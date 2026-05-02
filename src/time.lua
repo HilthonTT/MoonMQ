@@ -1,0 +1,10 @@
+local M = {}
+
+M.NANOSECOND  = 0.000000001
+M.MICROSECOND = 0.000001
+M.MILLISECOND = 0.001
+M.SECOND      = 1.0
+M.MINUTE      = 60.0
+M.HOUR        = 3600.0
+
+return M
