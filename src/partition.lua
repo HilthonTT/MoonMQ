@@ -7,9 +7,9 @@ local Partition = {}
 Partition.__index = Partition
 
 function Partition.new(topic, id, topicDir)
-    assert(type(topic) == "string", "topic must be a string")
+    assert(type(topic) == "table", "topic must be a Topic")
     assert(type(id) == "number", "id must be a number")
-    assert(type(topicDir) == "string", "id must be a number")
+    assert(type(topicDir) == "string", "topicDir must be a string")
 
     local logFileName = ("partition-%d.log"):format(id)
     local filePath    = fs.join_path(topicDir, logFileName)
@@ -99,22 +99,22 @@ function Partition:write_message(msg)
 
     -- Write length prefix
     local size = string.pack(">I8", total_size)
-    local _, err = self.file:write(size)
-    if err then return -1, ("failed to write message size: %s"):format(err) end
+    local ok, err = self.file:write(size)
+    if not ok then return -1, ("failed to write message size: %s"):format(err) end
 
     -- Write header
-    _, err = self.file:write(header)
-    if err then return -1, ("failed to write message header: %s"):format(err) end
+    ok, err = self.file:write(header)
+    if not ok then return -1, ("failed to write message header: %s"):format(err) end
 
     -- Write key (if present)
     if #msg.key > 0 then
-        _, err = self.file:write(msg.hey)
-        if err then return -1, ("failed to write message key: %s"):format(err) end
+        ok, err = self.file:write(msg.key)
+        if not ok then return -1, ("failed to write message key: %s"):format(err) end
     end
 
     -- Write value
-    _, err = self.file:write(msg.value)
-    if err then return -1, ("failed to write message value: %s"):format(err) end
+    ok, err = self.file:write(msg.value)
+    if not ok then return -1, ("failed to write message value: %s"):format(err) end
 
     self.offset = self.offset + (8 + total_size)
 
@@ -131,8 +131,8 @@ end
 function Partition:read_message(offset) 
     assert(type(offset) == "number", "offset must be a number")
 
-    local _, err = self.file:seek("set", offset)
-    if err then return nil, offset, ("failed to seek to offset: %d"):format(err) end
+    local pos, err = self.file:seek("set", offset)
+    if not pos then return nil, offset, ("failed to seek to offset: %s"):format(err) end
 
     local size_bytes, err = self.file:read(8)
     if not size_bytes or err then
