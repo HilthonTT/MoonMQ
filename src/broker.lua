@@ -85,3 +85,7 @@ function Broker:list_topics()
     end
     return topics
 end
+
+return {
+    Broker = Broker,
+}

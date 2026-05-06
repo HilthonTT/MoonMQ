@@ -35,7 +35,9 @@ function Partition:write(data)
     assert(type(data) == "string", "data must be a string")
     if not self.file then return false, "no file open" end
 
-    self.file:write(data)
+    local ok, err = self.file:write(data)
+    if not ok then return false, err end
+
     self.offset = self.offset + #data
     return true, nil
 end
@@ -168,4 +170,151 @@ function Partition:read_message(offset)
     return msg, next_offset, nil
 end
 
-return Partition
+local PartitionWriter = {}
+PartitionWriter.__index = PartitionWriter
+
+local DEFAULT_MAX_SIZE     = 1 * 1024 * 1024   -- 1 MiB
+local DEFAULT_MAX_MESSAGES = 1000
+local DEFAULT_FLUSH_EVERY  = 10 * time.MILLISECOND
+
+function PartitionWriter.new(partition, opts)
+    assert(getmetatable(partition) == Partition, "partition must be a Partition instance")
+    opts = opts or {}
+
+    local self = setmetatable({}, PartitionWriter)
+    self.partition    = partition
+    self.queue        = {}
+    self.head         = 1
+    self.tail         = 0
+    self.suspended    = nil
+    self.running      = false
+    self.max_size     = opts.max_size     or DEFAULT_MAX_SIZE
+    self.max_messages = opts.max_messages or DEFAULT_MAX_MESSAGES
+    self.flush_every  = opts.flush_every  or DEFAULT_FLUSH_EVERY
+    self.batch        = {}            -- accumulated serialized message bytes
+    self.batch_size   = 0
+    self.waiters      = {}            -- list of { co = co, offset = predicted_offset }
+    self.last_flush   = socket.gettime()
+    return self
+end
+
+-- Flush the in-memory batch to the partition file and resume all waiters
+-- with their predicted offsets (or the write error).
+function PartitionWriter:_flush_batch(scheduler)
+    if #self.batch == 0 then
+        self.last_flush = socket.gettime()
+        return
+    end
+
+    local data    = table.concat(self.batch)
+    local ok, err = self.partition:write(data)
+
+    local waiters   = self.waiters
+    self.batch      = {}
+    self.batch_size = 0
+    self.waiters    = {}
+    self.last_flush = socket.gettime()
+
+    if ok then
+        for i = 1, #waiters do
+            scheduler.resume(waiters[i].co, waiters[i].offset, nil)
+        end
+    else
+        for i = 1, #waiters do
+            scheduler.resume(waiters[i].co, nil, err)
+        end
+    end
+end
+
+-- Run on your scheduler as a long-lived coroutine.
+function PartitionWriter:run(scheduler)
+    self.running = true
+    while self.running do
+        -- Drain the request queue into the batch.
+        while self.head <= self.tail do
+            local req = self.queue[self.head]
+            self.queue[self.head] = nil
+            self.head = self.head + 1
+
+            local msg_bytes, serr = message.serialize_message(req.msg)
+            if not msg_bytes then
+                scheduler.resume(req.co, nil, serr)
+            else
+                if self.batch_size + #msg_bytes > self.max_size
+                   or #self.batch >= self.max_messages then
+                    self:_flush_batch(scheduler)
+                end
+
+                local predicted_offset = self.partition.offset + self.batch_size
+                self.batch[#self.batch + 1]     = msg_bytes
+                self.batch_size                 = self.batch_size + #msg_bytes
+                self.waiters[#self.waiters + 1] = { co = req.co, offset = predicted_offset }
+            end
+        end
+
+        -- Time-based flush: matches the article's 10ms ticker so messages
+        -- don't linger in the buffer indefinitely.
+        if self.batch_size > 0
+           and (socket.gettime() - self.last_flush) >= self.flush_every then
+            self:_flush_batch(scheduler)
+        end
+
+        -- Yield until a submit/tick/stop wakes us.
+        if self.running and self.head > self.tail then
+            self.suspended = coroutine.running()
+            coroutine.yield()
+        end
+    end
+
+    -- Graceful shutdown: flush whatever is buffered, then cancel any
+    -- requests that arrived after we stopped accepting work.
+    self:_flush_batch(scheduler)
+    while self.head <= self.tail do
+        local req = self.queue[self.head]
+        self.queue[self.head] = nil
+        self.head = self.head + 1
+        scheduler.resume(req.co, nil, "writer stopped")
+    end
+end
+
+-- Called from a caller coroutine. Returns offset, err.
+function PartitionWriter:submit(scheduler, msg)
+    local co = assert(coroutine.running(), "submit must run inside a coroutine")
+    self.tail = self.tail + 1
+    self.queue[self.tail] = { msg = msg, co = co }
+
+    if self.suspended then
+        local worker = self.suspended
+        self.suspended = nil
+        scheduler.resume(worker)                    -- wake the writer
+    end
+
+    return coroutine.yield()
+end
+
+-- Drive the time-based flush from outside. Call periodically (e.g. from
+-- the same scheduler tick that drives Partition:sync_loop). Wakes the
+-- writer if its batch has aged past flush_every.
+function PartitionWriter:tick(scheduler)
+    if self.batch_size > 0
+       and (socket.gettime() - self.last_flush) >= self.flush_every
+       and self.suspended then
+        local worker = self.suspended
+        self.suspended = nil
+        scheduler.resume(worker)
+    end
+end
+
+function PartitionWriter:stop(scheduler)
+    self.running = false
+    if self.suspended then
+        local worker = self.suspended
+        self.suspended = nil
+        scheduler.resume(worker)
+    end
+end
+
+return {
+    Partition = Partition,
+    PartitionWriter = PartitionWriter,
+}

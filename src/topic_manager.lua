@@ -1,6 +1,6 @@
 local fs        = require("src.fs")
 local Topic     = require("src.topic")
-local Partition = require("src.partition")
+local Partition = require("src.partition").Partition
 
 local TopicManager = {}
 TopicManager.__index = TopicManager

@@ -1,4 +1,3 @@
-local bit32 = require("bit32")
 local message = require("src.message")
 local socket = require("socket")
 local brk = require("src.broker")
@@ -18,8 +17,8 @@ local function fnv32a(key)
 
     for i = 1, #key do
         local byte = string.byte(key, i)
-        hash = bit32.bxor(hash, byte)          -- XOR
-        hash = bit32.band(hash * FNV_PRIME, 0xFFFFFFFF)  -- Multiply + keep 32 bits
+        hash = hash ~ byte                     -- XOR
+        hash = (hash * FNV_PRIME) & 0xFFFFFFFF -- Multiply + keep 32 bits
     end
 
     return hash
@@ -87,3 +86,7 @@ function Producer:produce(topic_name, msg)
 
     return partition_id, offset, nil
 end
+
+return {
+    Producer = Producer,
+}
