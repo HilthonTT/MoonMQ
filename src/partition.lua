@@ -2,19 +2,20 @@ local time   = require("src.time")
 local fs     = require("src.fs")
 local socket = require("socket")
 local message = require("src.message")
+local crc32 = require("src.crc32")
 
 local Partition = {}
 Partition.__index = Partition
 
-function Partition.new(topic, id, topicDir)
+function Partition.new(topic, id, topic_dir)
     assert(type(topic) == "table", "topic must be a Topic")
     assert(type(id) == "number", "id must be a number")
-    assert(type(topicDir) == "string", "topicDir must be a string")
+    assert(type(topic_dir) == "string", "topic_dir must be a string")
 
-    local logFileName = ("partition-%d.log"):format(id)
-    local filePath    = fs.join_path(topicDir, logFileName)
+    local log_file_name = ("partition-%d.log"):format(id)
+    local file_path     = fs.join_path(topic_dir, log_file_name)
 
-    local f, err = io.open(filePath, "a+b")
+    local f, err = io.open(file_path, "a+b")
     if not f then return nil, err end
 
     local size = f:seek("end")
@@ -165,6 +166,91 @@ function Partition:read_message(offset)
     end
 
     local msg = message.Message.new(key, value, timestamp)
+    local next_offset = offset + 8 + total_size
+
+    return msg, next_offset, nil
+end
+
+function Partition:write_message_with_integrity(msg)
+    assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
+
+    local current_offset = self.offset
+
+    local header  = string.pack(">I4I8", #msg.key, msg.timestamp)
+    local payload = msg.key .. msg.value
+
+    local header_crc  = crc32(header)
+    local payload_crc = crc32(payload)
+
+    -- total_size excludes the 8-byte length prefix itself
+    local total_size = #header + 4 + #payload + 4
+
+    -- Pack the whole record and write in one syscall. Keeps the record
+    -- atomic against signal-interrupted writes and means a single
+    -- file.flush() can't catch us mid-record.
+    local record = string.pack(">I8", total_size)
+                .. header
+                .. string.pack(">I4", header_crc)
+                .. payload
+                .. string.pack(">I4", payload_crc)
+
+    local ok, err = self.file:write(record)
+    if not ok then
+        return -1, ("failed to write message: %s"):format(err)
+    end
+
+    self.offset = self.offset + 8 + total_size
+
+    local elapsed = socket.gettime() - self.last_sync
+    if elapsed >= self.sync_every then
+        self.file:flush()
+        self.last_sync = socket.gettime()
+    end
+
+    return current_offset, nil
+end
+
+function Partition:read_message_with_integrity(offset)
+    assert(type(offset) == "number", "offset must be a number")
+
+    local pos, serr = self.file:seek("set", offset)
+    if not pos then
+        return nil, offset, ("failed to seek offset: %s"):format(serr)
+    end
+
+    local size_bytes = self.file:read(8)
+    if not size_bytes or #size_bytes < 8 then
+        return nil, offset, "failed to read message size: unexpected EOF"
+    end
+    local total_size = string.unpack(">I8", size_bytes)
+
+    -- Pull the whole record body in one read; slicing strings is much
+    -- cheaper than four seeks/reads, and we need the bytes anyway to CRC.
+    local body = self.file:read(total_size)
+    if not body or #body < total_size then
+        return nil, offset, "failed to read message body: unexpected EOF"
+    end
+
+    local HEADER_LEN = 12
+    local header_bytes       = body:sub(1, HEADER_LEN)
+    local stored_header_crc  = string.unpack(">I4", body, HEADER_LEN + 1)
+    local payload_start      = HEADER_LEN + 4 + 1
+    local payload_end        = #body - 4
+    local payload            = body:sub(payload_start, payload_end)
+    local stored_payload_crc = string.unpack(">I4", body, payload_end + 1)
+
+    if crc32(header_bytes) ~= stored_header_crc then
+        return nil, offset, "header checksum mismatch"
+    end
+    if crc32(payload) ~= stored_payload_crc then
+        return nil, offset, "payload checksum mismatch"
+    end
+
+    local key_size, timestamp = string.unpack(">I4I8", header_bytes)
+    local key   = payload:sub(1, key_size)
+    local value = payload:sub(key_size + 1)
+
+    local msg         = message.Message.new(key, value, timestamp)
     local next_offset = offset + 8 + total_size
 
     return msg, next_offset, nil
