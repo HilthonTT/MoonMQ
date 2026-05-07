@@ -1,5 +1,6 @@
 local message = require("src.message")
-local prt = require("src.partition")
+local prt     = require("src.partition")
+local io_sync = require("src.io_sync")
 
 local BatchWriter = {}
 BatchWriter.__index = BatchWriter
@@ -19,44 +20,49 @@ function BatchWriter.new(partition, max_size, max_messages)
     }, BatchWriter)
 end
 
--- Add a message to the batch
+-- Add a message to the batch. Returns (true, nil) on success, (nil, err) on failure.
 function BatchWriter:add(msg)
     assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
 
-    -- Serialize message
-    local msg_bytes, err = message.serialize_message(msg)
-    if not msg_bytes then return err end
+    local msg_bytes = message.serialize_message(msg)
 
-    -- Check if we could exceed batch size
+    -- Flush BEFORE adding when adding would push us over either cap;
+    -- this preserves the requested cap as a hard upper bound on batch
+    -- size (rather than an "approximate after the fact" bound).
     if self.buffer_size + #msg_bytes > self.max_size or self.count >= self.max_messages then
-        local err = self:flush()
-        if err then return err end
+        local fok, ferr = self:flush()
+        if not fok then return nil, ferr end
     end
 
     self.buffer[#self.buffer + 1] = msg_bytes
     self.buffer_size = self.buffer_size + #msg_bytes
     self.count = self.count + 1
 
-    return nil
+    return true, nil
 end
 
--- Flush writes the batch to disk
+-- Flush writes the batch to disk and forces an fsync so the durability
+-- guarantee actually holds. Returns (true, nil) on success, (nil, err) on failure.
 function BatchWriter:flush()
     if #self.buffer == 0 then
-        return nil
+        return true, nil
     end
 
-    -- Write buffer to disk
     local data = table.concat(self.buffer)
     local ok, err = self.partition:write(data)
-    if not ok then return err end
+    if not ok then return nil, err end
 
-    -- Reset buffer
+    -- Push userspace + OS buffers to disk. Without this, BatchWriter
+    -- claims to have committed N messages while they linger in the
+    -- C runtime buffer until the next process exit.
+    local sok, serr = io_sync.sync(self.partition.file)
+    if not sok then return nil, serr end
+
     self.buffer = {}
     self.buffer_size = 0
     self.count = 0
 
-    return nil
+    return true, nil
 end
 
 return BatchWriter

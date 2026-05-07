@@ -12,6 +12,7 @@ end
 function Buffer:write(s)
     self.n = self.n + 1
     self.chunks[self.n] = s
+    self.size = self.size + #s
 end
 
 function Buffer:bytes()

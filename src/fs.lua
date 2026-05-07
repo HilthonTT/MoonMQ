@@ -1,5 +1,20 @@
 local IS_WINDOWS = package.config:sub(1,1) == "\\"
 
+-- LuaJIT FFI is used on Windows so that is_dir does not have to write a
+-- probe file (the old implementation did, which had two sharp edges:
+-- read-only directories returned false, and on a fluke the probe could
+-- linger if os.remove failed). On Unix we shell out to `test -d`.
+local has_ffi, ffi = pcall(require, "ffi")
+local kernel32
+if IS_WINDOWS and has_ffi then
+    ffi.cdef[[
+        unsigned long GetFileAttributesA(const char *lpFileName);
+    ]]
+    local lok, k32 = pcall(ffi.load, "kernel32")
+    if lok then kernel32 = k32 end
+end
+local has_bit, bit = pcall(require, "bit")
+
 local function join_path(...)
     local sep   = IS_WINDOWS and "\\" or "/"
     local parts = {}
@@ -12,36 +27,61 @@ local function join_path(...)
     return table.concat(parts, sep)
 end
 
+-- Normalize Lua's wildly version-dependent os.execute return shape.
+-- LuaJIT (5.1 semantics): single number, 0 = success.
+-- Lua 5.2+: (true|nil, "exit"|"signal", code).
+local function exec_ok(...)
+    local r1, _, r3 = os.execute(...)
+    if type(r1) == "boolean" then
+        return r1, r3
+    end
+    return r1 == 0, r1
+end
+
+local function is_dir(path)
+    assert(type(path) == "string", "path must be a string")
+    if IS_WINDOWS and kernel32 and has_bit then
+        local attr = kernel32.GetFileAttributesA(path)
+        if tonumber(attr) == 0xFFFFFFFF then return false end
+        local FILE_ATTRIBUTE_DIRECTORY = 0x10
+        return bit.band(attr, FILE_ATTRIBUTE_DIRECTORY) ~= 0
+    end
+    -- Unix fallback (and Windows-without-FFI fallback).
+    local quoted = path:gsub("'", "'\\''")
+    local ok = exec_ok(("test -d '%s'"):format(quoted))
+    return ok
+end
+
 local function mkdir(path)
     assert(type(path) == "string", "path must be a string")
 
     local cmd
     if IS_WINDOWS then
-        -- Windows: mkdir creates intermediate dirs by default, errors if exists
-        -- 2>nul suppresses "already exists" error
+        -- Windows mkdir creates intermediate dirs by default and errors
+        -- if the dir already exists; 2>nul swallows the "already exists"
+        -- noise. The authoritative check is is_dir() afterward.
         cmd = ('mkdir "%s" 2>nul'):format(path:gsub("/", "\\"))
     else
-        cmd = ("mkdir -p '%s'"):format(path)
+        cmd = ("mkdir -p '%s'"):format(path:gsub("'", "'\\''"))
     end
 
     os.execute(cmd)
-
-    -- Verify the directory actually exists
-    local f = io.open(join_path(path, ".test_probe"), "w")
-    if not f then
+    if not is_dir(path) then
         return false, ("failed to create directory: %s"):format(path)
     end
-    f:close()
-    os.remove(join_path(path, ".test_probe"))
     return true, nil
 end
 
 local function read_dir(dir)
     assert(type(dir) == "string", "dir must be a string")
 
+    if not is_dir(dir) then
+        return nil, ("not a directory: %s"):format(dir)
+    end
+
     local cmd = IS_WINDOWS
-        and ('dir /b "%s"'):format(dir)
-        or  ("ls -1a '%s'"):format(dir)
+        and ('dir /b "%s" 2>nul'):format(dir:gsub("/", "\\"))
+        or  ("ls -1a '%s' 2>/dev/null"):format(dir:gsub("'", "'\\''"))
 
     local pipe = io.popen(cmd)
     if not pipe then
@@ -50,19 +90,17 @@ local function read_dir(dir)
 
     local entries = {}
     for name in pipe:lines() do
-        -- skip . and ..
         if name ~= "." and name ~= ".." then
             entries[#entries + 1] = name
         end
     end
-
     pipe:close()
     return entries, nil
 end
 
---- Returns a list of file paths matching a glob pattern.
+--- Returns a list of file paths matching a Lua pattern.
 --- `dir`     - the directory to search in
---- `pattern` - a Lua pattern (e.g. "^partition%-.*%.log$")
+--- `pattern` - a Lua pattern (e.g. "^partition%-.*%.log$"). NOT a shell glob.
 local function glob(dir, pattern)
     assert(type(dir) == "string", "dir must be a string")
     assert(type(pattern) == "string", "pattern must be a string")
@@ -79,19 +117,6 @@ local function glob(dir, pattern)
         end
     end
     return matches, nil
-end
-
---- Returns true if `path` is a directory.
-local function is_dir(path)
-    -- Attempt to open a probe file inside it; only works if it's a directory
-    local probe = join_path(path, ".test_probe")
-    local f = io.open(probe, "w")
-    if f then
-        f:close()
-        os.remove(probe)
-        return true
-    end
-    return false
 end
 
 return {

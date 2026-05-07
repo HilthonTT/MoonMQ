@@ -1,5 +1,7 @@
-local fs = require("src.fs")
-local tpm = require("src.topic_manager")
+local fs       = require("src.fs")
+local tpm      = require("src.topic_manager")
+local util     = require("src.util")
+local recover  = require("src.crash_recovery")
 
 local Broker = {}
 Broker.__index = Broker
@@ -8,7 +10,7 @@ function Broker.new(data_dir)
     assert(type(data_dir) == "string", "data dir must be a string")
 
     local success, err = fs.mkdir(data_dir)
-    if not success or err then
+    if not success then
         return nil, err
     end
 
@@ -17,9 +19,9 @@ function Broker.new(data_dir)
         topic_manager = topic_manager,
     }, Broker)
 
-    err = broker:load_topics()
-    if err then
-        return nil, err
+    local lerr = broker:load_topics()
+    if lerr then
+        return nil, lerr
     end
 
     return broker, nil
@@ -36,24 +38,53 @@ function Broker:load_topics()
     for _, name in ipairs(entries) do
         local topic_dir = fs.join_path(baseDir, name)
 
-        if not fs.is_dir(topic_dir) then
-            goto continue
-        end
+        if fs.is_dir(topic_dir) then
+            -- Skip names we'd reject anyway. Without this, a file/dir
+            -- left behind by some other tool would crash load.
+            local valid = util.validate_topic_name(name)
+            if valid then
+                local partition_files, gErr = fs.glob(topic_dir, "^partition%-(%d+)%.log$")
+                if not partition_files then
+                    return ("failed to glob partitions for topic %s: %s"):format(name, gErr)
+                end
 
-        local partition_files, err = fs.glob(topic_dir, "^partition%-.*%.log$")
-        if not partition_files then
-            error("glob failed: " .. err)
-        end
+                -- Extract partition IDs from filenames; reject gaps.
+                -- Trusting #partition_files as the partition count would
+                -- silently lose partitions when filenames are non-contiguous.
+                local ids = {}
+                for _, file_path in ipairs(partition_files) do
+                    local basename = file_path:match("[^/\\]+$") or file_path
+                    local id = tonumber(basename:match("^partition%-(%d+)%.log$"))
+                    if id then ids[#ids + 1] = id end
+                end
+                table.sort(ids)
 
-        local num_partitions = #partition_files
-        if num_partitions > 0 then
-            _, err = self.topic_manager:create_topic(name, num_partitions)
-            if err then
-                return ("failed to load topic %s: %s"):format(name, err)
+                if #ids > 0 then
+                    -- Run crash recovery on each partition file BEFORE
+                    -- topic_manager opens it for append. Recovery truncates
+                    -- the tail at the last CRC-valid record boundary.
+                    for _, id in ipairs(ids) do
+                        local _, rerr = recover(topic_dir, id)
+                        if rerr then
+                            return ("failed to recover topic %s partition %d: %s"):format(name, id, rerr)
+                        end
+                    end
+
+                    local max_id = ids[#ids]
+                    -- Verify contiguous 1..max_id.
+                    for i = 1, max_id do
+                        if ids[i] ~= i then
+                            return ("topic %s has non-contiguous partition files (missing partition %d)"):format(name, i)
+                        end
+                    end
+
+                    local _, cErr = self.topic_manager:create_topic(name, max_id)
+                    if cErr then
+                        return ("failed to load topic %s: %s"):format(name, cErr)
+                    end
+                end
             end
         end
-
-        ::continue::
     end
 
     return nil
@@ -63,8 +94,7 @@ function Broker:create_topic(name, num_partitions)
     assert(type(name) == "string", "name must be a string")
     assert(type(num_partitions) == "number", "num_partitions must be a number")
 
-    local _, err = self.topic_manager:create_topic(name, num_partitions)
-    return err
+    return self.topic_manager:create_topic(name, num_partitions)
 end
 
 function Broker:get_topic(name)

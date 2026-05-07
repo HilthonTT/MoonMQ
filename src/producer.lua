@@ -1,13 +1,15 @@
 local message = require("src.message")
-local socket = require("socket")
-local brk = require("src.broker")
+local socket  = require("socket")
+local brk     = require("src.broker")
 local Future  = require("src.future")
+local io_sync = require("src.io_sync")
+local util    = require("src.util")
 
 -- AckMode defines the producer acknowledgment levels
 local AckMode = {
     -- AckNone means no acknowledgment is required
     AckNone     = 0,
-    -- AckLeader means the leader must acknowledge
+    -- AckLeader means the leader must acknowledge (fsync after write)
     AckLeader   = 1,
     -- AckAll means all replicas must acknowledge (not implemented in this version)
     AckAll      = -1,
@@ -28,8 +30,8 @@ local function fnv32a(key)
 
     for i = 1, #key do
         local byte = string.byte(key, i)
-        hash = hash ~ byte                     -- XOR
-        hash = (hash * FNV_PRIME) & 0xFFFFFFFF -- Multiply + keep 32 bits
+        hash = hash ~ byte
+        hash = (hash * FNV_PRIME) & 0xFFFFFFFF
     end
 
     return hash
@@ -47,15 +49,22 @@ local function default_partitioner(key, numPartitions)
     return hash % numPartitions
 end
 
+-- Millisecond-resolution timestamps. We'd love nanosecond precision to
+-- match the Go reference's UnixNano(), but ns-since-epoch is ~1.8e18 in
+-- 2026 and Lua doubles only hold integers cleanly up to 2^53 ≈ 9e15.
+-- ms-since-epoch is ~1.8e12, well within precision, and ms granularity
+-- is more than enough for ordering messages within a partition.
+local function now_ms()
+    return math.floor(socket.gettime() * 1000)
+end
+
 local ProduceOptions = {}
 ProduceOptions.__index = ProduceOptions
 
 function ProduceOptions.new(ack_mode, timeout_in_seconds)
-    assert(type(timeout_in_seconds) == "number", "timeout_in_seconds must be a number")
-
     return setmetatable({
         ack_mode           = ack_mode or AckMode.AckNone,
-        timeout_in_seconds = timeout_in_seconds,
+        timeout_in_seconds = timeout_in_seconds,    -- nil = no limit
     }, ProduceOptions)
 end
 
@@ -91,41 +100,48 @@ function Producer:produce(topic_name, msg)
     assert(type(topic_name) == "string", "topic_name must be a string")
     assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
 
+    local valid, vErr = util.validate_topic_name(topic_name)
+    if not valid then return -1, -1, vErr end
+
     if msg.timestamp == 0 then
-        msg.timestamp = os.time()
+        msg.timestamp = now_ms()
     end
 
     local topic, err = self.broker:get_topic(topic_name)
-    if not topic or err then
+    if not topic then
         return -1, -1, ("failed to get topic: %s"):format(err)
     end
 
-    -- Determine partition
     local num_partitions = #topic.partitions
-    local partition_id = self.partitioner(msg.key, num_partitions) + 1
+    local partition_id   = self.partitioner(msg.key, num_partitions) + 1
 
-    -- Get partition
     local partition = topic.partitions[partition_id]
     if not partition then
         return -1, -1, ("partition %d does not exist"):format(partition_id)
     end
 
-    -- Write message to partition
-    local offset, err = partition:write_message(msg)
-    if err then
-        return -1, -1, ("failed to write message: %s"):format(err)
+    local offset, werr = partition:write_message(msg)
+    if werr then
+        return -1, -1, ("failed to write message: %s"):format(werr)
     end
 
     if self.acks > 0 then
-        partition.file:flush()
+        -- True fsync, not just userspace flush; otherwise acks=1 lies.
+        local sok, serr = io_sync.sync(partition.file)
+        if not sok then
+            return -1, -1, ("failed to sync partition: %s"):format(serr)
+        end
         partition.last_sync = socket.gettime()
     end
 
     return partition_id, offset, nil
 end
 
--- Async variant, returns a Future that
--- resolves to a ProduceResult. Caller awaits when convenient.
+-- Async variant. Returns a Future that resolves to a ProduceResult.
+-- NOTE: with the trivial scheduler (synchronous coroutine.resume), this
+-- runs to completion on the calling resume — it does not actually overlap
+-- with other I/O. Use it for the caller-friendly Future API, not for
+-- concurrency gains.
 function Producer:produce_async(scheduler, topic_name, msg, opts)
     assert(type(topic_name) == "string", "topic_name must be a string")
     assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
@@ -134,17 +150,22 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
     local timeout  = opts.timeout_in_seconds   -- nil = no limit
 
     if msg.timestamp == 0 then
-        msg.timestamp = os.time()
+        msg.timestamp = now_ms()
     end
 
     local future = Future.new(scheduler)
 
-    -- The "goroutine". Spawned now, runs on the next tick.
     local co = coroutine.create(function()
         local started = socket.gettime()
 
+        local valid, vErr = util.validate_topic_name(topic_name)
+        if not valid then
+            future:resolve(ProduceResult.new(topic_name, -1, -1, vErr))
+            return
+        end
+
         local topic, err = self.broker:get_topic(topic_name)
-        if not topic or err then
+        if not topic then
             future:resolve(ProduceResult.new(topic_name, -1, -1,
                 ("failed to get topic: %s"):format(err)))
             return
@@ -167,18 +188,24 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         end
 
         if ack_mode == AckMode.AckLeader then
-            partition.file:flush()
+            local sok, serr = io_sync.sync(partition.file)
+            if not sok then
+                future:resolve(ProduceResult.new(topic_name, partition_id, -1,
+                    ("failed to sync partition: %s"):format(serr)))
+                return
+            end
             partition.last_sync = socket.gettime()
         end
 
-        -- Soft timeout, matching Go's decorative context.WithTimeout:
-        -- the write itself isn't cancellable, so we report the deadline
-        -- miss after the fact. Still useful for monitoring.
+        -- Soft timeout: the write itself isn't cancellable. The write has
+        -- already succeeded; resolve with the offset and no error so the
+        -- caller doesn't retry and duplicate. Caller can compare elapsed
+        -- vs timeout themselves if monitoring is needed.
         local elapsed = socket.gettime() - started
         if timeout and elapsed > timeout then
-            future:resolve(ProduceResult.new(topic_name, partition_id, offset,
-                ("produce exceeded timeout: %.3fs > %.3fs"):format(elapsed, timeout)))
-            return
+            io.stderr:write(
+                ("warn: produce exceeded timeout: %.3fs > %.3fs\n")
+                :format(elapsed, timeout))
         end
 
         future:resolve(ProduceResult.new(topic_name, partition_id, offset, nil))

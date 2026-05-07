@@ -1,6 +1,7 @@
 local fs        = require("src.fs")
 local Topic     = require("src.topic")
 local Partition = require("src.partition").Partition
+local util      = require("src.util")
 
 local TopicManager = {}
 TopicManager.__index = TopicManager
@@ -18,6 +19,9 @@ function TopicManager:create_topic(name, numPartitions)
     assert(type(name) == "string", "name must be a string")
     assert(type(numPartitions) == "number", "numPartitions must be a number")
 
+    local valid, vErr = util.validate_topic_name(name)
+    if not valid then return nil, vErr end
+
     if self.topics[name] then
         return nil, ("topic '%s' already exists"):format(name)
     end
@@ -28,15 +32,17 @@ function TopicManager:create_topic(name, numPartitions)
 
     local topic = Topic.new(name)
 
+    -- Track partitions we've successfully opened so we can release their
+    -- file handles if a later partition fails. Without this, partial
+    -- failure leaks descriptors until GC, which is awful under retries.
+    local opened = {}
     for i = 1, numPartitions do
         local partition, pErr = Partition.new(topic, i, topicDir)
-        if pErr then
+        if not partition then
+            for _, p in ipairs(opened) do p:close() end
             return nil, ("failed to create partition %d: %s"):format(i, pErr)
         end
-
-        if partition then
-            partition:sync_loop()
-        end
+        opened[#opened + 1] = partition
         topic.partitions[i] = partition
     end
 

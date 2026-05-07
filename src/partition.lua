@@ -1,8 +1,9 @@
-local time   = require("src.time")
-local fs     = require("src.fs")
-local socket = require("socket")
+local time    = require("src.time")
+local fs      = require("src.fs")
+local socket  = require("socket")
 local message = require("src.message")
-local crc32 = require("src.crc32")
+local crc32   = require("src.crc32")
+local io_sync = require("src.io_sync")
 
 local Partition = {}
 Partition.__index = Partition
@@ -27,11 +28,12 @@ function Partition.new(topic, id, topic_dir)
         offset     = size,
         sync_every = 50 * time.MILLISECOND,
         last_sync  = socket.gettime(),
-        _coroutine = nil,
-        running    = false,
     }, Partition), nil
 end
 
+-- Append raw bytes. Bumps offset by #data on success. Note: Lua's io.write
+-- doesn't surface partial writes — a partial write is reported as an error,
+-- not a short count, so we treat any non-nil return as a complete write.
 function Partition:write(data)
     assert(type(data) == "string", "data must be a string")
     if not self.file then return false, "no file open" end
@@ -43,41 +45,16 @@ function Partition:write(data)
     return true, nil
 end
 
+-- Force userspace + OS buffers to disk. Use after acks=1 writes or
+-- whenever durability matters more than throughput.
 function Partition:sync()
-    if self.file then
-        self.file:flush()
-    end
+    if not self.file then return false, "no file open" end
+    local ok, err = io_sync.sync(self.file)
     self.last_sync = socket.gettime()
-end
-
-function Partition:sync_loop()
-    self.running    = true
-    self._coroutine = coroutine.create(function()
-        while self.running do
-            socket.sleep(self.sync_every)
-
-            local elapsed = socket.gettime() - self.last_sync
-            if elapsed >= self.sync_every then
-                self:sync()
-            end
-
-            coroutine.yield()
-        end
-    end)
-end
-
-function Partition:tick()
-    if self._coroutine and self.running then
-        local ok, err = coroutine.resume(self._coroutine)
-        if not ok then
-            print("sync_loop error:", err)
-            self.running = false
-        end
-    end
+    return ok, err
 end
 
 function Partition:close()
-    self.running = false
     if self.file then
         self.file:flush()
         self.file:close()
@@ -85,93 +62,10 @@ function Partition:close()
     end
 end
 
+-- Append a Message in the CRC-protected wire format. Single file:write so
+-- the record is atomic against signal-interrupted writes — we never leave
+-- a half-record on disk for the recovery scanner to puzzle over.
 function Partition:write_message(msg)
-    assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
-
-    -- Record te current offset before writing
-    local current_offset = self.offset
-
-    -- Calculate header size and total size
-    local key_size = #msg.key
-
-    -- Serialize header
-    local header = string.pack(">I4I8", key_size, msg.timestamp)
-
-    -- Calculate total message size
-    local total_size = #header + #msg.key + #msg.value
-
-    -- Write length prefix
-    local size = string.pack(">I8", total_size)
-    local ok, err = self.file:write(size)
-    if not ok then return -1, ("failed to write message size: %s"):format(err) end
-
-    -- Write header
-    ok, err = self.file:write(header)
-    if not ok then return -1, ("failed to write message header: %s"):format(err) end
-
-    -- Write key (if present)
-    if #msg.key > 0 then
-        ok, err = self.file:write(msg.key)
-        if not ok then return -1, ("failed to write message key: %s"):format(err) end
-    end
-
-    -- Write value
-    ok, err = self.file:write(msg.value)
-    if not ok then return -1, ("failed to write message value: %s"):format(err) end
-
-    self.offset = self.offset + (8 + total_size)
-
-    local elapsed = socket.gettime() - self.last_sync
-    if elapsed >= self.sync_every then
-        self.file:flush()
-        self.last_sync = socket.gettime()
-    end
-
-    return current_offset, nil
-end
-
-
-function Partition:read_message(offset) 
-    assert(type(offset) == "number", "offset must be a number")
-
-    local pos, err = self.file:seek("set", offset)
-    if not pos then return nil, offset, ("failed to seek to offset: %s"):format(err) end
-
-    local size_bytes, err = self.file:read(8)
-    if not size_bytes or err then
-        return nil, offset, ("failed to read message size: %s"):format(err or "unexpected EOF")
-    end
-
-    local total_size = string.unpack(">I8", size_bytes)
-
-    local header_bytes, err = self.file:read(12)
-    if not header_bytes then
-        return nil, offset, ("failed to read message header: %s"):format(err or "unexpected EOF")
-    end
-
-    local key_size, timestamp = string.unpack(">I4I8", header_bytes)
-
-    local key = ""
-    if key_size > 0 then
-        key, err = self.file:read(key_size)
-        if not key then
-            return nil, offset, ("failed to read message key: %s"):format(err or "unexpected EOF")
-        end
-    end
-
-    local value_size = total_size - 12 - key_size
-    local value, err = self.file:read(value_size)
-    if not value then
-        return nil, offset, ("failed to read message value: %s"):format(err or "unexpected EOF")
-    end
-
-    local msg = message.Message.new(key, value, timestamp)
-    local next_offset = offset + 8 + total_size
-
-    return msg, next_offset, nil
-end
-
-function Partition:write_message_with_integrity(msg)
     assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
 
     local current_offset = self.offset
@@ -182,12 +76,9 @@ function Partition:write_message_with_integrity(msg)
     local header_crc  = crc32(header)
     local payload_crc = crc32(payload)
 
-    -- total_size excludes the 8-byte length prefix itself
+    -- total_size excludes the 8-byte length prefix itself.
     local total_size = #header + 4 + #payload + 4
 
-    -- Pack the whole record and write in one syscall. Keeps the record
-    -- atomic against signal-interrupted writes and means a single
-    -- file.flush() can't catch us mid-record.
     local record = string.pack(">I8", total_size)
                 .. header
                 .. string.pack(">I4", header_crc)
@@ -201,6 +92,7 @@ function Partition:write_message_with_integrity(msg)
 
     self.offset = self.offset + 8 + total_size
 
+    -- Time-based flush; cheap and gives bounded data-loss on crash.
     local elapsed = socket.gettime() - self.last_sync
     if elapsed >= self.sync_every then
         self.file:flush()
@@ -210,7 +102,7 @@ function Partition:write_message_with_integrity(msg)
     return current_offset, nil
 end
 
-function Partition:read_message_with_integrity(offset)
+function Partition:read_message(offset)
     assert(type(offset) == "number", "offset must be a number")
 
     local pos, serr = self.file:seek("set", offset)
@@ -232,6 +124,10 @@ function Partition:read_message_with_integrity(offset)
     end
 
     local HEADER_LEN = 12
+    if total_size < HEADER_LEN + 4 + 4 then
+        return nil, offset, "corrupt header: total_size too small"
+    end
+
     local header_bytes       = body:sub(1, HEADER_LEN)
     local stored_header_crc  = string.unpack(">I4", body, HEADER_LEN + 1)
     local payload_start      = HEADER_LEN + 4 + 1
@@ -247,6 +143,10 @@ function Partition:read_message_with_integrity(offset)
     end
 
     local key_size, timestamp = string.unpack(">I4I8", header_bytes)
+    if key_size < 0 or key_size > #payload then
+        return nil, offset, "corrupt header: key_size out of range"
+    end
+
     local key   = payload:sub(1, key_size)
     local value = payload:sub(key_size + 1)
 
@@ -285,7 +185,9 @@ function PartitionWriter.new(partition, opts)
 end
 
 -- Flush the in-memory batch to the partition file and resume all waiters
--- with their predicted offsets (or the write error).
+-- with their predicted offsets (or the write error). Predicted offsets
+-- assume Partition is single-writer; callers that mix sync write_message
+-- with PartitionWriter on the same Partition will get bogus offsets.
 function PartitionWriter:_flush_batch(scheduler)
     if #self.batch == 0 then
         self.last_flush = socket.gettime()
@@ -345,7 +247,8 @@ function PartitionWriter:run(scheduler)
             self:_flush_batch(scheduler)
         end
 
-        -- Yield until a submit/tick/stop wakes us.
+        -- Yield only when the queue is empty. If a submit landed between
+        -- the drain loop above and this point, loop again to consume it.
         if self.running and self.head > self.tail then
             self.suspended = coroutine.running()
             coroutine.yield()
@@ -379,8 +282,8 @@ function PartitionWriter:submit(scheduler, msg)
 end
 
 -- Drive the time-based flush from outside. Call periodically (e.g. from
--- the same scheduler tick that drives Partition:sync_loop). Wakes the
--- writer if its batch has aged past flush_every.
+-- your scheduler tick) so a partially-full batch eventually flushes when
+-- no new submits are arriving.
 function PartitionWriter:tick(scheduler)
     if self.batch_size > 0
        and (socket.gettime() - self.last_flush) >= self.flush_every

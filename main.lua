@@ -30,10 +30,11 @@ end
 local topic_name = ("smoke-%d"):format(math.random(100000, 999999))
 header("Creating topic '" .. topic_name .. "' with 3 partitions")
 
-local cerr = broker:create_topic(topic_name, 3)
+local _, cerr = broker:create_topic(topic_name, 3)
 if cerr then fail(cerr) end
 
-local topic = broker:get_topic(topic_name)
+local topic, gerr = broker:get_topic(topic_name)
+if not topic then fail(gerr) end
 print("partitions:", #topic.partitions)
 
 -- ---------------------------------------------------------------------------
@@ -60,8 +61,8 @@ end
 header("Consuming")
 
 local consumer = consumer_m.Consumer.new(broker, "smoke-group")
-local serr = consumer:subscribe(topic_name)
-if serr then fail(serr) end
+local sok, serr = consumer:subscribe(topic_name)
+if not sok then fail(serr) end
 
 local seen = {}
 local total = 0
@@ -106,11 +107,11 @@ for i = 1, 5 do
         ("bk-%d"):format(i),
         ("bv-%d"):format(i),
         os.time())
-    local aerr = bw:add(m)
-    if aerr then fail(aerr) end
+    local aok, aerr = bw:add(m)
+    if not aok then fail(aerr) end
 end
-local ferr = bw:flush()
-if ferr then fail(ferr) end
+local fok, ferr = bw:flush()
+if not fok then fail(ferr) end
 
 local bytes_written = p1.offset - off_before_batch
 print(("flushed 5 messages to partition 1 (%d bytes)"):format(bytes_written))
