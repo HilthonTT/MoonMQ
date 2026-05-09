@@ -1,7 +1,7 @@
-local time    = require("src.time")
-local fs      = require("src.fs")
+local time_m    = require("src.time")
+local fs_m      = require("src.fs")
 local socket  = require("socket")
-local message = require("src.message")
+local msg_m = require("src.message")
 local crc32   = require("src.crc32")
 local io_sync = require("src.io_sync")
 
@@ -14,7 +14,7 @@ function Partition.new(topic, id, topic_dir)
     assert(type(topic_dir) == "string", "topic_dir must be a string")
 
     local log_file_name = ("partition-%d.log"):format(id)
-    local file_path     = fs.join_path(topic_dir, log_file_name)
+    local file_path     = fs_m.join_path(topic_dir, log_file_name)
 
     local f, err = io.open(file_path, "a+b")
     if not f then return nil, err end
@@ -26,7 +26,7 @@ function Partition.new(topic, id, topic_dir)
         id         = id,
         file       = f,
         offset     = size,
-        sync_every = 50 * time.MILLISECOND,
+        sync_every = 50 * time_m.MILLISECOND,
         last_sync  = socket.gettime(),
     }, Partition), nil
 end
@@ -66,7 +66,7 @@ end
 -- the record is atomic against signal-interrupted writes — we never leave
 -- a half-record on disk for the recovery scanner to puzzle over.
 function Partition:write_message(msg)
-    assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
+    assert(getmetatable(msg) == msg_m.Message, "msg must be a Message instance")
 
     local current_offset = self.offset
 
@@ -150,7 +150,7 @@ function Partition:read_message(offset)
     local key   = payload:sub(1, key_size)
     local value = payload:sub(key_size + 1)
 
-    local msg         = message.Message.new(key, value, timestamp)
+    local msg         = msg_m.Message.new(key, value, timestamp)
     local next_offset = offset + 8 + total_size
 
     return msg, next_offset, nil
@@ -161,7 +161,7 @@ PartitionWriter.__index = PartitionWriter
 
 local DEFAULT_MAX_SIZE     = 1 * 1024 * 1024   -- 1 MiB
 local DEFAULT_MAX_MESSAGES = 1000
-local DEFAULT_FLUSH_EVERY  = 10 * time.MILLISECOND
+local DEFAULT_FLUSH_EVERY  = 10 * time_m.MILLISECOND
 
 function PartitionWriter.new(partition, opts)
     assert(getmetatable(partition) == Partition, "partition must be a Partition instance")
@@ -224,7 +224,7 @@ function PartitionWriter:run(scheduler)
             self.queue[self.head] = nil
             self.head = self.head + 1
 
-            local msg_bytes, serr = message.serialize_message(req.msg)
+            local msg_bytes, serr = msg_m.serialize_message(req.msg)
             if not msg_bytes then
                 scheduler.resume(req.co, nil, serr)
             else

@@ -8,7 +8,7 @@
 -- use. We don't construct a Partition here — recovery is a filesystem
 -- operation, not a stateful one.
 
-local fs      = require("src.fs")
+local fs_m      = require("src.fs")
 local crc32   = require("src.crc32")
 local io_sync = require("src.io_sync")
 
@@ -20,7 +20,7 @@ local function recover_partition(topic_dir, partition_id)
     assert(type(partition_id) == "number", "partition_id must be a number")
 
     local log_file_name = ("partition-%d.log"):format(partition_id)
-    local file_path     = fs.join_path(topic_dir, log_file_name)
+    local file_path     = fs_m.join_path(topic_dir, log_file_name)
 
     local file, oerr = io.open(file_path, "r+b")
     if not file then
