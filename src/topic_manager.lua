@@ -1,7 +1,7 @@
-local fs        = require("src.fs")
+local fs_m        = require("src.fs")
 local Topic     = require("src.topic")
 local Partition = require("src.partition").Partition
-local util      = require("src.util")
+local utl_m      = require("src.util")
 
 local TopicManager = {}
 TopicManager.__index = TopicManager
@@ -19,15 +19,15 @@ function TopicManager:create_topic(name, numPartitions)
     assert(type(name) == "string", "name must be a string")
     assert(type(numPartitions) == "number", "numPartitions must be a number")
 
-    local valid, vErr = util.validate_topic_name(name)
+    local valid, vErr = utl_m.validate_topic_name(name)
     if not valid then return nil, vErr end
 
     if self.topics[name] then
         return nil, ("topic '%s' already exists"):format(name)
     end
 
-    local topicDir = fs.join_path(self.baseDir, name)
-    local ok, err  = fs.mkdir(topicDir)
+    local topicDir = fs_m.join_path(self.baseDir, name)
+    local ok, err  = fs_m.mkdir(topicDir)
     if not ok then return nil, err end
 
     local topic = Topic.new(name)

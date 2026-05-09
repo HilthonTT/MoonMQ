@@ -1,12 +1,12 @@
-local message = require("src.message")
-local prt     = require("src.partition")
+local msg_m = require("src.message")
+local prt_m     = require("src.partition")
 local io_sync = require("src.io_sync")
 
 local BatchWriter = {}
 BatchWriter.__index = BatchWriter
 
 function BatchWriter.new(partition, max_size, max_messages)
-    assert(getmetatable(partition) == prt.Partition, "partition must be a Partition instance")
+    assert(getmetatable(partition) == prt_m.Partition, "partition must be a Partition instance")
     assert(type(max_size) == "number", "max_size must be a number")
     assert(type(max_messages) == "number", "max_messages must be a number")
 
@@ -22,9 +22,9 @@ end
 
 -- Add a message to the batch. Returns (true, nil) on success, (nil, err) on failure.
 function BatchWriter:add(msg)
-    assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
+    assert(getmetatable(msg) == msg_m.Message, "msg must be a Message instance")
 
-    local msg_bytes = message.serialize_message(msg)
+    local msg_bytes = msg_m.serialize_message(msg)
 
     -- Flush BEFORE adding when adding would push us over either cap;
     -- this preserves the requested cap as a hard upper bound on batch

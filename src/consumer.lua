@@ -1,5 +1,5 @@
-local brk  = require("src.broker")
-local util = require("src.util")
+local brk_m  = require("src.broker")
+local util_m = require("src.util")
 
 -- ConsumerRecord holds a consumed message with its metadata
 local ConsumerRecord = {}
@@ -21,7 +21,7 @@ local Consumer = {}
 Consumer.__index = Consumer
 
 function Consumer.new(broker, group_id)
-    assert(getmetatable(broker) == brk.Broker, "broker must be a Broker instance")
+    assert(getmetatable(broker) == brk_m.Broker, "broker must be a Broker instance")
     assert(type(group_id) == "string", "group_id must be a string")
 
     return setmetatable({
@@ -37,7 +37,7 @@ end
 function Consumer:subscribe(topic_name)
     assert(type(topic_name) == "string", "topic_name must be a string")
 
-    local valid, vErr = util.validate_topic_name(topic_name)
+    local valid, vErr = util_m.validate_topic_name(topic_name)
     if not valid then return nil, vErr end
 
     local topic, err = self.broker:get_topic(topic_name)

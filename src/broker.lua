@@ -1,6 +1,6 @@
-local fs       = require("src.fs")
-local tpm      = require("src.topic_manager")
-local util     = require("src.util")
+local fs_m       = require("src.fs")
+local tpm_m      = require("src.topic_manager")
+local util_m     = require("src.util")
 local recover  = require("src.crash_recovery")
 
 local Broker = {}
@@ -9,12 +9,12 @@ Broker.__index = Broker
 function Broker.new(data_dir)
     assert(type(data_dir) == "string", "data dir must be a string")
 
-    local success, err = fs.mkdir(data_dir)
+    local success, err = fs_m.mkdir(data_dir)
     if not success then
         return nil, err
     end
 
-    local topic_manager = tpm.new(data_dir)
+    local topic_manager = tpm_m.new(data_dir)
     local broker = setmetatable({
         topic_manager = topic_manager,
     }, Broker)
@@ -30,20 +30,20 @@ end
 function Broker:load_topics()
     local baseDir = self.topic_manager.baseDir
 
-    local entries, err = fs.read_dir(baseDir)
+    local entries, err = fs_m.read_dir(baseDir)
     if not entries then
         return err
     end
 
     for _, name in ipairs(entries) do
-        local topic_dir = fs.join_path(baseDir, name)
+        local topic_dir = fs_m.join_path(baseDir, name)
 
-        if fs.is_dir(topic_dir) then
+        if fs_m.is_dir(topic_dir) then
             -- Skip names we'd reject anyway. Without this, a file/dir
             -- left behind by some other tool would crash load.
-            local valid = util.validate_topic_name(name)
+            local valid = util_m.validate_topic_name(name)
             if valid then
-                local partition_files, gErr = fs.glob(topic_dir, "^partition%-(%d+)%.log$")
+                local partition_files, gErr = fs_m.glob(topic_dir, "^partition%-(%d+)%.log$")
                 if not partition_files then
                     return ("failed to glob partitions for topic %s: %s"):format(name, gErr)
                 end
