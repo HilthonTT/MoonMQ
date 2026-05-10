@@ -22,7 +22,7 @@ math.randomseed(os.time())
 header("Bootstrapping broker at " .. DATA_DIR)
 
 local broker, berr = broker_m.Broker.new(DATA_DIR)
-if not broker then 
+if not broker then
     fail(berr)
     return
 end

@@ -63,11 +63,19 @@ describe("Partition", function()
         p:write_message(m)
         p.file:flush()
 
+        -- Partition opens its file in "a+b" (append mode). On POSIX, writes
+        -- to an append-mode fd always go to EOF regardless of seek, so we
+        -- can't corrupt in-place through p.file. Use a separate "r+b" fd.
+        local IS_WIN = package.config:sub(1,1) == "\\"
+        local sep    = IS_WIN and "\\" or "/"
+        local path   = BASE_DIR .. sep .. "orders" .. sep .. "partition-1.log"
+
         -- Layout: len(8) | header(12) | hdr_crc(4) | payload | pay_crc(4)
         -- Flip a byte at offset 24 (start of payload, 0-based).
-        p.file:seek("set", 24)
-        p.file:write(string.char(0xFF))
-        p.file:flush()
+        local f = assert(io.open(path, "r+b"))
+        f:seek("set", 24)
+        f:write(string.char(0xFF))
+        f:close()
 
         local got, _, rerr = p:read_message(0)
         assert.is_nil(got)

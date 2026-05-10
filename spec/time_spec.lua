@@ -1,0 +1,23 @@
+-- spec/time_spec.lua
+local time_m = require("src.time")
+
+describe("time constants", function()
+    it("expresses second-scale units as multiples of SECOND", function()
+        assert.are.equal(1.0, time_m.SECOND)
+        assert.are.equal(60.0, time_m.MINUTE)
+        assert.are.equal(3600.0, time_m.HOUR)
+    end)
+
+    it("expresses sub-second units as fractions of SECOND", function()
+        assert.are.equal(0.001, time_m.MILLISECOND)
+        assert.are.equal(0.000001, time_m.MICROSECOND)
+        assert.are.equal(0.000000001, time_m.NANOSECOND)
+    end)
+
+    it("has consistent ratios between units", function()
+        assert.is_true(math.abs(time_m.MINUTE / time_m.SECOND - 60) < 1e-9)
+        assert.is_true(math.abs(time_m.HOUR / time_m.MINUTE - 60) < 1e-9)
+        assert.is_true(math.abs(time_m.SECOND / time_m.MILLISECOND - 1000) < 1e-6)
+        assert.is_true(math.abs(time_m.MILLISECOND / time_m.MICROSECOND - 1000) < 1e-3)
+    end)
+end)
