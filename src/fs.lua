@@ -48,7 +48,7 @@ local function is_dir(path)
     end
     -- Unix fallback (and Windows-without-FFI fallback).
     local quoted = path:gsub("'", "'\\''")
-    local ok = exec_ok(("test -d '%s'"):format(quoted))
+    local ok = exec_ok(string.format("test -d '%s'", quoted))
     return ok
 end
 
@@ -60,14 +60,14 @@ local function mkdir(path)
         -- Windows mkdir creates intermediate dirs by default and errors
         -- if the dir already exists; 2>nul swallows the "already exists"
         -- noise. The authoritative check is is_dir() afterward.
-        cmd = ('mkdir "%s" 2>nul'):format(path:gsub("/", "\\"))
+        cmd = string.format('mkdir "%s" 2>nul', path:gsub("/", "\\"))
     else
-        cmd = ("mkdir -p '%s'"):format(path:gsub("'", "'\\''"))
+        cmd = string.format("mkdir -p '%s'", path:gsub("'", "'\\''"))
     end
 
     os.execute(cmd)
     if not is_dir(path) then
-        return false, ("failed to create directory: %s"):format(path)
+        return false, string.format("failed to create directory: %s", path)
     end
     return true, nil
 end
@@ -76,12 +76,12 @@ local function read_dir(dir)
     assert(type(dir) == "string", "dir must be a string")
 
     if not is_dir(dir) then
-        return nil, ("not a directory: %s"):format(dir)
+        return nil, string.format("not a directory: %s", dir)
     end
 
     local cmd = IS_WINDOWS
-        and ('dir /b "%s" 2>nul'):format(dir:gsub("/", "\\"))
-        or  ("ls -1a '%s' 2>/dev/null"):format(dir:gsub("'", "'\\''"))
+        and string.format('dir /b "%s" 2>nul', dir:gsub("/", "\\"))
+        or  string.format("ls -1a '%s' 2>/dev/null", dir:gsub("'", "'\\''"))
 
     local pipe = io.popen(cmd)
     if not pipe then

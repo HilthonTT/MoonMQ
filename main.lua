@@ -11,7 +11,7 @@ local partition_m  = require("src.partition")
 
 local DATA_DIR = "./data_test"
 
-local function header(s) print(("\n=== %s ==="):format(s)) end
+local function header(s) print(string.format("\n=== %s ===", s)) end
 local function fail(msg) print("FAIL:", msg); os.exit(1) end
 
 math.randomseed(os.time())
@@ -27,7 +27,7 @@ if not broker then
     return
 end
 
-local topic_name = ("smoke-%d"):format(math.random(100000, 999999))
+local topic_name = string.format("smoke-%d", math.random(100000, 999999))
 header("Creating topic '" .. topic_name .. "' with 3 partitions")
 
 local _, cerr = broker:create_topic(topic_name, 3)
@@ -46,13 +46,13 @@ local producer = producer_m.Producer.new(broker, 1)   -- acks=1: flush after wri
 
 local sent = {}
 for i = 1, 6 do
-    local key   = ("key-%d"):format(i)
-    local value = ("payload-%d"):format(i)
+    local key   = string.format("key-%d", i)
+    local value = string.format("payload-%d", i)
     local msg   = message.Message.new(key, value, os.time())
     local pid, off, perr = producer:produce(topic_name, msg)
     if perr then fail(perr) end
     sent[#sent+1] = { key = key, value = value, partition = pid, offset = off }
-    print(("  -> partition=%d offset=%d key=%s"):format(pid, off, key))
+    print(string.format("  -> partition=%d offset=%d key=%s", pid, off, key))
 end
 
 -- ---------------------------------------------------------------------------
@@ -75,7 +75,7 @@ while empty_polls < 3 do
     else
         empty_polls = 0
         for _, r in ipairs(records) do
-            print(("  <- partition=%d offset=%d key=%s value=%s"):format(
+            print(string.format("  <- partition=%d offset=%d key=%s value=%s",
                 r.partition, r.offset, r.key, r.value))
             seen[r.key] = r.value
             total = total + 1
@@ -86,12 +86,12 @@ end
 local missing = 0
 for _, s in ipairs(sent) do
     if seen[s.key] ~= s.value then
-        print(("  MISSING: %s -> %s"):format(s.key, s.value))
+        print(string.format("  MISSING: %s -> %s", s.key, s.value))
         missing = missing + 1
     end
 end
-if missing > 0 then fail(("missing %d message(s)"):format(missing)) end
-print(("OK: produced=%d consumed=%d"):format(#sent, total))
+if missing > 0 then fail(string.format("missing %d message(s)", missing)) end
+print(string.format("OK: produced=%d consumed=%d", #sent, total))
 
 -- ---------------------------------------------------------------------------
 -- 4. BatchWriter: synchronous batched append
@@ -104,8 +104,8 @@ local off_before_batch = p1.offset
 local bw = batch_writer.new(p1, 4096, 100)
 for i = 1, 5 do
     local m = message.Message.new(
-        ("bk-%d"):format(i),
-        ("bv-%d"):format(i),
+        string.format("bk-%d", i),
+        string.format("bv-%d", i),
         os.time())
     local aok, aerr = bw:add(m)
     if not aok then fail(aerr) end
@@ -114,7 +114,7 @@ local fok, ferr = bw:flush()
 if not fok then fail(ferr) end
 
 local bytes_written = p1.offset - off_before_batch
-print(("flushed 5 messages to partition 1 (%d bytes)"):format(bytes_written))
+print(string.format("flushed 5 messages to partition 1 (%d bytes)", bytes_written))
 if bytes_written <= 0 then fail("BatchWriter:flush did not advance partition offset") end
 
 -- ---------------------------------------------------------------------------
@@ -153,21 +153,21 @@ local function submit(label)
 end
 
 for i = 1, 4 do
-    submit(("pw-%d"):format(i))
+    submit(string.format("pw-%d", i))
 end
 
 -- Stop drains the in-memory batch and resumes every queued submitter
 -- with its real on-disk offset (or the write error).
 pw:stop(scheduler)
 
-if #results ~= 4 then fail(("expected 4 results, got %d"):format(#results)) end
+if #results ~= 4 then fail(string.format("expected 4 results, got %d", #results)) end
 for _, r in ipairs(results) do
-    if r.err then fail(("submit '%s' failed: %s"):format(r.label, r.err)) end
-    print(("  pw label=%s offset=%d"):format(r.label, r.offset))
+    if r.err then fail(string.format("submit '%s' failed: %s", r.label, r.err)) end
+    print(string.format("  pw label=%s offset=%d", r.label, r.offset))
 end
 
 local pw_bytes = p2.offset - off_before_pw
-print(("partition 2 advanced %d bytes"):format(pw_bytes))
+print(string.format("partition 2 advanced %d bytes", pw_bytes))
 if pw_bytes <= 0 then fail("PartitionWriter did not advance partition offset") end
 
 -- ---------------------------------------------------------------------------

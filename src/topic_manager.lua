@@ -23,7 +23,7 @@ function TopicManager:create_topic(name, numPartitions)
     if not valid then return nil, vErr end
 
     if self.topics[name] then
-        return nil, ("topic '%s' already exists"):format(name)
+        return nil, string.format("topic '%s' already exists", name)
     end
 
     local topicDir = fs_m.join_path(self.baseDir, name)
@@ -40,7 +40,7 @@ function TopicManager:create_topic(name, numPartitions)
         local partition, pErr = Partition.new(topic, i, topicDir)
         if not partition then
             for _, p in ipairs(opened) do p:close() end
-            return nil, ("failed to create partition %d: %s"):format(i, pErr)
+            return nil, string.format("failed to create partition %d: %s", i, pErr)
         end
         opened[#opened + 1] = partition
         topic.partitions[i] = partition

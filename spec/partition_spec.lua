@@ -8,9 +8,9 @@ local BASE_DIR     = IS_WINDOWS and "C:\\Temp\\lua_kafka_test" or "/tmp/lua_kafk
 
 local function rmdir(path)
     if IS_WINDOWS then
-        os.execute(('rmdir /s /q "%s" 2>nul'):format(path:gsub("/", "\\")))
+        os.execute(string.format('rmdir /s /q "%s" 2>nul', path:gsub("/", "\\")))
     else
-        os.execute(("rm -rf '%s'"):format(path))
+        os.execute(string.format("rm -rf '%s'", path))
     end
 end
 

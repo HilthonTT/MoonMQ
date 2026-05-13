@@ -33,7 +33,7 @@ function LogSegment:close()
 end
 
 function LogSegment:file_path(dir)
-    return fs_m.join_path(dir, ("%020d.log"):format(self.base_offset))
+    return fs_m.join_path(dir, string.format("%020d.log", self.base_offset))
 end
 
 local SegmentedPartition = {}
@@ -50,7 +50,7 @@ function SegmentedPartition.new(topic, id, dir)
     assert(type(id)  == "number", "id must be a number")
     assert(type(dir) == "string", "dir must be a string")
 
-    local partition_dir = fs_m.join_path(dir, ("partition-%d"):format(id))
+    local partition_dir = fs_m.join_path(dir, string.format("partition-%d", id))
     local ok, err = fs_m.mkdir(partition_dir)
     if not ok then
         return nil, err
@@ -86,7 +86,7 @@ function SegmentedPartition.new(topic, id, dir)
     sp.cleaner = coroutine.create(function() sp:segment_cleaner_loop() end)
     local cok, next_wake = coroutine.resume(sp.cleaner)
     if not cok then
-        return nil, ("failed to start cleaner coroutine: %s"):format(next_wake)
+        return nil, string.format("failed to start cleaner coroutine: %s", next_wake)
     end
     sp.cleaner_next_wake = next_wake
 
@@ -98,12 +98,12 @@ end
 function SegmentedPartition:create_new_segment(base_offset)
     assert(type(base_offset) == "number", "base_offset must be a number")
 
-    local file_name = ("%020d.log"):format(base_offset)
+    local file_name = string.format("%020d.log", base_offset)
     local file_path = fs_m.join_path(self.dir, file_name)
 
     local file, err = io.open(file_path, "a+b")
     if not file then
-        return ("failed to create segment file: %s"):format(err)
+        return string.format("failed to create segment file: %s", err)
     end
 
     local segment = LogSegment.new(file, base_offset, socket.gettime())
@@ -117,7 +117,7 @@ end
 function SegmentedPartition:load_segments()
     local matches, err = fs_m.glob(self.dir, LOG_FILE_PATTERN)
     if not matches then
-        return ("failed to glob segment files: %s"):format(err)
+        return string.format("failed to glob segment files: %s", err)
     end
 
     table.sort(matches, function(a, b)
@@ -130,12 +130,12 @@ function SegmentedPartition:load_segments()
         local base_name   = path:match("([^/\\]+)$")
         local base_offset = tonumber(base_name:match("(%d+)%.log$"))
         if not base_offset then
-            return ("invalid segment filename: %s"):format(base_name)
+            return string.format("invalid segment filename: %s", base_name)
         end
 
         local file, ferr = io.open(path, "a+b")
         if not file then
-            return ("failed to open segment file %s: %s"):format(path, ferr)
+            return string.format("failed to open segment file %s: %s", path, ferr)
         end
 
         -- No fstat in stdlib, so we approximate start_time as "now". If
@@ -161,7 +161,7 @@ function SegmentedPartition:write_message(msg)
         local new_base = self.active_segment.base_offset + current_size
         local cerr = self:create_new_segment(new_base)
         if cerr then
-            return nil, ("failed to roll segment: %s"):format(cerr)
+            return nil, string.format("failed to roll segment: %s", cerr)
         end
         -- The Go original reuses the stale `info.Size()` here, which
         -- double-counts the old segment's size into the next global
@@ -173,12 +173,12 @@ function SegmentedPartition:write_message(msg)
 
     local bytes, serr = msg_m.serialize_message(msg)
     if not bytes then
-        return nil, ("failed to serialize message: %s"):format(serr)
+        return nil, string.format("failed to serialize message: %s", serr)
     end
 
     local ok, werr = self.active_segment.file:write(bytes)
     if not ok then
-        return nil, ("failed to write message: %s"):format(werr)
+        return nil, string.format("failed to write message: %s", werr)
     end
 
     -- Push to the OS buffer. Not fsync — the Go version doesn't fsync
@@ -221,9 +221,9 @@ function SegmentedPartition:clean_old_segments()
             table.insert(kept, segment)
         else
             local path = segment:file_path(self.dir)
-            print(("Removing old segment %s (created at %s)")
-                :format(path, os.date("!%Y-%m-%dT%H:%M:%SZ",
-                                      math.floor(segment.start_time))))
+            print(string.format("Removing old segment %s (created at %s)",
+                path, os.date("!%Y-%m-%dT%H:%M:%SZ",
+                              math.floor(segment.start_time))))
             segment:close()
             os.remove(path)
         end
@@ -238,7 +238,7 @@ function SegmentedPartition:segment_cleaner_loop()
 
         local ok, err = pcall(self.clean_old_segments, self)
         if not ok then
-            print(("segment cleaner: %s"):format(err))
+            print(string.format("segment cleaner: %s", err))
         end
     end
 end
@@ -258,7 +258,7 @@ function SegmentedPartition:tick_cleaner()
 
     local ok, next_wake = coroutine.resume(self.cleaner)
     if not ok then
-        print(("segment cleaner crashed: %s"):format(next_wake))
+        print(string.format("segment cleaner crashed: %s", next_wake))
         self.cleaner = nil
         return false
     end

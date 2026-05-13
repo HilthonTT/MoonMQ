@@ -76,7 +76,7 @@ function Consumer:poll()
     for topic_name, partition_offsets in pairs(self.offsets) do
         local topic, err = self.broker:get_topic(topic_name)
         if not topic then
-            return nil, ("failed to get topic: %s"):format(err)
+            return nil, string.format("failed to get topic: %s", err)
         end
 
         for partition_id, offset in pairs(partition_offsets) do
@@ -106,7 +106,7 @@ function Consumer:poll()
                     if is_eof_error(read_err) then
                         self.offsets[topic_name][partition_id] = partition.offset
                     else
-                        return nil, ("failed to read message: %s"):format(read_err or "unknown error")
+                        return nil, string.format("failed to read message: %s", read_err or "unknown error")
                     end
                 end
             end
@@ -133,8 +133,8 @@ end
 -- commit_offset persists a single offset (stub — extend for file/DB storage).
 -- Returns (true, nil) on success, (nil, err) on failure.
 function Consumer:commit_offset(topic_name, partition_id, offset)
-    print(("Committed offset %d for topic '%s', partition %d")
-        :format(offset, topic_name, partition_id))
+    print(string.format("Committed offset %d for topic '%s', partition %d",
+        offset, topic_name, partition_id))
     return true, nil
 end
 

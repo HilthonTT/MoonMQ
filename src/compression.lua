@@ -19,7 +19,7 @@ local function compress_gzip(data)
     local stream = zlib.deflate(zlib.BEST_COMPRESSION, 31)
     local ok, compressed = pcall(stream, data, "finish")
     if not ok then
-        return nil, ("failed to compress with gzip: %s"):format(compressed)
+        return nil, string.format("failed to compress with gzip: %s", compressed)
     end
     return compressed, nil
 end
@@ -27,7 +27,7 @@ end
 local function compress_snappy(data)
     local compressed, err = snappy.compress(data)
     if not compressed then
-        return nil, ("failed to compress with snappy: %s"):format(err)
+        return nil, string.format("failed to compress with snappy: %s", err)
     end
     return compressed, nil
 end
@@ -38,7 +38,7 @@ local function decompress_gzip(data)
     local stream = zlib.inflate(31)
     local ok, decompressed = pcall(stream, data, "finish")
     if not ok then
-        return nil, ("failed to decompress with gzip: %s"):format(decompressed)
+        return nil, string.format("failed to decompress with gzip: %s", decompressed)
     end
     return decompressed, nil
 end
@@ -46,7 +46,7 @@ end
 local function decompress_snappy(data)
     local decompressed, err = snappy.uncompress(data)
     if not decompressed then
-        return nil, ("failed to decompress with snappy: %s"):format(err)
+        return nil, string.format("failed to decompress with snappy: %s", err)
     end
     return decompressed, nil
 end
@@ -66,7 +66,7 @@ function CompressedMessage.new(msg, compression_type)
     elseif compression_type == CompressionType.CompressionSnappy then
         value, err = compress_snappy(msg.value)
     else
-        return nil, ("unknown compression type: %d"):format(compression_type)
+        return nil, string.format("unknown compression type: %d", compression_type)
     end
 
     if err then
@@ -105,7 +105,7 @@ local function decompress(comp_msg)
     elseif ct == CompressionType.SNAPPY then
         value, err = decompress_snappy(comp_msg.value)
     else
-        return nil, ("unknown compression type: %d"):format(ct)
+        return nil, string.format("unknown compression type: %d", ct)
     end
 
     if err then

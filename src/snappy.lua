@@ -42,7 +42,7 @@ local function status_name(code)
     if     code == SNAPPY_OK              then return "OK"
     elseif code == SNAPPY_INVALID_INPUT   then return "INVALID_INPUT"
     elseif code == SNAPPY_BUFFER_TOO_SMALL then return "BUFFER_TOO_SMALL"
-    else   return ("UNKNOWN(%d)"):format(code)
+    else   return string.format("UNKNOWN(%d)", code)
     end
 end
 
@@ -56,7 +56,7 @@ local function compress(data)
 
     local status = lib.snappy_compress(data, in_len, out, out_len)
     if status ~= SNAPPY_OK then
-        return nil, ("snappy_compress: %s"):format(status_name(status))
+        return nil, string.format("snappy_compress: %s", status_name(status))
     end
 
     return ffi.string(out, out_len[0]), nil
@@ -72,13 +72,13 @@ local function uncompress(data)
     -- first so we can size the output buffer exactly. No iterative grow.
     local status = lib.snappy_uncompressed_length(data, in_len, out_len)
     if status ~= SNAPPY_OK then
-        return nil, ("snappy_uncompressed_length: %s"):format(status_name(status))
+        return nil, string.format("snappy_uncompressed_length: %s", status_name(status))
     end
 
     local out = ffi.new("char[?]", out_len[0])
     status = lib.snappy_uncompress(data, in_len, out, out_len)
     if status ~= SNAPPY_OK then
-        return nil, ("snappy_uncompress: %s"):format(status_name(status))
+        return nil, string.format("snappy_uncompress: %s", status_name(status))
     end
 
     return ffi.string(out, out_len[0]), nil

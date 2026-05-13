@@ -13,7 +13,7 @@ function Partition.new(topic, id, topic_dir)
     assert(type(id) == "number", "id must be a number")
     assert(type(topic_dir) == "string", "topic_dir must be a string")
 
-    local log_file_name = ("partition-%d.log"):format(id)
+    local log_file_name = string.format("partition-%d.log", id)
     local file_path     = fs_m.join_path(topic_dir, log_file_name)
 
     local f, err = io.open(file_path, "a+b")
@@ -87,7 +87,7 @@ function Partition:write_message(msg)
 
     local ok, err = self.file:write(record)
     if not ok then
-        return -1, ("failed to write message: %s"):format(err)
+        return -1, string.format("failed to write message: %s", err)
     end
 
     self.offset = self.offset + 8 + total_size
@@ -107,7 +107,7 @@ function Partition:read_message(offset)
 
     local pos, serr = self.file:seek("set", offset)
     if not pos then
-        return nil, offset, ("failed to seek offset: %s"):format(serr)
+        return nil, offset, string.format("failed to seek offset: %s", serr)
     end
 
     local size_bytes = self.file:read(8)

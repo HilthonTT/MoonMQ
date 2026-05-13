@@ -109,7 +109,7 @@ function Producer:produce(topic_name, msg)
 
     local topic, err = self.broker:get_topic(topic_name)
     if not topic then
-        return -1, -1, ("failed to get topic: %s"):format(err)
+        return -1, -1, string.format("failed to get topic: %s", err)
     end
 
     local num_partitions = #topic.partitions
@@ -117,19 +117,19 @@ function Producer:produce(topic_name, msg)
 
     local partition = topic.partitions[partition_id]
     if not partition then
-        return -1, -1, ("partition %d does not exist"):format(partition_id)
+        return -1, -1, string.format("partition %d does not exist", partition_id)
     end
 
     local offset, werr = partition:write_message(msg)
     if werr then
-        return -1, -1, ("failed to write message: %s"):format(werr)
+        return -1, -1, string.format("failed to write message: %s", werr)
     end
 
     if self.acks > 0 then
         -- True fsync, not just userspace flush; otherwise acks=1 lies.
         local sok, serr = io_sync.sync(partition.file)
         if not sok then
-            return -1, -1, ("failed to sync partition: %s"):format(serr)
+            return -1, -1, string.format("failed to sync partition: %s", serr)
         end
         partition.last_sync = socket.gettime()
     end
@@ -167,7 +167,7 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         local topic, err = self.broker:get_topic(topic_name)
         if not topic then
             future:resolve(ProduceResult.new(topic_name, -1, -1,
-                ("failed to get topic: %s"):format(err)))
+                string.format("failed to get topic: %s", err)))
             return
         end
 
@@ -176,14 +176,14 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         local partition      = topic.partitions[partition_id]
         if not partition then
             future:resolve(ProduceResult.new(topic_name, partition_id, -1,
-                ("partition %d does not exist"):format(partition_id)))
+                string.format("partition %d does not exist", partition_id)))
             return
         end
 
         local offset, werr = partition:write_message(msg)
         if werr then
             future:resolve(ProduceResult.new(topic_name, partition_id, -1,
-                ("failed to write message: %s"):format(werr)))
+                string.format("failed to write message: %s", werr)))
             return
         end
 
@@ -191,7 +191,7 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
             local sok, serr = io_sync.sync(partition.file)
             if not sok then
                 future:resolve(ProduceResult.new(topic_name, partition_id, -1,
-                    ("failed to sync partition: %s"):format(serr)))
+                    string.format("failed to sync partition: %s", serr)))
                 return
             end
             partition.last_sync = socket.gettime()
@@ -204,8 +204,8 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         local elapsed = socket.gettime() - started
         if timeout and elapsed > timeout then
             io.stderr:write(
-                ("warn: produce exceeded timeout: %.3fs > %.3fs\n")
-                :format(elapsed, timeout))
+                string.format("warn: produce exceeded timeout: %.3fs > %.3fs\n",
+                    elapsed, timeout))
         end
 
         future:resolve(ProduceResult.new(topic_name, partition_id, offset, nil))

@@ -45,7 +45,7 @@ function Broker:load_topics()
             if valid then
                 local partition_files, gErr = fs_m.glob(topic_dir, "^partition%-(%d+)%.log$")
                 if not partition_files then
-                    return ("failed to glob partitions for topic %s: %s"):format(name, gErr)
+                    return string.format("failed to glob partitions for topic %s: %s", name, gErr)
                 end
 
                 -- Extract partition IDs from filenames; reject gaps.
@@ -66,7 +66,7 @@ function Broker:load_topics()
                     for _, id in ipairs(ids) do
                         local _, rerr = recover(topic_dir, id)
                         if rerr then
-                            return ("failed to recover topic %s partition %d: %s"):format(name, id, rerr)
+                            return string.format("failed to recover topic %s partition %d: %s", name, id, rerr)
                         end
                     end
 
@@ -74,13 +74,13 @@ function Broker:load_topics()
                     -- Verify contiguous 1..max_id.
                     for i = 1, max_id do
                         if ids[i] ~= i then
-                            return ("topic %s has non-contiguous partition files (missing partition %d)"):format(name, i)
+                            return string.format("topic %s has non-contiguous partition files (missing partition %d)", name, i)
                         end
                     end
 
                     local _, cErr = self.topic_manager:create_topic(name, max_id)
                     if cErr then
-                        return ("failed to load topic %s: %s"):format(name, cErr)
+                        return string.format("failed to load topic %s: %s", name, cErr)
                     end
                 end
             end
@@ -102,7 +102,7 @@ function Broker:get_topic(name)
 
     local existing_topic = self.topic_manager.topics[name]
     if not existing_topic then
-        return nil, ("topic %s does not exist"):format(name)
+        return nil, string.format("topic %s does not exist", name)
     end
 
     return existing_topic, nil

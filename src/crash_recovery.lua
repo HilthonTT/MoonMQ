@@ -19,7 +19,7 @@ local function recover_partition(topic_dir, partition_id)
     assert(type(topic_dir) == "string", "topic_dir must be a string")
     assert(type(partition_id) == "number", "partition_id must be a number")
 
-    local log_file_name = ("partition-%d.log"):format(partition_id)
+    local log_file_name = string.format("partition-%d.log", partition_id)
     local file_path     = fs_m.join_path(topic_dir, log_file_name)
 
     local file, oerr = io.open(file_path, "r+b")
