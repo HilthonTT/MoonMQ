@@ -47,7 +47,35 @@ From the project root:
 lua5.4 main.lua
 ```
 
-This runs the smoke test, which exercises the broker, producer, consumer, `BatchWriter`, and `PartitionWriter` against a local data directory at `./data_test`.
+`main.lua` is the project's runnable example: an end-to-end "order-events
+pipeline" that wires every module under `src/` together and narrates each
+stage against a local data directory at `./data_test`. It walks through:
+
+1. Bootstrapping the broker and creating a topic
+2. Producing events synchronously (`Producer`, `acks=1`)
+3. Producing events asynchronously (`produce_async` + `Future`)
+4. Consumer-group partition rebalancing (`ConsumerGroup`)
+5. Consuming the topic and verifying nothing was lost
+6. Synchronous batched appends (`BatchWriter`)
+7. Asynchronous batched appends (`PartitionWriter`)
+8. Resilient writes that retry transient I/O errors (`Partition:write_with_resilience`)
+9. An accumulating byte buffer (`Buffer`)
+10. A log that rolls into multiple segments (`SegmentedPartition`)
+11. Message compression (`CompressedMessage` — optional, see below)
+12. Leader-side replication (`ReplicatedPartition` — optional, see below)
+13. Crash recovery on broker restart (CRC-validated log scan)
+
+### Optional modules
+
+Three modules depend on libraries that may not be present. `main.lua`
+`pcall`-gates them and prints a "skipped" note when they are unavailable, so
+the demo always runs to completion:
+
+- **`src/compression.lua`** needs the `zlib` LuaRocks module (gzip support).
+- **`src/snappy.lua`** needs LuaJIT's FFI and `libsnappy` (Snappy support).
+- **`src/replica.lua`** loads on stock Lua, but real replication needs a peer
+  broker exposing an HTTP `/replicate` endpoint; the demo only exercises the
+  leader-side local-write path.
 
 ## Testing
 

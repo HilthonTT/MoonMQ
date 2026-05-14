@@ -41,6 +41,7 @@ SegmentedPartition.__index = SegmentedPartition
 
 local DEFAULT_MAX_SEGMENT_SIZE = 1024 * 1024 * 1024  -- 1 GiB
 local DEFAULT_RETENTION        = 7 * 24 * time_m.HOUR
+local DEFAULT_CLEANER_INTERVAL = 1 * time_m.HOUR
 
 -- Anchored Lua pattern (NOT a shell glob). fs_m.glob takes a Lua pattern.
 local LOG_FILE_PATTERN = "^%d+%.log$"
@@ -62,6 +63,7 @@ function SegmentedPartition.new(topic, id, dir)
         dir              = partition_dir,
         max_segment_size = DEFAULT_MAX_SEGMENT_SIZE,
         retention        = DEFAULT_RETENTION,
+        cleaner_interval = DEFAULT_CLEANER_INTERVAL,
         segments         = {},
         active_segment   = nil,
     }, SegmentedPartition)
@@ -107,7 +109,7 @@ function SegmentedPartition:create_new_segment(base_offset)
     end
 
     local segment = LogSegment.new(file, base_offset, socket.gettime())
-    self.segments.insert(segment)
+    table.insert(self.segments, segment)
     self.active_segment = segment
 
     return nil

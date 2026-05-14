@@ -5,6 +5,35 @@ local msg_m = require("src.message")
 local crc32   = require("src.crc32")
 local io_sync = require("src.io_sync")
 
+-- Patterns we treat as transient. We can't introspect errno from plain
+-- io.write — Lua gives us the system's strerror text. These cover Linux/
+-- macOS strings plus a few Windows equivalents you'll hit on your WSL +
+-- native split. Extend as you find cases that should retry but don't.
+local RETRYABLE_PATTERNS = {
+    "resource temporarily unavailable",   -- EAGAIN / EWOULDBLOCK
+    "interrupted system call",            -- EINTR
+    "device or resource busy",            -- EBUSY
+    "no buffer space available",          -- ENOBUFS
+    "try again",                          -- some Linux variants
+    -- Windows-flavored strings:
+    "being used by another process",
+    "the operation could not be completed",
+}
+
+local function is_retryable_error(err)
+    assert(type(err) == "string", "err must be a string")
+
+    if not err then return false end
+    local low = err:lower()
+
+    for i = 1, #RETRYABLE_PATTERNS do
+        if low:find(RETRYABLE_PATTERNS[i], 1, true) then
+            return true
+        end 
+    end
+    return false
+end
+
 local Partition = {}
 Partition.__index = Partition
 
@@ -154,6 +183,38 @@ function Partition:read_message(offset)
     local next_offset = offset + 8 + total_size
 
     return msg, next_offset, nil
+end
+
+function Partition:write_with_resilience(msg)
+    assert(getmetatable(msg) == msg_m.Message, "msg must be Message instance")
+
+    local offset, err
+    local last_attempt = 0
+
+    for retries = 0, 2 do
+        last_attempt = retries
+        offset, err = self:write_message(msg)
+        if not err then break end
+
+        if not is_retryable_error(err) then
+            return -1, err
+        end
+
+        -- Sleep before the next attempt. Skip on the final iteration —
+        -- the Go version sleeps here unconditionally, which is a wasted
+        -- 200ms when we're about to give up anyway.
+        if retries < 2 then
+            socket.sleep((retries + 1) * 0.1)
+        end
+    end
+
+    if not err and last_attempt > 0 then
+        io.stderr:write(string.format(
+            "[partition %d] write succeeded after %d retries\n",
+            self.id, last_attempt))
+    end
+
+    return offset, err
 end
 
 local PartitionWriter = {}

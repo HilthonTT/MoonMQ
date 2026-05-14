@@ -98,11 +98,11 @@ local function decompress(comp_msg)
     local value, err
     local ct = comp_msg.compression_type
 
-    if ct == CompressionType.NONE then
+    if ct == CompressionType.CompressionNone then
         value = comp_msg.value
-    elseif ct == CompressionType.GZIP then
+    elseif ct == CompressionType.CompressionGzip then
         value, err = decompress_gzip(comp_msg.value)
-    elseif ct == CompressionType.SNAPPY then
+    elseif ct == CompressionType.CompressionSnappy then
         value, err = decompress_snappy(comp_msg.value)
     else
         return nil, string.format("unknown compression type: %d", ct)
