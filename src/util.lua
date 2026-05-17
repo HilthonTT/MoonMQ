@@ -1,6 +1,6 @@
 -- Shared helpers used across the public API surface.
-
 local M = {}
+M.__index = M
 
 -- Topic-name validator. Mirrors Kafka's rules closely enough to keep us safe:
 -- only [A-Za-z0-9._-], no leading dash, length 1..249. Critically, this is

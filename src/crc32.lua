@@ -1,4 +1,3 @@
--- src/crc32.lua
 -- IEEE 802.3 CRC-32, byte-compatible with Go's crc32.ChecksumIEEE.
 -- Uses zlib via FFI when available (fast path); falls back to a
 -- table-driven pure-Lua implementation otherwise.

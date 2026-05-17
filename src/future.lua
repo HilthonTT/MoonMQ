@@ -1,4 +1,3 @@
--- src/future.lua
 -- A one-shot promise/future. Caller awaits from inside a coroutine;
 -- producer resolves once with a value that gets delivered to all waiters.
 
