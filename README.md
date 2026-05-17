@@ -1,4 +1,4 @@
-# Nuntius
+# MoonMQ
 A message broker coded in LUA
 
 ## Requirements
