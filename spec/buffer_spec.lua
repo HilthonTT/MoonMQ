@@ -1,4 +1,3 @@
--- spec/buffer_spec.lua
 local Buffer = require("src.buffer")
 
 describe("Buffer", function()

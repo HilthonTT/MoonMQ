@@ -1,4 +1,3 @@
--- spec/message_spec.lua
 local message_m = require("src.message")
 local Message       = message_m.Message
 local MessageHeader = message_m.MessageHeader

@@ -1,4 +1,3 @@
--- spec/util_spec.lua
 local util = require("src.util")
 
 describe("validate_topic_name", function()

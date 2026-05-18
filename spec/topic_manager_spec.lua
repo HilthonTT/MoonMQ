@@ -1,4 +1,3 @@
--- spec/topic_manager_spec.lua
 local TopicManager = require("src.topic_manager")
 
 local IS_WINDOWS   = package.config:sub(1,1) == "\\"

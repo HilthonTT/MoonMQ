@@ -1,4 +1,3 @@
--- spec/crc32_spec.lua
 local crc32 = require("src.crc32")
 
 describe("crc32 (IEEE 802.3)", function()

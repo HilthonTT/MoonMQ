@@ -1,4 +1,3 @@
--- spec/future_spec.lua
 local Future = require("src.future")
 
 -- Minimal scheduler stub: resume() just dispatches to coroutine.resume.

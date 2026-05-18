@@ -1,4 +1,3 @@
--- spec/partition_spec.lua
 local TopicManager = require("src.topic_manager")
 local message      = require("src.message")
 local recover      = require("src.crash_recovery")

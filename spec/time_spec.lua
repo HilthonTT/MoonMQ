@@ -1,4 +1,3 @@
--- spec/time_spec.lua
 local time_m = require("src.time")
 
 describe("time constants", function()
