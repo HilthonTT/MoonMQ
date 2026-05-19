@@ -55,7 +55,7 @@ end
 M.encode_string = encode_string
 
 local function encode_frame(op, correl_id, payload)
-    local body = string.pack(">I4", op, correl_id) .. payload
+    local body = string.pack(">BI4", op, correl_id) .. payload
     return string.pack(">I4", #body) .. body
 end
 M.encode_frame = encode_frame
@@ -76,17 +76,17 @@ function M.encode_auth(correl_id, username, password)
 end
 
 function M.encode_auth_ok(correl_id)
-    return encode_frame(M.OP_AUTH, correl_id, "")
+    return encode_frame(M.OP_AUTH_OK, correl_id, "")
 end
 
 function M.encode_produce(correl_id, topic, key, value)
     local payload = encode_string(topic) .. encode_string(key) .. encode_string(value)
-    return encode_frame(M.OP_AUTH, correl_id, payload)
+    return encode_frame(M.OP_PRODUCE, correl_id, payload)
 end
 
 function M.encode_produce_ack(correl_id, partition, offset)
     local payload = string.pack(">i4I8", partition, offset)
-    return encode_frame(M.OP_AUTH, correl_id, payload)
+    return encode_frame(M.OP_PRODUCE_ACK, correl_id, payload)
 end
 
 function M.encode_fetch(correl_id, max_records)
@@ -124,7 +124,7 @@ local function decode_string(buf, pos)
     local len = string.unpack(">I4", buf, pos)
     pos = pos + 4
 
-    if len > #buf - 1 + 1 then
+    if len > #buf - pos + 1 then
         return nil, nil, "truncated string body"
     end
     return buf:sub(pos, pos + len - 1), pos + len, nil

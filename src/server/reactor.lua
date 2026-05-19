@@ -123,10 +123,13 @@ function Reactor:listen(host, port, on_accept)
     local listener, err = socket.bind(host, port)
     if not listener then return nil, err end
 
+    self.listeners[listener] = on_accept
+
     self:spawn(function()
         while self.running do
             local client, aerr = self:accept(listener)
             if not client then
+                if not self.running then break end
                 io.stderr:write(string.format("[reactor] accept: %s\n", aerr))
                 self:sleep(0.1)
             else
@@ -134,6 +137,7 @@ function Reactor:listen(host, port, on_accept)
                 self:spawn(function() on_accept(client, peer) end)
             end
         end
+        self.listeners[listener] = nil
         listener:close()
     end)
 
@@ -208,6 +212,25 @@ end
 
 function Reactor:stop()
     self.running = false
+end
+
+-- Close all sockets the reactor is tracking. Call after run() returns so
+-- peers see a clean FIN instead of waiting for GC to drop the fd.
+function Reactor:shutdown()
+    for listener in pairs(self.listeners) do
+        pcall(function() listener:close() end)
+    end
+    self.listeners = {}
+
+    for sock in pairs(self.read_waiters) do
+        pcall(function() sock:close() end)
+    end
+    self.read_waiters = {}
+
+    for sock in pairs(self.write_waiters) do
+        pcall(function() sock:close() end)
+    end
+    self.write_waiters = {}
 end
 
 return Reactor
