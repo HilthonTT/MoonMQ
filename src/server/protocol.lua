@@ -174,4 +174,38 @@ function M.decode_create_topic(payload)
     return { name = name, num_partitions = string.unpack(">I4", payload, p) }, nil
 end
 
+function M.decode_commit(payload)
+    local topic, p, err = decode_string(payload, 1)
+    if not topic then return nil end
+
+    if #payload - p + 1 < 12 then
+        return nil, "short commit"
+    end
+
+    local partition, offset = string.unpack(">I4I8", payload, p)
+    return { topic = topic, partition = partition, offset = offset }, nil
+end
+
+function M.decode_topic_list(payload)
+    if #payload < 4 then return nil, "short topic list" end
+    local count = string.unpack(">I4", payload, 1)
+    local pos = 5
+    local names = {}
+    for i = 1, count do
+        local n, np, derr = decode_string(payload, pos)
+        if not n then return nil, derr end
+        names[i] = n
+        pos = np or pos
+    end
+    return names, nil
+end
+
+function M.decode_error(payload)
+    if #payload < 2 then return nil, "short error" end
+    local code = string.unpack(">I2", payload, 1)
+    local msg, _, merr = decode_string(payload, 3)
+    if not msg then return nil, merr end
+    return { code = code, message = msg }, nil
+end
+
 return M

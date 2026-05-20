@@ -7,10 +7,13 @@ local Reactor = require("src.server.reactor")
 local proto = require("src.server.protocol")
 local brk_m = require("src.broker")
 local msg_m = require("src.message")
+local prd_m      = require("src.producer")
+local consumer_m = require("src.consumer")
 
 local DEFAULT_MAX_FRAME       = 16 * 1024 * 1024  -- 16 MiB
 local DEFAULT_HANDSHAKE_DEADLINE = 30             -- seconds
 local DEFAULT_IDLE_DEADLINE   = 300               -- seconds (5 min)
+local DEFAULT_PUSH_INTERVAL = 0.05
 
 local Server = {}
 Server.__index = Server
@@ -22,24 +25,26 @@ function Server.new(opts)
     local broker, berr = brk_m.Broker.new(opts.data_dir)
     if not broker then return nil, berr end
 
+    local producer = prd_m.Producer.new(broker, prd_m.AckMode.AckLeader)
+
     return setmetatable({
         broker        = broker,
+        producer      = producer,
         reactor       = Reactor.new(),
         host          = opts.host or "0.0.0.0",
         port          = opts.port or 9092,
         max_frame     = opts.max_frame or DEFAULT_MAX_FRAME,
         idle_deadline = opts.idle_deadline or DEFAULT_IDLE_DEADLINE,
         handshake_deadline = opts.handshake_deadline or DEFAULT_HANDSHAKE_DEADLINE,
-
-        -- DDoS knobs
+        push_interval = opts.push_interval or DEFAULT_PUSH_INTERVAL,
+ 
         max_connections        = opts.max_connections or 1024,
         max_connections_per_ip = opts.max_connections_per_ip or 32,
         connections            = 0,
-        conn_by_ip             = {},  -- ip -> count
-
-        -- Pluggables (fill in next)
-        authenticator = opts.authenticator,  -- function(user, pass) -> ok, err
-        rate_limiter_factory = opts.rate_limiter_factory, -- function() -> bucket
+        conn_by_ip             = {},
+ 
+        authenticator        = opts.authenticator,
+        rate_limiter_factory = opts.rate_limiter_factory,
     }, Server)
 end
 
@@ -84,7 +89,9 @@ function Server:_register_conn(ip)
 end
 
 function Server:_unregister_conn(ip)
-    self.connections = self.connections - 1
+    if self.connections > 0 then
+        self.connections = self.connections - 1
+    end
     local n = (self.conn_by_ip[ip] or 1) - 1
     if n <= 0 then
         self.conn_by_ip[ip] = nil
@@ -156,72 +163,21 @@ end
 -- or (false, reason) to terminate it. Per-op errors that the client can
 -- recover from are sent as ERROR frames and return (true, nil).
 function Server:_dispatch(conn, op, correl, payload)
-    -- HELLO and AUTH are the only ops allowed before auth completes.
     if not conn.authed and op ~= proto.OP_HELLO and op ~= proto.OP_AUTH then
-        conn.send(proto.encode_error(correl, proto.ERR_NOT_AUTHED,
-            "authenticate first"))
-        return true, nil
+        conn.send(proto.encode_error(correl, proto.ERR_NOT_AUTHED, "authenticate first"))
+        return true
     end
-
-    if op == proto.OP_HELLO then
-        local h, herr = proto.decode_hello(payload)
-        if not h then
-            conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, herr))
-            return true
-        end
-        if h.version ~= proto.PROTOCOL_VERSION then
-            conn.send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
-                "version mismatch"))
-            return false, "protocol version"
-        end
-        conn.send(proto.encode_welcome(correl, proto.PROTOCOL_VERSION))
-        return true
-
-    elseif op == proto.OP_AUTH then
-        local a, aerr = proto.decode_auth(payload)
-        if not a then
-            conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, aerr))
-            return true
-        end
-        if not self.authenticator then
-            -- No authenticator configured = open mode. Useful for dev,
-            -- but log loudly so it doesn't ship to prod silently.
-            io.stderr:write("[server] WARN: no authenticator configured, allowing\n")
-            conn.authed = true
-            conn.username = a.username
-            conn.send(proto.encode_auth_ok(correl))
-            return true
-        end
-        local ok, auth_err = self.authenticator(a.username, a.password, conn.ip)
-        if not ok then
-            conn.send(proto.encode_error(correl, proto.ERR_AUTH_FAILED,
-                auth_err or "auth failed"))
-            -- Don't disconnect immediately; let the auth module decide
-            -- (it may want to apply per-IP backoff before we kill the
-            -- connection). For now: drop after one failure.
-            return false, "auth failed"
-        end
-        conn.authed = true
-        conn.username = a.username
-        conn.send(proto.encode_auth_ok(correl))
-        return true
-
-    elseif op == proto.OP_PING then
-        conn.send(proto.encode_pong(correl))
-        return true
-
-    elseif op == proto.OP_PRODUCE then
-        if conn.rate_limiter and not conn.rate_limiter:take(1) then
-            conn.send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
-                "too many produces"))
-            return true
-        end
-        return self:_handle_produce(conn, correl, payload)
-
-    elseif op == proto.OP_GOODBYE then
-        return false, "client goodbye"
-
-    -- TODO: FETCH, SUBSCRIBE, COMMIT, CREATE_TOPIC, LIST_TOPICS
+ 
+    if op == proto.OP_HELLO         then return self:_handle_hello(conn, correl, payload)
+    elseif op == proto.OP_AUTH         then return self:_handle_auth(conn, correl, payload)
+    elseif op == proto.OP_PING         then conn.send(proto.encode_pong(correl)); return true
+    elseif op == proto.OP_PRODUCE      then return self:_handle_produce(conn, correl, payload)
+    elseif op == proto.OP_SUBSCRIBE    then return self:_handle_subscribe(conn, correl, payload)
+    elseif op == proto.OP_FETCH        then return self:_handle_fetch(conn, correl, payload)
+    elseif op == proto.OP_COMMIT       then return self:_handle_commit(conn, correl, payload)
+    elseif op == proto.OP_CREATE_TOPIC then return self:_handle_create_topic(conn, correl, payload)
+    elseif op == proto.OP_LIST_TOPICS  then return self:_handle_list_topics(conn, correl, payload)
+    elseif op == proto.OP_GOODBYE      then return false, "client goodbye"
     else
         conn.send(proto.encode_error(correl, proto.ERR_UNKNOWN_OP,
             string.format("op 0x%02X", op)))
@@ -229,36 +185,235 @@ function Server:_dispatch(conn, op, correl, payload)
     end
 end
 
+function Server:_handle_hello(conn, correl, payload)
+    local h, herr = proto.decode_hello(payload)
+    if not h then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, herr))
+        return true
+    end
+    if h.version ~= proto.PROTOCOL_VERSION then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            string.format("expected v%d got v%d",
+                proto.PROTOCOL_VERSION, h.version)))
+        return false, "protocol version"
+    end
+    conn.send(proto.encode_welcome(correl, proto.PROTOCOL_VERSION))
+    return true
+end
+ 
+function Server:_handle_auth(conn, correl, payload)
+    local a, aerr = proto.decode_auth(payload)
+    if not a then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, aerr))
+        return true
+    end
+ 
+    if not self.authenticator then
+        io.stderr:write("[server] WARN: no authenticator, allowing\n")
+        conn.authed   = true
+        conn.username = a.username
+        conn.send(proto.encode_auth_ok(correl))
+        return true
+    end
+ 
+    local ok, auth_err = self.authenticator:verify(a.username, a.password, conn.ip)
+    if not ok then
+        -- Don't echo the supplied username in logs — it could be
+        -- attacker-controlled and pollute logs / trigger log injection
+        -- on downstream log processors.
+        conn.send(proto.encode_error(correl, proto.ERR_AUTH_FAILED,
+            auth_err or "auth failed"))
+        return false, "auth failed"
+    end
+ 
+    conn.authed   = true
+    conn.username = a.username
+    conn.send(proto.encode_auth_ok(correl))
+    return true
+end
+
+
 function Server:_handle_produce(conn, correl, payload)
+    if conn.rate_limiter and not conn.rate_limiter:take(1) then
+        conn.send(proto.encode_error(correl, proto.ERR_RATE_LIMITED, "produce rate exceeded"))
+        return true
+    end
+ 
     local p, perr = proto.decode_produce(payload)
     if not p then
         conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, perr))
         return true
     end
-
-    local topic, terr = self.broker:get_topic(p.topic)
-    if not topic then
-        conn.send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING, terr))
-        return true
-    end
-
-    -- Reusing the existing Producer would be cleaner; inlining here so
-    -- this file stays focused on the network plumbing. Swap for Producer
-    -- once you wire it through.
+ 
     local msg = msg_m.Message.new(p.key, p.value, 0)
-    local crc32 = require("src.crc32")
-
-    local part_id = (crc32(p.key) % #topic.partitions) + 1
-    local partition = topic.partitions[part_id]
-    local offset, werr = partition:write_message(msg)
+    local part_id, offset, werr = self.producer:produce(p.topic, msg)
     if werr then
-        conn.send(proto.encode_error(correl, proto.ERR_INTERNAL, werr))
+        local code = werr:find("does not exist", 1, true)
+            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
+        conn.send(proto.encode_error(correl, code, werr))
         return true
     end
-
+ 
     conn.send(proto.encode_produce_ack(correl, part_id, offset))
     return true
 end
+
+local function ensure_consumer(conn, broker, group_id)
+    if conn.consumer then
+        if conn.consumer.group_id ~= group_id then
+            return nil, string.format("group_id mismatch (already in group %s)",
+                conn.consumer.group_id)
+        end
+        return conn.consumer
+    end
+    conn.consumer = consumer_m.Consumer.new(broker, group_id)
+    return conn.consumer
+end
+
+function Server:_handle_subscribe(conn, correl, payload)
+    local s, serr = proto.decode_subscribe(payload)
+    if not s then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, serr))
+        return true
+    end
+    if conn.mode == "pull" then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            "connection already in pull mode (used FETCH)"))
+        return true
+    end
+    local consumer, cerr = ensure_consumer(conn, self.broker, s.group_id)
+    if not consumer then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
+        return true
+    end
+    local ok, err = consumer:subscribe(s.topic)
+    if not ok then
+        conn.send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING, err or "subscribe failed"))
+        return true
+    end
+    conn.subscriptions[s.topic] = true
+    conn.mode = "push"
+    conn.send(proto.encode_ok(correl))
+ 
+    if not conn.subscriber_co then
+        conn.subscriber_co = self.reactor:spawn(function()
+            self:_subscriber_loop(conn)
+        end)
+    end
+    return true
+end
+ 
+function Server:_subscriber_loop(conn)
+    while not conn.closed do
+        local records, err = conn.consumer:poll()
+        if err then
+            io.stderr:write(string.format("[push] %s poll: %s\n", conn.peer, err))
+            return
+        end
+        if records and #records > 0 then
+            for i = 1, #records do
+                if conn.closed then return end
+                local r = records[i]
+                local frame = proto.encode_record(0,
+                    r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
+                if not conn.send(frame) then return end
+            end
+        else
+            self.reactor:sleep(self.push_interval)
+        end
+    end
+end
+ 
+function Server:_handle_fetch(conn, correl, payload)
+    local f, ferr = proto.decode_fetch(payload)
+    if not f then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, ferr))
+        return true
+    end
+    if conn.mode == "push" then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            "connection already in push mode (used SUBSCRIBE)"))
+        return true
+    end
+    local consumer, cerr = ensure_consumer(conn, self.broker, f.group_id)
+    if not consumer then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
+        return true
+    end
+    if not conn.subscriptions[f.topic] then
+        local sok, sber = consumer:subscribe(f.topic)
+        if not sok then
+            conn.send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
+                sber or "subscribe failed"))
+            return true
+        end
+        conn.subscriptions[f.topic] = true
+    end
+    conn.mode = "pull"
+ 
+    local records, perr = consumer:poll()
+    if perr then
+        conn.send(proto.encode_error(correl, proto.ERR_INTERNAL, perr))
+        return true
+    end
+    if records then
+        local limit = math.min(#records, f.max_records or #records)
+        for i = 1, limit do
+            local r = records[i]
+            local frame = proto.encode_record(correl,
+                r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
+            if not conn.send(frame) then return false, "send failed" end
+        end
+    end
+    conn.send(proto.encode_ok(correl))
+    return true
+end
+ 
+function Server:_handle_commit(conn, correl, payload)
+    local c, cerr = proto.decode_commit(payload)
+    if not c then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, cerr))
+        return true
+    end
+    if not conn.consumer then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            "commit requires prior subscribe/fetch"))
+        return true
+    end
+    local ok, err = conn.consumer:commit_offset(c.topic, c.partition, c.offset)
+    if not ok then
+        conn.send(proto.encode_error(correl, proto.ERR_INTERNAL, err or "commit failed"))
+        return true
+    end
+    conn.send(proto.encode_ok(correl))
+    return true
+end
+ 
+function Server:_handle_create_topic(conn, correl, payload)
+    local c, cerr = proto.decode_create_topic(payload)
+    if not c then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME, cerr))
+        return true
+    end
+    if c.num_partitions < 1 or c.num_partitions > 1024 then
+        conn.send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
+            "num_partitions out of range (1..1024)"))
+        return true
+    end
+    local _, err = self.broker:create_topic(c.name, c.num_partitions)
+    if err then
+        conn.send(proto.encode_error(correl, proto.ERR_INTERNAL, err))
+        return true
+    end
+    conn.send(proto.encode_ok(correl))
+    return true
+end
+ 
+function Server:_handle_list_topics(conn, correl, _payload)
+    conn.send(proto.encode_topic_list(correl, self.broker:list_topics()))
+    return true
+end
+
 
 -- Install handlers for SIGINT, SIGTERM, and SIGTSTP (Ctrl+Z) so the
 -- reactor stops on the next tick. The handler must do as little as

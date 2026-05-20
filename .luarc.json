@@ -1,9 +1,48 @@
 {
   "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+
   "runtime.version": "Lua 5.4",
-  "diagnostics.globals": ["describe", "it", "before_each"],
+
+  // Busted globals — test structure, lifecycle hooks, and mocking helpers
+  "diagnostics.globals": [
+    "describe",
+    "it",
+    "pending",
+    "before_each",
+    "after_each",
+    "setup",
+    "teardown",
+    "lazy_setup",
+    "lazy_teardown",
+    "strict_setup",
+    "strict_teardown",
+    "finally",
+    "insulate",
+    "expose",
+    "randomize",
+    "spy",
+    "stub",
+    "mock"
+  ],
+
+  // Type defs for assert.*, spy.*, stub.*, mock.* APIs
   "workspace.library": ["${3rd}/busted/library"],
   "workspace.checkThirdParty": false,
+
+  // Inlay hints — variable types, param names, array indices
   "hint.enable": true,
-  "hint.setType": true
+  "hint.setType": true,
+  "hint.paramName": "All",
+  "hint.paramType": true,
+  "hint.arrayIndex": "Auto",
+
+  // Better autocomplete + hover
+  "completion.callSnippet": "Replace",
+  "hover.expandAlias": true,
+
+  // Built-in formatter (Shift+Alt+F)
+  "format.enable": true,
+
+  // Don't phone home
+  "telemetry.enable": false
 }

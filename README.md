@@ -4,13 +4,19 @@ A message broker coded in LUA
 ## Requirements
 
 - Lua 5.4 (uses native bitwise operators and `goto`/labels)
-- LuaSocket (`lua-socket`)
+- LuaSocket (`lua-socket`) — TCP networking
+- dkjson — pure-Lua JSON, used by `src/server/config.lua` to read `appsettings.json`
 - luaposix (Linux only — used for real `fsync`/`ftruncate` so `acks=1` actually flushes to disk)
+
+SHA-256/HMAC for authentication is provided by a vendored pure-Lua
+`sha2.lua` at the repo root — no installation needed.
 
 On Debian/Ubuntu:
 ```bash
 sudo apt install lua5.4 lua-socket
 ```
+
+`dkjson` is installed by `make deps` (or directly with `luarocks-5.4 install dkjson`).
 
 ### Installing luaposix for Lua 5.4
 
@@ -40,42 +46,61 @@ Verify with: `lua5.4 -e 'print(require("posix.unistd").fsync)'` — should print
 
 `src/io_sync.lua` falls back to LuaJIT FFI on Windows (`_commit`, `_chsize_s` from the C runtime). Running on Windows therefore requires LuaJIT rather than stock Lua 5.4.
 
-## Running
+## Running the server
+
+`main.lua` starts the TCP broker server. It reads configuration from
+`appsettings.json` in the working directory, then listens for client
+connections and handles each one in its own coroutine.
 
 From the project root:
 ```bash
 lua5.4 main.lua
+# or
+make run
 ```
 
-`main.lua` is the project's runnable example: an end-to-end "order-events
-pipeline" that wires every module under `src/` together and narrates each
-stage against a local data directory at `./data_test`. It walks through:
+The server logs the resolved config and a listening line, e.g.:
+```
+[main] env=Development host=0.0.0.0 port=9092 data_dir=./data_server
+[server] listening on 0.0.0.0:9092
+```
+Stop it with Ctrl+C (SIGINT) for a clean shutdown.
 
-1. Bootstrapping the broker and creating a topic
-2. Producing events synchronously (`Producer`, `acks=1`)
-3. Producing events asynchronously (`produce_async` + `Future`)
-4. Consumer-group partition rebalancing (`ConsumerGroup`)
-5. Consuming the topic and verifying nothing was lost
-6. Synchronous batched appends (`BatchWriter`)
-7. Asynchronous batched appends (`PartitionWriter`)
-8. Resilient writes that retry transient I/O errors (`Partition:write_with_resilience`)
-9. An accumulating byte buffer (`Buffer`)
-10. A log that rolls into multiple segments (`SegmentedPartition`)
-11. Message compression (`CompressedMessage` — optional, see below)
-12. Leader-side replication (`ReplicatedPartition` — optional, see below)
-13. Crash recovery on broker restart (CRC-validated log scan)
+### Configuration
+
+`appsettings.json` has two sections:
+
+- **`Server`** — `Host`, `Port` (default `9092`), `DataDir`, `MaxConnections`,
+  `MaxConnectionsPerIP`, `MaxFrameSize`, `IdleDeadline`, `HandshakeDeadline`.
+- **`Auth`** — `Username`, plus either `PasswordHash` (a
+  `pbkdf2-sha256$<iter>$<salt_hex>$<hash_hex>` string) or a plaintext
+  `Password`. `MaxFailures`, `FailureWindow`, and `BanDuration` control
+  per-IP lockout after repeated failures.
+
+If `Auth` has no usable credential, the server starts **open** (no
+authentication) and logs a warning.
+
+**Environment overlays:** set `MOONMQ_ENVIRONMENT` (default `Development`).
+If `appsettings.<environment>.json` exists, it is deep-merged over the base
+`appsettings.json`.
+
+### Setting the admin password
+
+Generate a PBKDF2-SHA256 hash and paste it into `Auth.PasswordHash`:
+```bash
+lua5.4 -e 'print(require("src.server.auth").hash_password("yourpw"))'
+```
+Alternatively, set `Auth.Password` to a plaintext value — the server hashes
+it at startup and logs a warning.
 
 ### Optional modules
 
-Three modules depend on libraries that may not be present. `main.lua`
-`pcall`-gates them and prints a "skipped" note when they are unavailable, so
-the demo always runs to completion:
+Some modules under `src/` depend on libraries that may not be present:
 
 - **`src/compression.lua`** needs the `zlib` LuaRocks module (gzip support).
 - **`src/snappy.lua`** needs LuaJIT's FFI and `libsnappy` (Snappy support).
 - **`src/replica.lua`** loads on stock Lua, but real replication needs a peer
-  broker exposing an HTTP `/replicate` endpoint; the demo only exercises the
-  leader-side local-write path.
+  broker exposing an HTTP `/replicate` endpoint.
 
 ## Testing
 
