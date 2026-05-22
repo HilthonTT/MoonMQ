@@ -131,22 +131,22 @@ own CRC since the disk layer can corrupt independently.
 Opcodes are split into client requests (`0x01`–`0x7F`) and server replies
 (`0x80`–`0xFE`):
 
-| Op             | Direction       | Purpose                              |
-| -------------- | --------------- | ------------------------------------ |
-| `HELLO`        | client → server | Protocol-version handshake           |
-| `AUTH`         | client → server | Username/password authentication     |
-| `PRODUCE`      | client → server | Append a record to a topic           |
-| `FETCH`        | client → server | Pull a batch of records (pull mode)  |
-| `SUBSCRIBE`    | client → server | Stream records as they arrive (push) |
-| `COMMIT`       | client → server | Commit a consumer-group offset       |
-| `CREATE_TOPIC` | client → server | Create a partitioned topic           |
-| `LIST_TOPICS`  | client → server | List existing topics                 |
-| `PING`/`GOODBYE` | client → server | Liveness / clean disconnect        |
-| `WELCOME` / `AUTH_OK` | server → client | Handshake / auth acceptance   |
-| `PRODUCE_ACK`  | server → client | Partition + offset of an appended record |
-| `RECORD`       | server → client | A delivered record (fetch or push)   |
-| `TOPIC_LIST` / `PONG` / `OK` | server → client | Query results / acks  |
-| `ERROR`        | server → client | Numeric error code + message         |
+| Op                           | Direction       | Purpose                                  |
+| ---------------------------- | --------------- | ---------------------------------------- |
+| `HELLO`                      | client → server | Protocol-version handshake               |
+| `AUTH`                       | client → server | Username/password authentication         |
+| `PRODUCE`                    | client → server | Append a record to a topic               |
+| `FETCH`                      | client → server | Pull a batch of records (pull mode)      |
+| `SUBSCRIBE`                  | client → server | Stream records as they arrive (push)     |
+| `COMMIT`                     | client → server | Commit a consumer-group offset           |
+| `CREATE_TOPIC`               | client → server | Create a partitioned topic               |
+| `LIST_TOPICS`                | client → server | List existing topics                     |
+| `PING`/`GOODBYE`             | client → server | Liveness / clean disconnect              |
+| `WELCOME` / `AUTH_OK`        | server → client | Handshake / auth acceptance              |
+| `PRODUCE_ACK`                | server → client | Partition + offset of an appended record |
+| `RECORD`                     | server → client | A delivered record (fetch or push)       |
+| `TOPIC_LIST` / `PONG` / `OK` | server → client | Query results / acks                     |
+| `ERROR`                      | server → client | Numeric error code + message             |
 
 A connection must `HELLO` then `AUTH` before any other request; only
 handshake opcodes are accepted pre-auth. A consumer connection is either

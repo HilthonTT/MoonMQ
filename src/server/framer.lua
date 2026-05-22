@@ -17,7 +17,8 @@ local M = {}
 -- handshake reads this should be the handshake deadline, for steady-
 -- state reads the idle deadline.
 function M.read_frame(reactor, sock, max_frame, deadline)
-    assert(type(deadline) == 'number', "deadline must be a number")
+    assert(deadline == nil or type(deadline) == 'number',
+        "deadline must be a number or nil")
     assert(getmetatable(reactor) == rct, "reactor must be a Reactor instance")
 
     local len_bytes, err = reactor:read_exact(sock, 4, deadline)

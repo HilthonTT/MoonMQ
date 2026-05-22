@@ -6,12 +6,8 @@
 local sha2   = require("sha2")
 local socket = require("socket")
 local rng    = require("src.server.rng")
- 
+
 local M = {}
- 
-local DEFAULT_PBKDF2_ITERATIONS = 10000
-local DEFAULT_SALT_BYTES        = 16
-local DEFAULT_HASH_BYTES        = 32
 
 local DEFAULT_PBKDF2_ITERATIONS = 10000
 local DEFAULT_SALT_BYTES        = 16
@@ -29,22 +25,21 @@ local function pbkdf2_hmac_sha256(password, salt, iterations, dklen)
     local hLen = 32
     local blocks = math.ceil(dklen / hLen)
     local output = {}
-
-     for block_i = 1, blocks do
+    for block_i = 1, blocks do
         local int_be = string.pack(">I4", block_i)
         local u_hex  = sha2.hmac(sha2.sha256, password, salt .. int_be)
         local u_bin  = sha2.hex_to_bin(u_hex)
         local f      = u_bin
- 
+
         for _ = 2, iterations do
             u_hex = sha2.hmac(sha2.sha256, password, u_bin)
             u_bin = sha2.hex_to_bin(u_hex)
             f     = xor_strings(f, u_bin)
         end
- 
+
         output[block_i] = f
     end
- 
+
     return table.concat(output):sub(1, dklen)
 end
 M.pbkdf2_hmac_sha256 = pbkdf2_hmac_sha256
@@ -123,7 +118,7 @@ function M.static_authenticator(opts)
     else
         error("static_authenticator: provide password_hash or password")
     end
- 
+
     return setmetatable({
         username       = opts.username,
         password_hash  = password_hash,
@@ -139,7 +134,7 @@ end
 function Auth:_maybe_sweep(now)
     if now - self.last_sweep < 30 then return end
     self.last_sweep = now
- 
+
     for ip, rec in pairs(self.failures) do
         local fresh  = rec.first_at     and (now - rec.first_at) < self.failure_window
         local banned = rec.banned_until and rec.banned_until > now
@@ -148,7 +143,7 @@ function Auth:_maybe_sweep(now)
         end
     end
 end
- 
+
 function Auth:is_banned(ip)
     if not ip then return false end
     local rec = self.failures[ip]
@@ -159,7 +154,7 @@ function Auth:is_banned(ip)
     end
     return false
 end
- 
+
 function Auth:_record_failure(ip, now)
     local rec = self.failures[ip]
     if not rec or (now - (rec.first_at or 0)) > self.failure_window then
@@ -175,7 +170,7 @@ function Auth:_record_failure(ip, now)
     end
     self.failures[ip] = rec
 end
- 
+
 function Auth:_verify_password(password, stored)
     local parsed, perr = parse_hash(stored)
     if not parsed then return false, perr end
@@ -187,24 +182,24 @@ end
 function Auth:verify(user, pass, ip)
     local now = socket.gettime()
     self:_maybe_sweep(now)
- 
+
     ip = ip or "?"
- 
+
     local banned, remaining = self:is_banned(ip)
     if banned then
         return false, string.format("ip banned for %d more seconds", remaining)
     end
- 
+
     -- Run BOTH compares regardless of intermediate results so timing
     -- doesn't reveal which field is wrong.
     local user_ok = compare_secure(user or "", self.username, self.hmac_key)
     local pass_ok = self:_verify_password(pass or "", self.password_hash)
- 
+
     if user_ok and pass_ok then
         self.failures[ip] = nil
         return true, nil
     end
- 
+
     self:_record_failure(ip, now)
     return false, "invalid credentials"
 end

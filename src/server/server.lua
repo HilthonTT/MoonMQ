@@ -135,7 +135,16 @@ function Server:_handle(sock, peer, ip)
 
     local conn = Connection.new(self, sock, peer, ip)
     self.connections_by_id[conn.id] = conn
-    conn:start()
+
+    -- conn:start() runs the reader inline; an uncaught error here would
+    -- otherwise leak the capacity slot (the connection is registered but
+    -- _unregister_conn never runs). close() is idempotent and unregisters.
+    local ok, err = pcall(conn.start, conn)
+    if not ok then
+        io.stderr:write(string.format("[server] conn=%s start failed: %s\n",
+            conn.id_short, tostring(err)))
+        conn:close(Connection.REASON_READ_ERROR)
+    end
 end
 
 function Server:dispatch(conn, op, correl, payload)

@@ -29,6 +29,14 @@ function Reactor:spawn(fn, ...)
     return co
 end
 
+-- Re-queue an already-created coroutine for resumption on the next tick.
+-- Used to wake coroutines parked with a bare coroutine.yield() — e.g. the
+-- per-connection sender waiting for the send queue to fill.
+function Reactor:schedule(co)
+    assert(type(co) == "thread", "schedule expects a coroutine")
+    self.ready[#self.ready + 1] = { co = co }
+end
+
 local function safe_resume(co, ...)
     local ok, err = coroutine.resume(co, ...)
     if not ok then
@@ -58,7 +66,8 @@ end
 
 function Reactor:read_exact(sock, n, deadline)
     assert(type(n) == "number", "n must be a number")
-    assert(type(deadline) == "number", "deadline must be a number")
+    assert(deadline == nil or type(deadline) == "number",
+        "deadline must be a number or nil")
 
     sock:settimeout(0)
     local buf = {}
@@ -89,7 +98,9 @@ function Reactor:read_exact(sock, n, deadline)
     return table.concat(buf)
 end
 
-function Reactor:send_all(sock, data)
+function Reactor:send_all(sock, data, deadline)
+    assert(deadline == nil or type(deadline) == "number",
+        "deadline must be a number or nil")
     sock:settimeout(0)
     local sent = 0
     local total = #data
@@ -100,6 +111,9 @@ function Reactor:send_all(sock, data)
         else
             sent = last or sent
             if err == "timeout" then
+                if deadline and socket.gettime() > deadline then
+                    return nil, "write deadline exceeded"
+                end
                 self:wait_writable(sock)
             else
                 return nil, err
@@ -136,8 +150,10 @@ function Reactor:listen(host, port, on_accept)
                 io.stderr:write(string.format("[reactor] accept: %s\n", aerr))
                 self:sleep(0.1)
             else
-                local peer = client:getpeername() or "?:?"
-                self:spawn(function() on_accept(client, peer) end)
+                local ip, port = client:getpeername()
+                ip = ip or "?"
+                local peer = string.format("%s:%s", ip, port or "?")
+                self:spawn(function() on_accept(client, peer, ip) end)
             end
         end
         self.listeners[listener] = nil
