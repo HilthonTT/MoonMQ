@@ -14,9 +14,12 @@ local M = {}
 M.__index = M
 
 M.PROTOCOL_VERSION = 1
+M.SERVER_NAME = "MoonMQ"
+M.SERVER_VERSION = "v0.01"
 
 -- Opcodes. Client requests 0x01-0x7F, server replies 0x80-0xFE.
 -- 0xFF reserved for future framing extensions.
+-- Client to server
 M.OP_HELLO        = 0x01
 M.OP_AUTH         = 0x02
 M.OP_PRODUCE      = 0x03
@@ -28,6 +31,11 @@ M.OP_LIST_TOPICS  = 0x08
 M.OP_PING         = 0x09
 M.OP_GOODBYE      = 0x0A
 
+-- Bidirectional
+M.OP_HEARTBEAT_REQ   = 0x0B
+M.OP_HEARTBEAT_RESP  = 0x0C
+
+-- Server to clients
 M.OP_WELCOME      = 0x80
 M.OP_AUTH_OK      = 0x81
 M.OP_PRODUCE_ACK  = 0x82

@@ -16,10 +16,10 @@ deps:
 
 test:
 	busted
- 
+
 run:
 	lua5.4 main.lua
- 
+
 hash:
 	@test -n "$(PASSWORD)" || (echo "usage: make hash PASSWORD=mypass [ITER=10000]" && exit 1)
 	@lua5.4 bin/moonmq-hash.lua "$(PASSWORD)" $(ITER)

@@ -1,5 +1,9 @@
 # MoonMQ
-A message broker coded in LUA
+
+A log-structured message broker written in pure Lua. Clients connect over
+TCP and speak a compact binary protocol to produce records, fetch or
+subscribe to topics, create topics, and commit consumer offsets. Topics are
+partitioned append-only logs with CRC-checked on-disk records.
 
 ## Requirements
 
@@ -12,6 +16,7 @@ SHA-256/HMAC for authentication is provided by a vendored pure-Lua
 `sha2.lua` at the repo root — no installation needed.
 
 On Debian/Ubuntu:
+
 ```bash
 sudo apt install lua5.4 lua-socket
 ```
@@ -53,6 +58,7 @@ Verify with: `lua5.4 -e 'print(require("posix.unistd").fsync)'` — should print
 connections and handles each one in its own coroutine.
 
 From the project root:
+
 ```bash
 lua5.4 main.lua
 # or
@@ -60,10 +66,12 @@ make run
 ```
 
 The server logs the resolved config and a listening line, e.g.:
+
 ```
 [main] env=Development host=0.0.0.0 port=9092 data_dir=./data_server
-[server] listening on 0.0.0.0:9092
+[server] listening on 0.0.0.0:9092 (proto v1, MoonMQ/v0.01)
 ```
+
 Stop it with Ctrl+C (SIGINT) for a clean shutdown.
 
 ### Configuration
@@ -87,9 +95,11 @@ If `appsettings.<environment>.json` exists, it is deep-merged over the base
 ### Setting the admin password
 
 Generate a PBKDF2-SHA256 hash and paste it into `Auth.PasswordHash`:
+
 ```bash
 lua5.4 -e 'print(require("src.server.auth").hash_password("yourpw"))'
 ```
+
 Alternatively, set `Auth.Password` to a plaintext value — the server hashes
 it at startup and logs a warning.
 
@@ -101,6 +111,58 @@ Some modules under `src/` depend on libraries that may not be present:
 - **`src/snappy.lua`** needs LuaJIT's FFI and `libsnappy` (Snappy support).
 - **`src/replica.lua`** loads on stock Lua, but real replication needs a peer
   broker exposing an HTTP `/replicate` endpoint.
+
+## Wire protocol
+
+Clients and the broker speak a compact binary protocol over TCP
+(`src/server/protocol.lua`). All integers are big-endian; strings are
+length-prefixed (`u32`) UTF-8. Every frame is length-prefixed:
+
+```
+┌──────────────┬────────┬──────────────┬──────────────┐
+│ FrameLen(4B) │ Op(1B) │ CorrelID     │ Payload(var) │
+└──────────────┴────────┴──────────────┴──────────────┘
+```
+
+`FrameLen` covers everything after itself. There is no application-level
+CRC — TCP guarantees transport integrity, and on-disk records carry their
+own CRC since the disk layer can corrupt independently.
+
+Opcodes are split into client requests (`0x01`–`0x7F`) and server replies
+(`0x80`–`0xFE`):
+
+| Op             | Direction       | Purpose                              |
+| -------------- | --------------- | ------------------------------------ |
+| `HELLO`        | client → server | Protocol-version handshake           |
+| `AUTH`         | client → server | Username/password authentication     |
+| `PRODUCE`      | client → server | Append a record to a topic           |
+| `FETCH`        | client → server | Pull a batch of records (pull mode)  |
+| `SUBSCRIBE`    | client → server | Stream records as they arrive (push) |
+| `COMMIT`       | client → server | Commit a consumer-group offset       |
+| `CREATE_TOPIC` | client → server | Create a partitioned topic           |
+| `LIST_TOPICS`  | client → server | List existing topics                 |
+| `PING`/`GOODBYE` | client → server | Liveness / clean disconnect        |
+| `WELCOME` / `AUTH_OK` | server → client | Handshake / auth acceptance   |
+| `PRODUCE_ACK`  | server → client | Partition + offset of an appended record |
+| `RECORD`       | server → client | A delivered record (fetch or push)   |
+| `TOPIC_LIST` / `PONG` / `OK` | server → client | Query results / acks  |
+| `ERROR`        | server → client | Numeric error code + message         |
+
+A connection must `HELLO` then `AUTH` before any other request; only
+handshake opcodes are accepted pre-auth. A consumer connection is either
+**pull** (`FETCH`) or **push** (`SUBSCRIBE`) — mixing the two on one
+connection is rejected.
+
+### Connection lifecycle
+
+The TCP front-end (`src/server/server.lua`) owns the listener, capacity
+accounting, and ban enforcement, then delegates each connection to
+`src/server/connection.lua`. A `Connection` runs three coroutines — a
+reader, a sender (bounded send queue), and a heartbeat probe — driven by an
+explicit `new → greeted → authenticated → closed` state machine. Framing is
+isolated in `src/server/framer.lua`, and 16-byte connection/correlation IDs
+come from `src/server/uuid.lua`. A handshake watchdog drops connections that
+fail to authenticate within `HandshakeDeadline`.
 
 ## Testing
 
@@ -130,13 +192,13 @@ The `busted` binary at `/usr/local/bin/busted` is installed by `make deps` and i
 
 Current coverage:
 
-| Spec file                  | Module under test                                  |
-| -------------------------- | -------------------------------------------------- |
-| `buffer_spec.lua`          | `src/buffer.lua` — accumulating byte buffer        |
-| `crc32_spec.lua`           | `src/crc32.lua` — IEEE 802.3 CRC-32                |
-| `future_spec.lua`          | `src/future.lua` — one-shot coroutine future       |
-| `message_spec.lua`         | `src/message.lua` — message wire format + pool     |
-| `partition_spec.lua`       | `src/partition.lua` — append, read, recovery       |
-| `time_spec.lua`            | `src/time.lua` — duration constants                |
-| `topic_manager_spec.lua`   | `src/topic_manager.lua` — topic/partition creation |
-| `util_spec.lua`            | `src/util.lua` — topic-name validation             |
+| Spec file                | Module under test                                  |
+| ------------------------ | -------------------------------------------------- |
+| `buffer_spec.lua`        | `src/buffer.lua` — accumulating byte buffer        |
+| `crc32_spec.lua`         | `src/crc32.lua` — IEEE 802.3 CRC-32                |
+| `future_spec.lua`        | `src/future.lua` — one-shot coroutine future       |
+| `message_spec.lua`       | `src/message.lua` — message wire format + pool     |
+| `partition_spec.lua`     | `src/partition.lua` — append, read, recovery       |
+| `time_spec.lua`          | `src/time.lua` — duration constants                |
+| `topic_manager_spec.lua` | `src/topic_manager.lua` — topic/partition creation |
+| `util_spec.lua`          | `src/util.lua` — topic-name validation             |

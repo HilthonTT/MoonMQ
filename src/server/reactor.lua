@@ -57,6 +57,9 @@ function Reactor:sleep(seconds)
 end
 
 function Reactor:read_exact(sock, n, deadline)
+    assert(type(n) == "number", "n must be a number")
+    assert(type(deadline) == "number", "deadline must be a number")
+
     sock:settimeout(0)
     local buf = {}
     local got = 0
