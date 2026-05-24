@@ -59,6 +59,8 @@ if is_main(arg, ...) then
         max_frame              = s.MaxFrameSize,
         idle_deadline          = s.IdleDeadline,
         handshake_deadline     = s.HandshakeDeadline,
+        metrics_host =  "127.0.0.1",
+        metrics_port = 9090,
         authenticator          = build_authenticator(cfg),
     }))
 

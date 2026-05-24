@@ -24,10 +24,11 @@
 -- wakes the sender if it's parked. The heartbeat and watchdog observe
 -- state==closed on their next wakeup and exit.
 
-local socket   = require("socket")
+local socket          = require("socket")
 local uuid     = require("src.server.uuid")
 local framer   = require("src.server.framer")
 local proto    = require("src.server.protocol")
+local metrics  = require("src.server.metrics")
 
 local Connection = {}
 Connection.__index = Connection
@@ -56,7 +57,7 @@ function Connection.new(server, sock, peer, ip)
     assert(type(ip) == "string", "ip must be a string")
 
     local id = uuid.bytes()
-    return setmetatable({
+    local connection = setmetatable({
         server = server,
         sock = sock,
         peer = peer,
@@ -100,6 +101,11 @@ function Connection.new(server, sock, peer, ip)
         frames_received = 0,
         frames_sent = 0,
     }, Connection)
+
+    metrics.inc("moonmq_connections_accepted_total")
+    metrics.set("moonmq_connections_open", server.connections, nil)
+
+    return connection
 end
 
 function Connection:transition_to(new_state)
@@ -159,6 +165,8 @@ function Connection:send(frame)
         self.server.reactor:schedule(co)
     end
 
+    metrics.set("moonmq_pending_bytes", self.pending_bytes, { conn = self.id_short })
+
     return true
 end
 
@@ -178,6 +186,10 @@ function Connection:_log_close()
         self.bytes_received, self.frames_received,
         self.bytes_sent, self.frames_sent,
         duration, ident))
+
+    metrics.inc("moonmq_connections_closed_total", 1, { reason = self.close_reason })
+    metrics.observe("moonmq_connection_duration_seconds",
+    socket.gettime() - self.started_at)
 end
 
 -- Idempotent. Safe to call from any coroutine. If err_code is set, a
@@ -228,11 +240,16 @@ function Connection:run_sender()
             self.send_head = self.send_head + 1
 
             local deadline = send_timeout and (socket.gettime() + send_timeout) or nil
+            local stop_timer = metrics.timer("moonmq_send_duration_seconds")
             local ok, err = self.server.reactor:send_all(self.sock, frame, deadline)
+            stop_timer()
             if ok then
                 self.pending_bytes = self.pending_bytes - #frame
                 self.bytes_sent = self.bytes_sent + #frame
                 self.frames_sent = self.frames_sent + 1
+
+                metrics.inc("moonmq_frames_sent_total")
+                metrics.inc("moonmq_bytes_sent_total", #frame)
             else
                 if err == "write deadline exceeded" then
                     self:close(Connection.REASON_WRITE_DEADLINE)
@@ -280,6 +297,8 @@ function Connection:run_reader()
             self:close(Connection.REASON_BAD_FRAME, proto.ERR_BAD_FRAME, perr)
             return
         end
+
+        metrics.inc("moonmq_frames_received_total", 1, { op = string.format("0x%02x", op) })
 
         if not self:can_handle(op) then
             -- Soft reject: send error, stay open. This lets a confused

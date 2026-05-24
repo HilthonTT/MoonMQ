@@ -20,14 +20,16 @@
 --   - Pending-send cap reinterpreted as a per-write deadline
 --   - Pre-auth opcode whitelist (only HELLO/AUTH/IDENTIFY/HEARTBEAT allowed)
 
-local Reactor    = require("src.server.reactor")
-local proto      = require("src.server.protocol")
-local Connection = require("src.server.connection")
-local uuid       = require("src.server.uuid")
-local brk_m      = require("src.broker")
-local prd_m      = require("src.producer")
-local consumer_m = require("src.consumer")
-local msg_m      = require("src.message")
+local Reactor     = require("src.server.reactor")
+local proto       = require("src.server.protocol")
+local Connection  = require("src.server.connection")
+local uuid        = require("src.server.uuid")
+local brk_m       = require("src.broker")
+local prd_m       = require("src.producer")
+local consumer_m  = require("src.consumer")
+local msg_m       = require("src.message")
+local metrics     = require("src.server.metrics")
+local MetricsHttp = require("src.server.metrics_http")
 
 -- Tightened from a hypothetical 16 MiB to 1 MiB. A 1 MiB cap is still
 -- generous for a message queue and bounds worst-case memory under
@@ -77,6 +79,10 @@ function Server.new(opts)
         connections            = 0,
         conn_by_ip             = {},
         connections_by_id      = {},
+
+        -- Metrics endpoints
+        metrics_host = opts.metrics_host or "127.0.0.1",
+        metrics_port = opts.metrics_port,  -- nil = off
 
         authenticator        = opts.authenticator,
         rate_limiter_factory = opts.rate_limiter_factory,
@@ -136,6 +142,9 @@ function Server:_handle(sock, peer, ip)
     local conn = Connection.new(self, sock, peer, ip)
     self.connections_by_id[conn.id] = conn
 
+    metrics.inc("moonmq_connections_accepted_total")
+    metrics.set("moonmq_connections_open", self.connections)
+
     -- conn:start() runs the reader inline; an uncaught error here would
     -- otherwise leak the capacity slot (the connection is registered but
     -- _unregister_conn never runs). close() is idempotent and unregisters.
@@ -148,6 +157,10 @@ function Server:_handle(sock, peer, ip)
 end
 
 function Server:dispatch(conn, op, correl, payload)
+    local stop = metrics.timer(
+        "moonmq_dispatch_duration_seconds", 
+        { op = string.format("0x%02x", op) })
+
     if     op == proto.OP_HELLO           then self:_handle_hello(conn, correl, payload)
     elseif op == proto.OP_AUTH            then self:_handle_auth(conn, correl, payload)
     elseif op == proto.OP_IDENTIFY_CLIENT then self:_handle_identify_client(conn, correl, payload)
@@ -162,6 +175,8 @@ function Server:dispatch(conn, op, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_UNKNOWN_OP,
             string.format("op 0x%02X", op)))
     end
+
+    stop()
 end
 
 function Server:_handle_hello(conn, correl, payload)
@@ -442,6 +457,16 @@ function Server:start()
         "[server] listening on %s:%d (proto v%d, %s/%s)\n",
         self.host, self.port, proto.PROTOCOL_VERSION,
         proto.SERVER_NAME, proto.SERVER_VERSION))
+
+    if self.metrics_port then
+        local mh = MetricsHttp.new({
+            reactor = self.reactor,
+            host    = self.metrics_host,
+            port    = self.metrics_port,
+        })
+        mh:start()
+    end
+
     self.reactor:run()
 
     -- Reactor returned (signal or :stop()). Close everything we own.
