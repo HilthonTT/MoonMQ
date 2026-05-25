@@ -182,13 +182,15 @@ local function decode_string(buf, pos)
     if #buf - pos + 1 < 4 then
         return nil, nil, "truncated string length"
     end
-    local len = string.unpack(">I4", buf, pos)
-    pos = pos + 4
+    -- string.unpack returns the next position; use it directly rather
+    -- than adding sizeof by hand. Keeps this in sync if the prefix
+    -- format ever changes.
+    local len, next_pos = string.unpack(">I4", buf, pos)
 
-    if len > #buf - pos + 1 then
+    if len > #buf - next_pos + 1 then
         return nil, nil, "truncated string body"
     end
-    return buf:sub(pos, pos + len - 1), pos + len, nil
+    return buf:sub(next_pos, next_pos + len - 1), next_pos + len, nil
 end
 M.decode_string = decode_string
 

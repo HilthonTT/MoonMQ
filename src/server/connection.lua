@@ -198,19 +198,28 @@ end
 function Connection:close(reason, err_code, err_msg)
     if self.state == Connection.STATE_CLOSED then return end
 
+    -- Transition first so re-entrant close() calls (from inside the
+    -- sender/reader/heartbeat coroutines that may run as a side effect
+    -- of the courtesy send below) early-out at the guard above.
+    self.state = Connection.STATE_CLOSED
+    self.close_reason = reason
+
     if err_code then
         local ok, frame = pcall(proto.encode_error,
             uuid.ZERO, err_code, err_msg or reason)
         if ok then
+            -- Best-effort courtesy frame. Route through the reactor's
+            -- non-blocking send_all so a wedged peer can't stall the
+            -- event loop. Cap at 250ms — error frames are tiny, and
+            -- this is a teardown path; we'd rather drop the frame than
+            -- delay the whole reactor.
+            local deadline = socket.gettime() + 0.25
             pcall(function()
-                self.sock:settimeout(0.5)
-                self.sock:send(frame)
+                self.server.reactor:send_all(self.sock, frame, deadline)
             end)
         end
     end
 
-    self.state = Connection.STATE_CLOSED
-    self.close_reason = reason
     self:_log_close()
 
     pcall(function() self.sock:close() end)
@@ -262,9 +271,17 @@ function Connection:run_sender()
 
         if self.state == Connection.STATE_CLOSED then return end
 
-        -- Park until enqueue or close wakes us.
+        -- Park until enqueue or close wakes us. The double-check after
+        -- arming sender_suspended closes a race where send() runs (and
+        -- already saw sender_suspended==nil) between our last queue
+        -- check and the yield: without this, we'd sleep until the NEXT
+        -- enqueue while a frame sits unsent.
         self.sender_suspended = coroutine.running()
-        coroutine.yield()
+        if self.send_head <= self.send_tail or self.state == Connection.STATE_CLOSED then
+            self.sender_suspended = nil
+        else
+            coroutine.yield()
+        end
     end
 end
 

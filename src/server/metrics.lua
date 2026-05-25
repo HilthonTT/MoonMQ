@@ -28,6 +28,9 @@ end
 
 -- Histogram buckets: explicit boundaries, Prometheus-style. Stores
 -- bucket counts + sum + count, so quantiles are reconstructable.
+-- The "+Inf" bucket is implicit: its count equals h.count (Prometheus
+-- convention). We surface it explicitly at render time so tail-latency
+-- quantiles are computable.
 local BUCKETS = { 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5 }
 function M.observe(name, value, labels)
     local k = key(name, labels)
@@ -43,9 +46,9 @@ function M.observe(name, value, labels)
         if value <= b then
             h.buckets[b] = h.buckets[b] + 1
         end
-        h.sum = h.sum + value
-        h.count = h.count + 1
     end
+    h.sum = h.sum + value
+    h.count = h.count + 1
 end
 
 -- Convenience: returns a timer closure. Call it to record elapsed.
@@ -64,16 +67,31 @@ function M.render_prometheus()
         out[#out+1] = string.format("%s %s", k, tostring(v))
     end
     for k, h in pairs(M.histograms) do
-        local base, lbl = k:match("^([^{]+)({.*})?$")
-        lbl = lbl or ""
-        local inner = lbl:sub(2, -2)  -- strip braces
-        local sep = (inner == "") and "" or ","
-        for _, b in ipairs(BUCKETS) do
-            out[#out+1] = string.format("%s_bucket{%sle=\"%s\"%s} %d",
-                base, inner, b, sep == "," and ","..inner or "", h.buckets[b])
+        -- Split key into base and inner labels by the first `{`. Lua
+        -- patterns don't support `?` on groups, so don't try to do this
+        -- with a single match.
+        local base, inner
+        local brace = k:find("{", 1, true)
+        if brace then
+            base  = k:sub(1, brace - 1)
+            inner = k:sub(brace + 1, -2)  -- strip closing brace
+        else
+            base  = k
+            inner = ""
         end
-        out[#out+1] = string.format("%s_sum %s",   base, tostring(h.sum))
-        out[#out+1] = string.format("%s_count %d", base, h.count)
+        local prefix = (inner == "") and "" or (inner .. ",")
+        local label_suffix = (inner == "") and "" or ("{" .. inner .. "}")
+        for _, b in ipairs(BUCKETS) do
+            out[#out+1] = string.format("%s_bucket{%sle=\"%s\"} %d",
+                base, prefix, b, h.buckets[b])
+        end
+        -- +Inf bucket = count (Prometheus requires this for quantile estimation).
+        out[#out+1] = string.format("%s_bucket{%sle=\"+Inf\"} %d",
+            base, prefix, h.count)
+        out[#out+1] = string.format("%s_sum%s %s",
+            base, label_suffix, tostring(h.sum))
+        out[#out+1] = string.format("%s_count%s %d",
+            base, label_suffix, h.count)
     end
     return table.concat(out, "\n") .. "\n"
 end

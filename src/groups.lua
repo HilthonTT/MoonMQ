@@ -1,11 +1,12 @@
 local broker_m = require("src.broker")
+local socket   = require("socket")
 
 local GroupMember = {}
 GroupMember.__index = GroupMember
 
 function GroupMember.new(id, topics, partitions, last_heartbeat)
     assert(type(id) == "string", "id must be a string")
-    last_heartbeat = last_heartbeat or os.time()
+    last_heartbeat = last_heartbeat or socket.gettime()
     assert(type(last_heartbeat) == "number", "last_heartbeat must be a number")
 
    return setmetatable({
@@ -102,7 +103,7 @@ function ConsumerGroup:join(member_id, topics)
     local member = self.members[member_id]
     if member then
         member.topics = topics
-        member.last_heartbeat = os.time()
+        member.last_heartbeat = socket.gettime()
     else
         member = GroupMember.new(member_id, topics)
         self.members[member_id] = member
@@ -143,14 +144,14 @@ function ConsumerGroup:heartbeat(member_id)
     if not member then
         return false, string.format("member %s does not exist", member_id)
     end
-    member.last_heartbeat = os.time()
+    member.last_heartbeat = socket.gettime()
     return true, nil
 end
 
 -- Evict members that haven't sent a heartbeat in the last 30 seconds.
 function ConsumerGroup:check_heartbeats()
     local expired  = {}
-    local deadline = os.time() - 30
+    local deadline = socket.gettime() - 30
 
     for member_id, member in pairs(self.members) do
         if member.last_heartbeat < deadline then

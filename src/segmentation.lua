@@ -4,6 +4,10 @@ local fs_m = require("src.fs")
 local msg_m = require("src.message")
 local socket = require("socket")
 
+-- Optional: luafilesystem for accurate per-segment mtime. Without it,
+-- retention falls back to load-time (legacy behavior).
+local has_lfs, lfs = pcall(require, "lfs")
+
 local LogSegment = {}
 LogSegment.__index = LogSegment
 
@@ -122,28 +126,39 @@ function SegmentedPartition:load_segments()
         return string.format("failed to glob segment files: %s", err)
     end
 
-    table.sort(matches, function(a, b)
-        local na = tonumber(a:match("(%d+)%.log$")) or 0
-        local nb = tonumber(b:match("(%d+)%.log$")) or 0
-        return na < nb
-    end)
-
-    for _, path in ipairs(matches) do
-        local base_name   = path:match("([^/\\]+)$")
-        local base_offset = tonumber(base_name:match("(%d+)%.log$"))
-        if not base_offset then
-            return string.format("invalid segment filename: %s", base_name)
+    -- Decorate-sort-undecorate: parse the offset once per entry instead
+    -- of twice per comparison (O(n log n) string.match calls → O(n)).
+    local decorated = {}
+    for i = 1, #matches do
+        local p = matches[i]
+        local n = tonumber(p:match("(%d+)%.log$"))
+        if not n then
+            return string.format("invalid segment filename: %s", p)
         end
+        decorated[i] = { path = p, n = n }
+    end
+    table.sort(decorated, function(a, b) return a.n < b.n end)
+
+    local now = socket.gettime()
+    for _, entry in ipairs(decorated) do
+        local path        = entry.path
+        local base_offset = entry.n
 
         local file, ferr = io.open(path, "a+b")
         if not file then
             return string.format("failed to open segment file %s: %s", path, ferr)
         end
 
-        -- No fstat in stdlib, so we approximate start_time as "now". If
-        -- accurate retention based on file mtime matters, plumb in
-        -- luafilesystem (lfs.attributes(path, "modification")).
-        local segment = LogSegment.new(file, base_offset, socket.gettime())
+        -- Prefer real mtime when luafilesystem is available so retention
+        -- survives a restart. Without lfs we approximate as "now" — the
+        -- legacy behavior — which means retention is reset on reload.
+        local start_time = now
+        if has_lfs then
+            local mtime = lfs.attributes(path, "modification")
+            if type(mtime) == "number" then start_time = mtime end
+        end
+
+        local segment = LogSegment.new(file, base_offset, start_time)
         table.insert(self.segments, segment)
     end
 

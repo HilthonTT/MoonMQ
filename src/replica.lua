@@ -21,13 +21,13 @@ end
 
 -- POST a serialized message to the replica's /replicate endpoint.
 -- Returns (offset, nil) on 200 OK with valid JSON, otherwise (nil, err).
--- Note: socket.http.TIMEOUT is module-global; we set it per call. This
--- works fine when each replica has its own worker coroutine, but two
--- workers racing on it would clobber each other. Switch to a custom
--- `create` function returning a timeout-bound socket if that becomes
--- a problem.
+--
+-- We previously set socket.http.TIMEOUT module-globally, which races
+-- when multiple replica coroutines share the same scheduler. The custom
+-- `create` below binds the timeout to *this* request's TCP socket, so
+-- concurrent senders no longer clobber each other.
 function ReplicaClient:send(topic_name, partition_id, sender_replica_id, payload)
-    http.TIMEOUT = self.timeout
+    local timeout = self.timeout
     local response_body = {}
 
     local _, code, _hdrs, status = http.request{
@@ -42,6 +42,11 @@ function ReplicaClient:send(topic_name, partition_id, sender_replica_id, payload
         },
         source = ltn12.source.string(payload),
         sink   = ltn12.sink.table(response_body),
+        create = function()
+            local s = socket.tcp()
+            s:settimeout(timeout)
+            return s
+        end,
     }
 
     if type(code) ~= "number" then

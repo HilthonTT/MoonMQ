@@ -10,12 +10,15 @@ local M = {}
 M.ZERO = string.rep("\0", 16)
 
 -- Returns 16 raw bytes, with version=4 and variant=10 set per RFC 4122.
+-- Hot path (every connection + every heartbeat correl id): patch only
+-- the two octets that need setting and splice rather than allocating a
+-- 16-element table per call.
 function M.bytes()
-    local b= rng.bytes(16)
-    local octets = { b:byte(1, 16) }
-    octets[7] = (octets[7] & 0x0F) | 0x40  -- version 4 (random)
-    octets[9] = (octets[9] & 0x3F) | 0x80  -- variant 10 (RFC 4122)
-    return string.char(table.unpack(octets))
+    local b = rng.bytes(16)
+    local b7 = (b:byte(7) & 0x0F) | 0x40  -- version 4
+    local b9 = (b:byte(9) & 0x3F) | 0x80  -- variant 10
+    return b:sub(1, 6) .. string.char(b7) .. b:sub(8, 8)
+        .. string.char(b9) .. b:sub(10, 16)
 end
 
 -- Canonical 8-4-4-4-12 hyphenated form.

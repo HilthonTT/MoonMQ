@@ -10,12 +10,23 @@ local IS_WINDOWS = package.config:sub(1, 1) == "\\"
  
 local M = {}
 
+-- Keep /dev/urandom open across calls. Every UUID, salt, and connection
+-- ID allocation hits this path; opening/closing the file each time turns
+-- a cheap read into 3 syscalls. The handle is process-lifetime; if the
+-- read ever fails we drop the cached handle and retry once on next call.
+local urandom_handle = nil
 local function urandom_unix(n)
-    local f, err = io.open("/dev/urandom", "rb")
-    if not f then return nil, err end
-    local bytes = f:read(n)
-    f:close()
+    if not urandom_handle then
+        local f, err = io.open("/dev/urandom", "rb")
+        if not f then return nil, err end
+        f:setvbuf("no")  -- don't buffer randomness through stdio
+        urandom_handle = f
+    end
+    local bytes = urandom_handle:read(n)
     if not bytes or #bytes < n then
+        -- Drop the cached handle; the next call will reopen.
+        pcall(function() urandom_handle:close() end)
+        urandom_handle = nil
         return nil, "short read from /dev/urandom"
     end
     return bytes

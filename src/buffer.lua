@@ -16,6 +16,8 @@ function Buffer:write(s)
 end
 
 function Buffer:bytes()
+    if self.n == 0 then return "" end
+    if self.n == 1 then return self.chunks[1] end
     return table.concat(self.chunks, "", 1, self.n)
 end
 

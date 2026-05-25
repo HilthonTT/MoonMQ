@@ -51,25 +51,36 @@ local function read_request(reactor, sock, deadline)
     sock:settimeout(0)
     local buf = ""
     while #buf < MAX_REQUEST do
+        -- Top-of-loop deadline check so we can't spin forever on a
+        -- peer that keeps returning (nil, nil, "") or never yields any
+        -- bytes. This is the pre-auth path, so be ungenerous.
+        if socket.gettime() > deadline then
+            return nil, "read deadline"
+        end
+
         local chunk, err, partial = sock:receive(MAX_REQUEST - #buf)
+        local progressed = false
         if chunk then
-           buf = buf .. chunk
+            buf = buf .. chunk
+            progressed = #chunk > 0
         elseif partial and #partial > 0 then
             buf = buf .. partial
+            progressed = true
         end
 
         local idx = buf:find("\r\n\r\n", 1, true)
         if idx then return buf:sub(1, idx + 3) end
 
         if err == "timeout" then
-            if socket.gettime() > deadline then
-                return nil, "read deadline"
-            end
             reactor:wait_readable(sock)
         elseif err == "closed" then
             return nil, "peer closed"
         elseif err then
             return nil, err
+        elseif not progressed then
+            -- No chunk, no partial, no err: nothing to wait on. Yield
+            -- to the reactor for a tick so we don't burn CPU.
+            reactor:sleep(0.05)
         end
     end
     return nil, "request too large"

@@ -14,6 +14,7 @@ local DEFAULT_SALT_BYTES        = 16
 local DEFAULT_HASH_BYTES        = 32
 
 local function xor_strings(a, b)
+    assert(#a == #b, "xor_strings: length mismatch")
     local out = {}
     for i = 1, #a do
         out[i] = string.char(a:byte(i) ~ b:byte(i))
@@ -22,6 +23,7 @@ local function xor_strings(a, b)
 end
 
 local function pbkdf2_hmac_sha256(password, salt, iterations, dklen)
+    assert(type(dklen) == "number" and dklen > 0, "dklen must be positive")
     local hLen = 32
     local blocks = math.ceil(dklen / hLen)
     local output = {}
@@ -44,16 +46,28 @@ local function pbkdf2_hmac_sha256(password, salt, iterations, dklen)
 end
 M.pbkdf2_hmac_sha256 = pbkdf2_hmac_sha256
 
-local function compare_secure(a, b, key)
+-- Constant-time string compare. The HMAC indirection that used to wrap
+-- both inputs added no security: the key was a per-process random value
+-- with no out-of-band sharing, so it didn't protect against any attacker
+-- who couldn't already read process memory. We still want constant time
+-- to avoid leaking field length / prefix matches via timing — but the
+-- HMAC was pure overhead.
+--
+-- The `key` parameter is kept for API compatibility; it is ignored.
+local function compare_secure(a, b, _key)
     if type(a) ~= "string" or type(b) ~= "string" then return false end
 
-    local ha = sha2.hmac(sha2.sha256, key, a)
-    local hb = sha2.hmac(sha2.sha256, key, b)
-    if #ha ~= #hb then return false end
+    -- Compare in constant time over max(|a|, |b|) so the length itself
+    -- is also constant-time. Mismatched lengths always return false.
+    local la, lb = #a, #b
+    local n = la > lb and la or lb
+    if n == 0 then return la == lb end
 
-    local diff = 0
-    for i = 1, #ha do
-        diff = diff | (ha:byte(i) ~ hb:byte(i))
+    local diff = la ~ lb  -- nonzero if lengths differ
+    for i = 1, n do
+        local ai = (i <= la) and a:byte(i) or 0
+        local bi = (i <= lb) and b:byte(i) or 0
+        diff = diff | (ai ~ bi)
     end
     return diff == 0
 end
@@ -122,11 +136,12 @@ function M.static_authenticator(opts)
     return setmetatable({
         username       = opts.username,
         password_hash  = password_hash,
-        hmac_key       = rng.bytes(32),
         max_failures   = opts.max_failures   or 5,
         failure_window = opts.failure_window or 60,
         ban_duration   = (opts.ban_duration   or 15) * 60,
+        max_failure_entries = opts.max_failure_entries or 10000,
         failures       = {},
+        failures_n     = 0,
         last_sweep     = socket.gettime(),
     }, Auth)
 end
@@ -140,7 +155,36 @@ function Auth:_maybe_sweep(now)
         local banned = rec.banned_until and rec.banned_until > now
         if not fresh and not banned then
             self.failures[ip] = nil
+            self.failures_n = self.failures_n - 1
         end
+    end
+end
+
+-- Emergency eviction: caller exceeded max_failure_entries. Drop the
+-- oldest non-banned entries until we're back under the cap. This bounds
+-- memory under a rotating-IP attack at the cost of forgetting some
+-- recent failures (those entries' attacker just got luckier).
+function Auth:_evict_oldest(now)
+    local victims = {}
+    for ip, rec in pairs(self.failures) do
+        local banned = rec.banned_until and rec.banned_until > now
+        if not banned then
+            victims[#victims+1] = { ip = ip, first_at = rec.first_at or 0 }
+        end
+    end
+    table.sort(victims, function(a, b) return a.first_at < b.first_at end)
+
+    local target = math.floor(self.max_failure_entries * 0.9)
+    local removed = 0
+    for i = 1, #victims do
+        if self.failures_n <= target then break end
+        self.failures[victims[i].ip] = nil
+        self.failures_n = self.failures_n - 1
+        removed = removed + 1
+    end
+    if removed > 0 then
+        io.stderr:write(string.format(
+            "[auth] failures table full, evicted %d oldest entries\n", removed))
     end
 end
 
@@ -157,6 +201,7 @@ end
 
 function Auth:_record_failure(ip, now)
     local rec = self.failures[ip]
+    local existed = rec ~= nil
     if not rec or (now - (rec.first_at or 0)) > self.failure_window then
         rec = { count = 1, first_at = now }
     else
@@ -169,6 +214,12 @@ function Auth:_record_failure(ip, now)
             ip, self.ban_duration, rec.count))
     end
     self.failures[ip] = rec
+    if not existed then
+        self.failures_n = self.failures_n + 1
+        if self.failures_n > self.max_failure_entries then
+            self:_evict_oldest(now)
+        end
+    end
 end
 
 function Auth:_verify_password(password, stored)
@@ -176,7 +227,7 @@ function Auth:_verify_password(password, stored)
     if not parsed then return false, perr end
     local computed = pbkdf2_hmac_sha256(
         password, parsed.salt, parsed.iterations, #parsed.hash)
-    return compare_secure(computed, parsed.hash, self.hmac_key)
+    return compare_secure(computed, parsed.hash)
 end
  
 function Auth:verify(user, pass, ip)
@@ -192,11 +243,14 @@ function Auth:verify(user, pass, ip)
 
     -- Run BOTH compares regardless of intermediate results so timing
     -- doesn't reveal which field is wrong.
-    local user_ok = compare_secure(user or "", self.username, self.hmac_key)
+    local user_ok = compare_secure(user or "", self.username)
     local pass_ok = self:_verify_password(pass or "", self.password_hash)
 
     if user_ok and pass_ok then
-        self.failures[ip] = nil
+        if self.failures[ip] ~= nil then
+            self.failures[ip] = nil
+            self.failures_n = self.failures_n - 1
+        end
         return true, nil
     end
 

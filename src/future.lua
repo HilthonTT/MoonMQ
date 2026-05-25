@@ -32,6 +32,12 @@ function Future:await()
     end
 
     local co = assert(coroutine.running(), "await must run inside a coroutine")
+    -- waiters can be nil if resolve() ran between the ready check above
+    -- and this point. Single-threaded coroutines can't actually hit this,
+    -- but guarding here is cheap and keeps the invariant local.
+    if not self.waiters then
+        return self.value
+    end
     self.waiters[#self.waiters+1] = co
     return coroutine.yield()
 end

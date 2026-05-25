@@ -132,8 +132,8 @@ function Server:_handle(sock, peer, ip)
         end
     end
 
-    local ok, reason = self:_register_conn(ip)
-    if not ok then
+    local reg_ok, reason = self:_register_conn(ip)
+    if not reg_ok then
         local f = proto.encode_error(uuid.ZERO, proto.ERR_RATE_LIMITED, reason)
         pcall(function() sock:send(f); sock:close() end)
         return
@@ -148,10 +148,10 @@ function Server:_handle(sock, peer, ip)
     -- conn:start() runs the reader inline; an uncaught error here would
     -- otherwise leak the capacity slot (the connection is registered but
     -- _unregister_conn never runs). close() is idempotent and unregisters.
-    local ok, err = pcall(conn.start, conn)
-    if not ok then
+    local start_ok, start_err = pcall(conn.start, conn)
+    if not start_ok then
         io.stderr:write(string.format("[server] conn=%s start failed: %s\n",
-            conn.id_short, tostring(err)))
+            conn.id_short, tostring(start_err)))
         conn:close(Connection.REASON_READ_ERROR)
     end
 end
