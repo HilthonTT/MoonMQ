@@ -1,6 +1,6 @@
 local fs_m        = require("src.fs")
 local Topic     = require("src.topic")
-local Partition = require("src.partition").Partition
+local SegmentedPartition = require("src.segmentation").SegmentedPartition
 local utl_m      = require("src.util")
 
 local TopicManager = {}
@@ -37,7 +37,7 @@ function TopicManager:create_topic(name, numPartitions)
     -- failure leaks descriptors until GC, which is awful under retries.
     local opened = {}
     for i = 1, numPartitions do
-        local partition, pErr = Partition.new(topic, i, topicDir)
+        local partition, pErr = SegmentedPartition.new(topic, i, topicDir)
         if not partition then
             for _, p in ipairs(opened) do p:close() end
             return nil, string.format("failed to create partition %d: %s", i, pErr)

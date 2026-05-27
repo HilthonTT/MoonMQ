@@ -1,7 +1,6 @@
 local fs_m       = require("src.fs")
 local tpm_m      = require("src.topic_manager")
 local util_m     = require("src.util")
-local recover  = require("src.crash_recovery")
 
 local Broker = {}
 Broker.__index = Broker
@@ -43,41 +42,38 @@ function Broker:load_topics()
             -- left behind by some other tool would crash load.
             local valid = util_m.validate_topic_name(name)
             if valid then
-                local partition_files, gErr = fs_m.glob(topic_dir, "^partition%-(%d+)%.log$")
-                if not partition_files then
+                -- Each partition lives under topic_dir/partition-<id>/ as
+                -- a directory containing one or more <base_offset>.log
+                -- segment files plus a recovery-checkpoint sidecar.
+                local partition_dirs, gErr = fs_m.glob(topic_dir, "^partition%-(%d+)$")
+                if not partition_dirs then
                     return string.format("failed to glob partitions for topic %s: %s", name, gErr)
                 end
 
-                -- Extract partition IDs from filenames; reject gaps.
-                -- Trusting #partition_files as the partition count would
-                -- silently lose partitions when filenames are non-contiguous.
+                -- Extract partition IDs from dir names; reject gaps.
                 local ids = {}
-                for _, file_path in ipairs(partition_files) do
-                    local basename = file_path:match("[^/\\]+$") or file_path
-                    local id = tonumber(basename:match("^partition%-(%d+)%.log$"))
-                    if id then ids[#ids + 1] = id end
+                for _, dir_path in ipairs(partition_dirs) do
+                    if fs_m.is_dir(dir_path) then
+                        local basename = dir_path:match("[^/\\]+$") or dir_path
+                        local id = tonumber(basename:match("^partition%-(%d+)$"))
+                        if id then ids[#ids + 1] = id end
+                    end
                 end
                 table.sort(ids)
 
                 if #ids > 0 then
-                    -- Run crash recovery on each partition file BEFORE
-                    -- topic_manager opens it for append. Recovery truncates
-                    -- the tail at the last CRC-valid record boundary.
-                    for _, id in ipairs(ids) do
-                        local _, rerr = recover(topic_dir, id)
-                        if rerr then
-                            return string.format("failed to recover topic %s partition %d: %s", name, id, rerr)
-                        end
-                    end
-
                     local max_id = ids[#ids]
                     -- Verify contiguous 1..max_id.
                     for i = 1, max_id do
                         if ids[i] ~= i then
-                            return string.format("topic %s has non-contiguous partition files (missing partition %d)", name, i)
+                            return string.format("topic %s has non-contiguous partition dirs (missing partition %d)", name, i)
                         end
                     end
 
+                    -- SegmentedPartition.new performs its own crash recovery
+                    -- (verify_file with checkpoint/clean-shutdown protocol)
+                    -- when it opens the partition dir, so the broker doesn't
+                    -- need a separate recovery pass here.
                     local _, cErr = self.topic_manager:create_topic(name, max_id)
                     if cErr then
                         return string.format("failed to load topic %s: %s", name, cErr)

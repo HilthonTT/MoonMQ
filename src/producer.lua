@@ -2,7 +2,6 @@ local message = require("src.message")
 local socket  = require("socket")
 local brk     = require("src.broker")
 local Future  = require("src.future")
-local io_sync = require("src.io_sync")
 local util    = require("src.util")
 
 -- AckMode defines the producer acknowledgment levels
@@ -127,11 +126,10 @@ function Producer:produce(topic_name, msg)
 
     if self.acks > 0 then
         -- True fsync, not just userspace flush; otherwise acks=1 lies.
-        local sok, serr = io_sync.sync(partition.file)
+        local sok, serr = partition:sync()
         if not sok then
             return -1, -1, string.format("failed to sync partition: %s", serr)
         end
-        partition.last_sync = socket.gettime()
     end
 
     return partition_id, offset, nil
@@ -188,13 +186,12 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         end
 
         if ack_mode == AckMode.AckLeader then
-            local sok, serr = io_sync.sync(partition.file)
+            local sok, serr = partition:sync()
             if not sok then
                 future:resolve(ProduceResult.new(topic_name, partition_id, -1,
                     string.format("failed to sync partition: %s", serr)))
                 return
             end
-            partition.last_sync = socket.gettime()
         end
 
         -- Soft timeout: the write itself isn't cancellable. The write has

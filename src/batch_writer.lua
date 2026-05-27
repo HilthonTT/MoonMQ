@@ -1,12 +1,12 @@
 local msg_m = require("src.message")
-local prt_m     = require("src.partition")
-local io_sync = require("src.io_sync")
+local seg_m = require("src.segmentation")
 
 local BatchWriter = {}
 BatchWriter.__index = BatchWriter
 
 function BatchWriter.new(partition, max_size, max_messages)
-    assert(getmetatable(partition) == prt_m.Partition, "partition must be a Partition instance")
+    assert(getmetatable(partition) == seg_m.SegmentedPartition,
+        "partition must be a SegmentedPartition instance")
     assert(type(max_size) == "number", "max_size must be a number")
     assert(type(max_messages) == "number", "max_messages must be a number")
 
@@ -55,7 +55,7 @@ function BatchWriter:flush()
     -- Push userspace + OS buffers to disk. Without this, BatchWriter
     -- claims to have committed N messages while they linger in the
     -- C runtime buffer until the next process exit.
-    local sok, serr = io_sync.sync(self.partition.file)
+    local sok, serr = self.partition:sync()
     if not sok then return nil, serr end
 
     self.buffer = {}

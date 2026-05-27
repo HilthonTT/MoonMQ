@@ -1,7 +1,6 @@
 local TopicManager = require("src.topic_manager")
 local message      = require("src.message")
-local recover   = require("src.crash_recovery")
-local os_utils            = require("src.utils.os")
+local os_utils     = require("src.utils.os")
 
 local BASE_DIR     = os_utils.IS_WINDOWS and "C:\\Temp\\lua_kafka_test" or "/tmp/lua_kafka_test"
 
@@ -11,6 +10,19 @@ local function rmdir(path)
     else
         os.execute(string.format("rm -rf '%s'", path))
     end
+end
+
+local SEP = os_utils.IS_WINDOWS and "\\" or "/"
+local FIRST_SEGMENT_NAME = string.format("%020d.log", 0)
+
+-- Path to partition <pid>'s first segment file. The current
+-- SegmentedPartition opens one segment at base_offset=0 on fresh create.
+local function first_segment_path(topic_name, pid)
+    return table.concat({
+        BASE_DIR, topic_name,
+        string.format("partition-%d", pid),
+        FIRST_SEGMENT_NAME,
+    }, SEP)
 end
 
 describe("Partition", function()
@@ -60,17 +72,15 @@ describe("Partition", function()
         local p = topic.partitions[1]
         local m = message.Message.new("k", "secret", 99)
         p:write_message(m)
-        p.file:flush()
+        p:sync()
 
-        -- Partition opens its file in "a+b" (append mode). On POSIX, writes
-        -- to an append-mode fd always go to EOF regardless of seek, so we
-        -- can't corrupt in-place through p.file. Use a separate "r+b" fd.
-        local IS_WIN = package.config:sub(1,1) == "\\"
-        local sep    = IS_WIN and "\\" or "/"
-        local path   = BASE_DIR .. sep .. "orders" .. sep .. "partition-1.log"
+        -- SegmentedPartition opens the segment in "a+b"; on POSIX writes
+        -- ignore seek and go to EOF, so we corrupt through a separate
+        -- "r+b" handle.
+        local path = first_segment_path("orders", 1)
 
         -- Layout: len(8) | header(12) | hdr_crc(4) | payload | pay_crc(4)
-        -- Flip a byte at offset 24 (start of payload, 0-based).
+        -- Payload starts at byte 24, where the first key byte ("k") lives.
         local f = assert(io.open(path, "r+b"))
         f:seek("set", 24)
         f:write(string.char(0xFF))
@@ -89,25 +99,50 @@ describe("Partition", function()
         p:write_message(m1)
         p:write_message(m2)
         local good_offset = p.offset
-        p:close()
 
-        local IS_WIN = package.config:sub(1,1) == "\\"
-        local sep    = IS_WIN and "\\" or "/"
-        local path   = BASE_DIR .. sep .. "orders" .. sep .. "partition-1.log"
+        -- Close all partition handles first. This writes .clean-shutdown
+        -- and persists the checkpoint at good_offset (the corruption below
+        -- happens behind our back, so the checkpoint reflects only the
+        -- legitimate writes).
+        for _, part in ipairs(topic.partitions) do
+            pcall(function() part:close() end)
+        end
+
+        local path = first_segment_path("orders", 1)
 
         -- Append garbage that looks like a length prefix but has no body.
-        local f = io.open(path, "ab")
+        -- Simulates a torn append from an OS-level crash.
+        local f = assert(io.open(path, "ab"))
         f:write(string.char(0,0,0,0,0,0,0xFF,0xFF)) -- absurd uint64 length
         f:close()
 
-        local recovered, rerr = recover(BASE_DIR .. sep .. "orders", 1)
-        assert.is_nil(rerr)
-        assert.are.equal(recovered, good_offset)
+        -- Drop the clean-shutdown flag for partition-1 so recovery runs.
+        -- (close() wrote it after we set good_offset; remove it now to
+        -- simulate a crash that happened between corruption and the next
+        -- clean shutdown.)
+        local clean_path = table.concat({
+            BASE_DIR, "orders", "partition-1", ".clean-shutdown",
+        }, SEP)
+        os.remove(clean_path)
+
+        -- Fresh TopicManager picks up the existing partition dirs and
+        -- runs SegmentedPartition.load_segments, which invokes verify_file
+        -- and truncates the torn frame.
+        local tm2 = TopicManager.new(BASE_DIR)
+        local topic2, terr = tm2:create_topic("orders", 3)
+        assert.is_nil(terr)
+        topic = topic2  -- so after_each closes the new handles
+
+        assert.are.equal(topic2.partitions[1].offset, good_offset)
     end)
 
     it("closes cleanly", function()
         local p = topic.partitions[1]
         p:close()
-        assert.is_nil(p.file)
+        -- SegmentedPartition holds files inside its segments; after close,
+        -- every segment's file handle should be nil.
+        for _, seg in ipairs(p.segments) do
+            assert.is_nil(seg.file)
+        end
     end)
 end)

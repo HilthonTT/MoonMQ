@@ -11,6 +11,25 @@
 
 local os_utils = require("src.utils.os")
 
+-- atomic_rename: POSIX `rename(2)` is atomic over an existing target. On
+-- Windows it isn't — the target must not exist, otherwise os.rename fails.
+-- We fall back to remove-then-rename there. Not truly atomic, but the
+-- checkpoint file's content (a base-10 integer) is safe to read as 0 if
+-- a crash lands in the gap: the next recovery just re-scans more.
+local function atomic_rename(from, to)
+    assert(type(from) == "string", "from must be a string")
+    assert(type(to)   == "string", "to must be a string")
+
+    local ok, err = os.rename(from, to)
+    if ok then return true, nil end
+    if not os_utils.IS_WINDOWS then return false, err end
+
+    os.remove(to)
+    local ok2, err2 = os.rename(from, to)
+    if not ok2 then return false, err2 end
+    return true, nil
+end
+
 if not os_utils.IS_WINDOWS then
     local stdio   = require("posix.stdio")
     local unistd  = require("posix.unistd")
@@ -37,8 +56,9 @@ if not os_utils.IS_WINDOWS then
     end
 
     return {
-        sync     = sync,
-        truncate = truncate,
+        sync          = sync,
+        truncate      = truncate,
+        atomic_rename = atomic_rename,
     }
 end
 
@@ -96,6 +116,7 @@ local function truncate(luafile, length)
 end
 
 return {
-    sync     = sync,
-    truncate = truncate,
+    sync          = sync,
+    truncate      = truncate,
+    atomic_rename = atomic_rename,
 }

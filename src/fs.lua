@@ -120,7 +120,6 @@ local function glob(dir, pattern)
 end
 
 return {
-    IS_WINDOWS = os_utils.IS_WINDOWS,
     join_path  = join_path,
     mkdir      = mkdir,
     read_dir   = read_dir,

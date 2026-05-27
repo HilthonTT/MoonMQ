@@ -28,10 +28,11 @@ local function rmdir(path)
 end
 
 -- Read every record back from the (single-partition) topic and return them in
--- write order. We flush first because Partition only flushes on the
--- sync_every timer, and the read path can't see un-flushed bytes.
+-- write order. We fsync first so the read path can see every write — the
+-- segmented partition flushes after each write but :sync() makes the
+-- read-vs-write ordering bulletproof under chaos.
 local function drain_partition(partition)
-    partition.file:flush()
+    partition:sync()
     local out = {}
     local off = 0
     while off < partition.offset do
