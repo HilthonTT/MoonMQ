@@ -1,4 +1,4 @@
-local IS_WINDOWS = package.config:sub(1,1) == "\\"
+local os_utils = require("src.utils.os")
 
 -- LuaJIT FFI is used on Windows so that is_dir does not have to write a
 -- probe file (the old implementation did, which had two sharp edges:
@@ -6,7 +6,7 @@ local IS_WINDOWS = package.config:sub(1,1) == "\\"
 -- linger if os.remove failed). On Unix we shell out to `test -d`.
 local has_ffi, ffi = pcall(require, "ffi")
 local kernel32
-if IS_WINDOWS and has_ffi then
+if os_utils.IS_WINDOWS and has_ffi then
     ffi.cdef[[
         unsigned long GetFileAttributesA(const char *lpFileName);
     ]]
@@ -16,7 +16,7 @@ end
 local has_bit, bit = pcall(require, "bit")
 
 local function join_path(...)
-    local sep   = IS_WINDOWS and "\\" or "/"
+    local sep   = os_utils.IS_WINDOWS and "\\" or "/"
     local parts = {}
     for _, p in ipairs({ ... }) do
         p = p:gsub("[/\\]+$", "") -- strip trailing slashes (both kinds)
@@ -40,7 +40,7 @@ end
 
 local function is_dir(path)
     assert(type(path) == "string", "path must be a string")
-    if IS_WINDOWS and kernel32 and has_bit then
+    if os_utils.IS_WINDOWS and kernel32 and has_bit then
         local attr = kernel32.GetFileAttributesA(path)
         if tonumber(attr) == 0xFFFFFFFF then return false end
         local FILE_ATTRIBUTE_DIRECTORY = 0x10
@@ -56,7 +56,7 @@ local function mkdir(path)
     assert(type(path) == "string", "path must be a string")
 
     local cmd
-    if IS_WINDOWS then
+    if os_utils.IS_WINDOWS then
         -- Windows mkdir creates intermediate dirs by default and errors
         -- if the dir already exists; 2>nul swallows the "already exists"
         -- noise. The authoritative check is is_dir() afterward.
@@ -79,7 +79,7 @@ local function read_dir(dir)
         return nil, string.format("not a directory: %s", dir)
     end
 
-    local cmd = IS_WINDOWS
+    local cmd = os_utils.IS_WINDOWS
         and string.format('dir /b "%s" 2>nul', dir:gsub("/", "\\"))
         or  string.format("ls -1a '%s' 2>/dev/null", dir:gsub("'", "'\\''"))
 
@@ -120,7 +120,7 @@ local function glob(dir, pattern)
 end
 
 return {
-    IS_WINDOWS = IS_WINDOWS,
+    IS_WINDOWS = os_utils.IS_WINDOWS,
     join_path  = join_path,
     mkdir      = mkdir,
     read_dir   = read_dir,

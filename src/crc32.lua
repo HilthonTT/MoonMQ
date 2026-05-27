@@ -2,7 +2,7 @@
 -- Uses zlib via FFI when available (fast path); falls back to a
 -- table-driven pure-Lua implementation otherwise.
 
-local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+local os_utils = require("src.utils.os")
 
 local has_ffi, ffi = pcall(require, "ffi")
 
@@ -17,7 +17,7 @@ if has_ffi then
         if ok then return lib end
     end
 
-    if IS_WINDOWS then
+    if os_utils.IS_WINDOWS then
         -- zlib1.dll: official zlib Windows build, the most common name.
         -- zlibwapi.dll: older WinAPI variant, still seen in the wild.
         -- zlib.dll: occasional alias in third-party bundles.

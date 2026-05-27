@@ -1,10 +1,10 @@
 local TopicManager = require("src.topic_manager")
+local os_utils     = require("src.utils.os")
 
-local IS_WINDOWS   = package.config:sub(1,1) == "\\"
-local BASE_DIR     = IS_WINDOWS and "C:\\Temp\\lua_kafka_test" or "/tmp/lua_kafka_test"
+local BASE_DIR     = os_utils.IS_WINDOWS and "C:\\Temp\\lua_kafka_test" or "/tmp/lua_kafka_test"
 
 local function rmdir(path)
-    if IS_WINDOWS then
+    if os_utils.IS_WINDOWS then
         os.execute(string.format('rmdir /s /q "%s" 2>nul', path:gsub("/", "\\")))
     else
         os.execute(string.format("rm -rf '%s'", path))

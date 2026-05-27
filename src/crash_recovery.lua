@@ -8,7 +8,7 @@
 -- use. We don't construct a Partition here — recovery is a filesystem
 -- operation, not a stateful one.
 
-local fs_m      = require("src.fs")
+local fs_m    = require("src.fs")
 local crc32   = require("src.crc32")
 local io_sync = require("src.io_sync")
 

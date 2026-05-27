@@ -6,8 +6,8 @@
 -- on Windows via FFI). Fall back to math.random ONLY with a loud
 -- warning.
 
-local IS_WINDOWS = package.config:sub(1, 1) == "\\"
- 
+local os_utils = require("src.utils.os")
+
 local M = {}
 
 -- Keep /dev/urandom open across calls. Every UUID, salt, and connection
@@ -87,7 +87,7 @@ end
 function M.bytes(n)
     assert(type(n) == "number" and n > 0, "n must be a positive integer")
  
-    local picked = IS_WINDOWS and urandom_windows or urandom_unix
+    local picked = os_utils.IS_WINDOWS and urandom_windows or urandom_unix
     if picked then
         local b, err = picked(n)
         if b then return b end

@@ -15,12 +15,12 @@ local producer_m = require("src.producer")
 local message_m  = require("src.message")
 local chaos_m    = require("src.chaos.chaos")
 local socket     = require("socket")
+local os_utils = require("src.utils.os")
 
-local IS_WINDOWS = package.config:sub(1,1) == "\\"
-local BASE_DIR   = IS_WINDOWS and "C:\\Temp\\lua_chaos_test" or "/tmp/lua_chaos_test"
+local BASE_DIR   = os_utils.IS_WINDOWS and "C:\\Temp\\lua_chaos_test" or "/tmp/lua_chaos_test"
 
 local function rmdir(path)
-    if IS_WINDOWS then
+    if os_utils.IS_WINDOWS then
         os.execute(string.format('rmdir /s /q "%s" 2>nul', path:gsub("/", "\\")))
     else
         os.execute(string.format("rm -rf '%s'", path))

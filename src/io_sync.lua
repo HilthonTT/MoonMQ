@@ -9,9 +9,9 @@
 -- Windows: fall back to LuaJIT FFI against the C runtime, since luaposix
 -- doesn't ship there.
 
-local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+local os_utils = require("src.utils.os")
 
-if not IS_WINDOWS then
+if not os_utils.IS_WINDOWS then
     local stdio   = require("posix.stdio")
     local unistd  = require("posix.unistd")
 
