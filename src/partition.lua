@@ -4,6 +4,7 @@ local socket  = require("socket")
 local msg_m = require("src.message")
 local crc32   = require("src.crc32")
 local io_sync = require("src.io_sync")
+local log     = require("src.log.logger").get("partition")
 
 -- Patterns we treat as transient. We can't introspect errno from plain
 -- io.write — Lua gives us the system's strerror text. These cover Linux/
@@ -209,9 +210,8 @@ function Partition:write_with_resilience(msg)
     end
 
     if not err and last_attempt > 0 then
-        io.stderr:write(string.format(
-            "[partition %d] write succeeded after %d retries\n",
-            self.id, last_attempt))
+        log:warn("partition %d write succeeded after %d retries",
+            self.id, last_attempt)
     end
 
     return offset, err

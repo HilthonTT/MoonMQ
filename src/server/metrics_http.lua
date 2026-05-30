@@ -18,6 +18,7 @@
 
 local socket  = require("socket")
 local metrics = require("src.server.metrics")
+local log     = require("src.log.logger").get("metrics")
  
 local M = {}
 M.__index = M
@@ -166,12 +167,10 @@ function M:start()
     local _, lerr = self.reactor:listen(self.host, self.port,
         function(sock, peer, _ip) self:_handle(sock, peer) end)
     if lerr then
-        io.stderr:write(string.format(
-            "[metrics] listen failed on %s:%d: %s\n", self.host, self.port, lerr))
+        log:error("listen failed on %s:%d: %s", self.host, self.port, lerr)
         return nil, lerr
     end
-    io.stderr:write(string.format(
-        "[metrics] listening on %s:%d (GET /metrics)\n", self.host, self.port))
+    log:info("listening on %s:%d (GET /metrics)", self.host, self.port)
     return true
 end
 

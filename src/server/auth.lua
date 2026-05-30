@@ -6,6 +6,7 @@
 local sha2   = require("sha2")
 local socket = require("socket")
 local rng    = require("src.server.rng")
+local log    = require("src.log.logger").get("auth")
 
 local M = {}
 
@@ -124,10 +125,9 @@ function M.static_authenticator(opts)
         assert(not perr, "invalid password_hash: " .. tostring(perr))
         password_hash = opts.password_hash
     elseif opts.password then
-        io.stderr:write(
-            "[auth] WARNING: hashing plaintext password on startup. " ..
+        log:warn("hashing plaintext password on startup. " ..
             "Replace Auth.Password with Auth.PasswordHash in config; " ..
-            "generate the hash with `lua bin/moonmq-hash.lua <password>`.\n")
+            "generate the hash with `lua bin/moonmq-hash.lua <password>`.")
         password_hash = M.hash_password(opts.password)
     else
         error("static_authenticator: provide password_hash or password")
@@ -183,8 +183,7 @@ function Auth:_evict_oldest(now)
         removed = removed + 1
     end
     if removed > 0 then
-        io.stderr:write(string.format(
-            "[auth] failures table full, evicted %d oldest entries\n", removed))
+        log:warn("failures table full, evicted %d oldest entries", removed)
     end
 end
 
@@ -209,9 +208,8 @@ function Auth:_record_failure(ip, now)
     end
     if rec.count >= self.max_failures then
         rec.banned_until = now + self.ban_duration
-        io.stderr:write(string.format(
-            "[auth] banning %s for %ds after %d failures\n",
-            ip, self.ban_duration, rec.count))
+        log:warn("banning %s for %ds after %d failures",
+            ip, self.ban_duration, rec.count)
     end
     self.failures[ip] = rec
     if not existed then

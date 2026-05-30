@@ -7,6 +7,7 @@
 -- paths.
 
 local socket = require("socket")
+local log    = require("src.log.logger").get("reactor")
 
 local Reactor = {}
 Reactor.__index = Reactor
@@ -40,8 +41,7 @@ end
 local function safe_resume(co, ...)
     local ok, err = coroutine.resume(co, ...)
     if not ok then
-        io.stderr:write(string.format("[reactor] coroutine error: %s\n",
-            tostring(err)))
+        log:error("coroutine error: %s", tostring(err))
     end
     return ok
 end
@@ -147,7 +147,7 @@ function Reactor:listen(host, port, on_accept)
             local client, aerr = self:accept(listener)
             if not client then
                 if not self.running then break end
-                io.stderr:write(string.format("[reactor] accept: %s\n", aerr))
+                log:error("accept: %s", aerr)
                 self:sleep(0.1)
             else
                 local ip, port = client:getpeername()

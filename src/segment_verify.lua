@@ -1,5 +1,6 @@
 local crc32   = require("src.crc32")
 local io_sync = require("src.io_sync")
+local log     = require("src.log.logger").get("segment_verify")
 
 local HEADER_SIZE    = 8
 local MSG_HEADER_LEN = 12
@@ -56,8 +57,7 @@ local function verify_file(file_path, start_at)
 
         if record_end > file_size
            or total_size < MSG_HEADER_LEN + 4 + 4 then
-            io.stderr:write(string.format(
-                "%s: bad framing at %d, truncating\n", file_path, current))
+            log:error("%s: bad framing at %d, truncating", file_path, current)
             truncate_at = current
             break
         end
@@ -75,8 +75,7 @@ local function verify_file(file_path, start_at)
         local stored_payload_crc = string.unpack(">I4", body, payload_end + 1)
 
         if crc32(header_bytes) ~= stored_header_crc or crc32(payload) ~= stored_payload_crc then
-            io.stderr:write(string.format(
-                "%s: CRC mismatch at %d, truncating\n", file_path, current))
+            log:error("%s: CRC mismatch at %d, truncating", file_path, current)
             truncate_at = current
             break
         end

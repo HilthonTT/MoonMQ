@@ -6,6 +6,7 @@ local crc32 = require("src.crc32")
 local socket = require("socket")
 local io_sync = require("src.io_sync")
 local verify_file = require("src.segment_verify")
+local log = require("src.log.logger").get("segmentation")
 
 -- Optional: luafilesystem for accurate per-segment mtime fallback. Without
 -- it, segments fall back to their .meta sidecar or (last resort) "now".
@@ -82,8 +83,7 @@ end
 local function write_meta(meta_path, t)
     local f, err = io.open(meta_path, "wb")
     if not f then
-        io.stderr:write(string.format(
-            "segment meta write %s: %s\n", meta_path, tostring(err)))
+        log:error("segment meta write %s: %s", meta_path, tostring(err))
         return
     end
     f:write(tostring(t))
@@ -490,9 +490,9 @@ function SegmentedPartition:clean_old_segments()
         else
             local path = segment:file_path(self.dir)
             local meta = segment:meta_path(self.dir)
-            print(string.format("Removing old segment %s (created at %s)",
+            log:info("removing old segment %s (created at %s)",
                 path, os.date("!%Y-%m-%dT%H:%M:%SZ",
-                              math.floor(segment.start_time))))
+                              math.floor(segment.start_time)))
             segment:close()
             os.remove(path)
             os.remove(meta)
@@ -531,7 +531,7 @@ function SegmentedPartition:segment_cleaner_loop()
 
         local ok, err = pcall(self.clean_old_segments, self)
         if not ok then
-            print(string.format("segment cleaner: %s", err))
+            log:error("segment cleaner: %s", err)
         end
     end
 end
@@ -551,7 +551,7 @@ function SegmentedPartition:tick_cleaner()
 
     local ok, next_wake = coroutine.resume(self.cleaner)
     if not ok then
-        print(string.format("segment cleaner crashed: %s", next_wake))
+        log:error("segment cleaner crashed: %s", next_wake)
         self.cleaner = nil
         return false
     end

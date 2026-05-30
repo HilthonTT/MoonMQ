@@ -3,6 +3,7 @@ local http   = require("socket.http")
 local ltn12  = require("ltn12")
 local json   = require("dkjson")        -- only needs json.decode
 local msg_m  = require("src.message")
+local log    = require("src.log.logger").get("replicate")
 
 local DEFAULT_QUEUE_SIZE = 1000
 local DEFAULT_TIMEOUT_IN_SECONDS = 5 -- seconds
@@ -148,9 +149,8 @@ function ReplicatedPartition:write(scheduler, msg)
     local payload, serr = msg_m.serialize_message(msg)
     if not payload then
         -- Local write already succeeded; we can't unwind it. Log and move on.
-        io.stderr:write(string.format(
-            "[replicate] partition %d: serialize failed: %s\n",
-            self.partition.id, serr))
+        log:error("partition %d: serialize failed: %s",
+            self.partition.id, serr)
         return offset, nil
     end
 
@@ -160,9 +160,8 @@ function ReplicatedPartition:write(scheduler, msg)
             -- Same back-pressure semantics as Go's buffered chan(1000)
             -- when full: drop, since we can't block the writer without
             -- killing throughput.
-            io.stderr:write(string.format(
-                "[replicate] partition %d replica %d: queue full, dropping\n",
-                self.partition.id, replica.id))
+            log:warn("partition %d replica %d: queue full, dropping",
+                self.partition.id, replica.id)
         else
             replica.tail = replica.tail + 1
             replica.queue[replica.tail] = payload
@@ -204,9 +203,8 @@ function ReplicatedPartition:run_replica(scheduler, replica)
                 payload)
 
             if serr then
-                io.stderr:write(string.format(
-                    "[replicate] partition %d -> replica %d: %s\n",
-                    self.partition.id, replica.id, serr))
+                log:error("partition %d -> replica %d: %s",
+                    self.partition.id, replica.id, serr)
             else
                 replica.last_offset = new_offset
             end

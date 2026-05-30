@@ -7,6 +7,7 @@
 -- warning.
 
 local os_utils = require("src.utils.os")
+local log      = require("src.log.logger").get("rng")
 
 local M = {}
 
@@ -60,10 +61,9 @@ end
 local fallback_warned = false
 local function urandom_fallback(n)
     if not fallback_warned then
-        io.stderr:write(
-            "[rng] WARNING: no OS CSPRNG available, falling back to math.random. " ..
+        log:warn("no OS CSPRNG available, falling back to math.random. " ..
             "This is NOT cryptographically secure. " ..
-            "Use Lua on Linux/macOS, or LuaJIT on Windows with bcrypt.dll.\n")
+            "Use Lua on Linux/macOS, or LuaJIT on Windows with bcrypt.dll.")
         fallback_warned = true
  
         local socket_ok, socket = pcall(require, "socket")
@@ -91,7 +91,7 @@ function M.bytes(n)
     if picked then
         local b, err = picked(n)
         if b then return b end
-        io.stderr:write(string.format("[rng] OS CSPRNG failed (%s); falling back\n", err))
+        log:warn("OS CSPRNG failed (%s); falling back", err)
     end
     return urandom_fallback(n)
 end

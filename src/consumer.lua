@@ -1,5 +1,6 @@
 local brk_m  = require("src.broker")
 local util_m = require("src.util")
+local log    = require("src.log.logger").get("consumer")
 
 -- ConsumerRecord holds a consumed message with its metadata
 local ConsumerRecord = {}
@@ -133,8 +134,8 @@ end
 -- commit_offset persists a single offset (stub — extend for file/DB storage).
 -- Returns (true, nil) on success, (nil, err) on failure.
 function Consumer:commit_offset(topic_name, partition_id, offset)
-    print(string.format("Committed offset %d for topic '%s', partition %d",
-        offset, topic_name, partition_id))
+    log:debug("committed offset %d for topic '%s', partition %d",
+        offset, topic_name, partition_id)
     return true, nil
 end
 

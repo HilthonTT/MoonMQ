@@ -29,6 +29,7 @@ local uuid     = require("src.server.uuid")
 local framer   = require("src.server.framer")
 local proto    = require("src.server.protocol")
 local metrics  = require("src.server.metrics")
+local log      = require("src.log.logger").get("server")
 
 local Connection = {}
 Connection.__index = Connection
@@ -180,12 +181,11 @@ function Connection:_log_close()
     if self.username then
         ident = ident .. " user=" .. self.username
     end
-    io.stderr:write(string.format(
-        "[server] closed conn=%s peer=%s reason=%s recv=%dB/%df sent=%dB/%df dur=%.1fs%s\n",
+    log:info("closed conn=%s peer=%s reason=%s recv=%dB/%df sent=%dB/%df dur=%.1fs%s",
         self.id_short, self.peer, self.close_reason or "unknown",
         self.bytes_received, self.frames_received,
         self.bytes_sent, self.frames_sent,
-        duration, ident))
+        duration, ident)
 
     metrics.inc("moonmq_connections_closed_total", 1, { reason = self.close_reason })
     metrics.observe("moonmq_connection_duration_seconds",
@@ -382,8 +382,7 @@ function Connection:start()
     self.server.reactor:spawn(function() self:run_sender() end)
     self.server.reactor:spawn(function() self:run_handshake_watchdog() end)
 
-    io.stderr:write(string.format("[server] accepted conn=%s peer=%s\n",
-        self.id_short, self.peer))
+    log:info("accepted conn=%s peer=%s", self.id_short, self.peer)
 
     self:run_reader()
 end

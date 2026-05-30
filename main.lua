@@ -1,6 +1,9 @@
 local Server = require("src.server.server")
 local Config = require("src.server.config")
 local auth_m = require("src.server.auth")
+local Log    = require("src.log.logger")
+
+local log = Log.get("main")
 
 local function is_main(_arg, ...)
     local n_arg = _arg and #_arg or 0
@@ -16,7 +19,7 @@ end
 local function build_authenticator(cfg)
     local ac = cfg.Auth
     if not ac or not ac.Username then
-        io.stderr:write("[main] WARN: Auth.Username missing, server is OPEN\n")
+        log:warn("Auth.Username missing, server is OPEN")
         return nil
     end
 
@@ -31,11 +34,11 @@ local function build_authenticator(cfg)
         opts.password_hash = ac.PasswordHash
     elseif ac.Password and ac.Password ~= "" then
         if ac.Password == "CHANGE_ME" then
-            io.stderr:write("[main] WARN: default password in use; replace Auth.Password\n")
+            log:warn("default password in use; replace Auth.Password")
         end
         opts.password = ac.Password
     else
-        io.stderr:write("[main] WARN: no credential configured, server is OPEN\n")
+        log:warn("no credential configured, server is OPEN")
         return nil
     end
 
@@ -45,9 +48,11 @@ end
 if is_main(arg, ...) then
     local cfg, cerr = Config.load()
     if not cfg then
-        io.stderr:write("[main] config: " .. cerr .. "\n")
+        log:error("config: %s", cerr)
         os.exit(1)
     end
+
+    Log.configure({ level = Config.get(cfg, "Logging.Level", "INFO") })
 
     local s = cfg.Server or {}
     local srv = assert(Server.new({
@@ -64,7 +69,7 @@ if is_main(arg, ...) then
         authenticator          = build_authenticator(cfg),
     }))
 
-    print(string.format("[main] env=%s host=%s port=%d data_dir=%s",
-        cfg._environment, srv.host, srv.port, s.DataDir or "./data_server"))
+    log:info("env=%s host=%s port=%d data_dir=%s",
+        cfg._environment, srv.host, srv.port, s.DataDir or "./data_server")
     srv:start()
 end

@@ -3,6 +3,7 @@ local socket  = require("socket")
 local brk     = require("src.broker")
 local Future  = require("src.future")
 local util    = require("src.util")
+local log     = require("src.log.logger").get("producer")
 
 -- AckMode defines the producer acknowledgment levels
 local AckMode = {
@@ -200,9 +201,7 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         -- vs timeout themselves if monitoring is needed.
         local elapsed = socket.gettime() - started
         if timeout and elapsed > timeout then
-            io.stderr:write(
-                string.format("warn: produce exceeded timeout: %.3fs > %.3fs\n",
-                    elapsed, timeout))
+            log:warn("produce exceeded timeout: %.3fs > %.3fs", elapsed, timeout)
         end
 
         future:resolve(ProduceResult.new(topic_name, partition_id, offset, nil))

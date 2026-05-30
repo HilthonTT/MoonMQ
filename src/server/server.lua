@@ -30,6 +30,8 @@ local consumer_m  = require("src.consumer")
 local msg_m       = require("src.message")
 local metrics     = require("src.server.metrics")
 local MetricsHttp = require("src.server.metrics_http")
+local log         = require("src.log.logger").get("server")
+local push_log    = require("src.log.logger").get("push")
 
 -- Tightened from a hypothetical 16 MiB to 1 MiB. A 1 MiB cap is still
 -- generous for a message queue and bounds worst-case memory under
@@ -150,8 +152,8 @@ function Server:_handle(sock, peer, ip)
     -- _unregister_conn never runs). close() is idempotent and unregisters.
     local start_ok, start_err = pcall(conn.start, conn)
     if not start_ok then
-        io.stderr:write(string.format("[server] conn=%s start failed: %s\n",
-            conn.id_short, tostring(start_err)))
+        log:error("conn=%s start failed: %s",
+            conn.id_short, tostring(start_err))
         conn:close(Connection.REASON_READ_ERROR)
     end
 end
@@ -207,8 +209,8 @@ function Server:_handle_identify_client(conn, correl, payload)
     end
     conn.client_name    = i.name
     conn.client_version = i.version
-    io.stderr:write(string.format("[server] conn=%s identified client=%s/%s\n",
-        conn.id_short, conn.client_name, conn.client_version))
+    log:info("conn=%s identified client=%s/%s",
+        conn.id_short, conn.client_name, conn.client_version)
     conn:send(proto.encode_identify_ack(correl,
         proto.SERVER_NAME, proto.SERVER_VERSION))
 end
@@ -221,7 +223,7 @@ function Server:_handle_auth(conn, correl, payload)
     end
 
     if not self.authenticator then
-        io.stderr:write("[server] WARN: no authenticator configured, allowing\n")
+        log:warn("no authenticator configured, allowing")
         conn.authed   = true
         conn.username = a.username
         conn:transition_to(Connection.STATE_AUTHENTICATED)
@@ -317,8 +319,7 @@ function Server:_subscriber_loop(conn)
     while conn.state ~= Connection.STATE_CLOSED do
         local records, err = conn.consumer:poll()
         if err then
-            io.stderr:write(string.format("[push] conn=%s poll: %s\n",
-                conn.id_short, err))
+            push_log:error("conn=%s poll: %s", conn.id_short, err)
             return
         end
         if records and #records > 0 then
@@ -430,13 +431,12 @@ end
 function Server:_install_signal_handlers()
     local ok, signal = pcall(require, "posix.signal")
     if not ok then
-        io.stderr:write("[server] luaposix missing, no signal handling\n")
+        log:warn("luaposix missing, no signal handling")
         return
     end
 
     local function on_signal(signo)
-        io.stderr:write(string.format(
-            "[server] got signal %d, shutting down\n", signo))
+        log:info("got signal %d, shutting down", signo)
         self.reactor:stop()
     end
 
@@ -453,10 +453,9 @@ function Server:start()
 
     self:_install_signal_handlers()
 
-    io.stderr:write(string.format(
-        "[server] listening on %s:%d (proto v%d, %s/%s)\n",
+    log:info("listening on %s:%d (proto v%d, %s/%s)",
         self.host, self.port, proto.PROTOCOL_VERSION,
-        proto.SERVER_NAME, proto.SERVER_VERSION))
+        proto.SERVER_NAME, proto.SERVER_VERSION)
 
     if self.metrics_port then
         local mh = MetricsHttp.new({
@@ -470,7 +469,7 @@ function Server:start()
     self.reactor:run()
 
     -- Reactor returned (signal or :stop()). Close everything we own.
-    io.stderr:write("[server] reactor stopped, closing sockets\n")
+    log:info("reactor stopped, closing sockets")
     self.reactor:shutdown()
 
     return true
