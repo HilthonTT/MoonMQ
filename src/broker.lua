@@ -86,11 +86,51 @@ function Broker:load_topics()
     return nil
 end
 
-function Broker:create_topic(name, num_partitions)
+-- opts (optional): per-topic config forwarded to the TopicManager. See
+-- src/segmentation.lua SegmentedPartition.new for supported keys.
+function Broker:create_topic(name, num_partitions, opts)
     assert(type(name) == "string", "name must be a string")
     assert(type(num_partitions) == "number", "num_partitions must be a number")
+    if opts ~= nil then
+        assert(type(opts) == "table", "opts must be a table or nil")
+    end
 
-    return self.topic_manager:create_topic(name, num_partitions)
+    local topic, err = self.topic_manager:create_topic(name, num_partitions, opts)
+    if topic and self._committer_factory then
+        for _, p in ipairs(topic.partitions) do
+            self._committer_factory(p)
+        end
+    end
+    return topic, err
+end
+
+-- attach_committer_factory installs a callback `fn(partition)` that the
+-- broker invokes on every partition — both those already loaded and any
+-- created later via :create_topic. The Server calls this once at startup
+-- with a closure that wires the partition to its reactor for group
+-- commit. Kept separate from Broker.new so the broker module doesn't
+-- need to know about the reactor.
+function Broker:attach_committer_factory(fn)
+    assert(type(fn) == "function", "factory must be a function")
+    self._committer_factory = fn
+    for _, topic in pairs(self.topic_manager.topics) do
+        for _, p in ipairs(topic.partitions) do
+            fn(p)
+        end
+    end
+end
+
+-- Inverse of attach_committer_factory: detach every partition's
+-- committer (draining any in-flight waiters) and forget the factory so
+-- future :create_topic calls don't re-attach. Used at shutdown so the
+-- reactor doesn't get fresh sleeps queued while it's stopping.
+function Broker:detach_committers()
+    self._committer_factory = nil
+    for _, topic in pairs(self.topic_manager.topics) do
+        for _, p in ipairs(topic.partitions) do
+            if p.detach_committer then p:detach_committer() end
+        end
+    end
 end
 
 function Broker:get_topic(name)

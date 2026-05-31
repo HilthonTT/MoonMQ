@@ -6,12 +6,25 @@ local M = {
     histograms = {},
 }
 
+-- Per the Prometheus exposition format, label values are double-quoted
+-- and must escape backslash, double-quote, and newline. Anything else
+-- passes through verbatim. We escape at key() time so the same escaped
+-- form is what we group by — otherwise two metrics whose labels only
+-- differ by an escape would end up under the same series key.
+local function escape_label_value(v)
+    v = tostring(v)
+    v = v:gsub("\\", "\\\\")
+    v = v:gsub('"', '\\"')
+    v = v:gsub("\n", "\\n")
+    return v
+end
+
 -- Labels as a stable string key so we don't lose to table identity.
 local function key(name, labels)
     if not labels then return name end
     local parts = {}
     for k, v in pairs(labels) do
-        parts[#parts+1] = k.. "=" ..tostring(v)
+        parts[#parts+1] = k .. '="' .. escape_label_value(v) .. '"'
     end
     table.sort(parts)
     return name .. "{" .. table.concat(parts, ",") .. "}"

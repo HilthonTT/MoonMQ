@@ -11,9 +11,18 @@ local AckMode = {
     AckNone     = 0,
     -- AckLeader means the leader must acknowledge (fsync after write)
     AckLeader   = 1,
-    -- AckAll means all replicas must acknowledge (not implemented in this version)
+    -- AckAll means all replicas must acknowledge. Currently rejected at
+    -- the API boundary: src/replica.lua drains fire-and-forget over HTTP
+    -- and has no high-watermark, so we cannot honour the contract. The
+    -- prior behaviour silently degraded acks=-1 to acks=0 (because the
+    -- `self.acks > 0` guard is false for -1), which is worse than failing
+    -- — callers thought they had stronger durability than they did.
     AckAll      = -1,
 }
+
+local ERR_ACKS_ALL_UNSUPPORTED =
+    "acks=all is not supported: replication is fire-and-forget without HWM. " ..
+    "Use acks=0 (None) or acks=1 (Leader)."
 
 local function rand_intn(n)
     assert(type(n) == "number", "n must be a number")
@@ -47,6 +56,54 @@ local function default_partitioner(key, numPartitions)
 
     local hash = fnv32a(key)
     return hash % numPartitions
+end
+
+-- Sticky-partitioner parameters. Kafka 2.4's sticky partitioner pins
+-- empty-key sends to one partition until a batch is closed (size or
+-- linger). We don't yet thread batch boundaries through the produce
+-- path, so we approximate with a count + wall-clock rotation: every N
+-- records or T seconds, reroll to a new partition. This keeps small
+-- bursts together (huge for batching/compression once it's wired) but
+-- still spreads load over time.
+local STICKY_MAX_RECORDS = 16
+local STICKY_MAX_AGE_S   = 0.010   -- 10ms
+
+-- pick_partition centralises keyed vs sticky routing. Returns the 0-based
+-- partition index (the caller adds 1 for the partitions[] lookup).
+local function pick_partition(self, topic_name, key, num_partitions)
+    if num_partitions <= 0 then return 0 end
+
+    -- Keyed: deterministic. No stickiness — same key always lands on the
+    -- same partition so ordering-per-key is preserved.
+    if key ~= nil and #key > 0 then
+        return self.partitioner(key, num_partitions)
+    end
+
+    -- Empty key: sticky path.
+    local s = self.sticky[topic_name]
+    local now = socket.gettime()
+    if s and s.num_partitions == num_partitions
+       and s.count < STICKY_MAX_RECORDS
+       and (now - s.started_at) < STICKY_MAX_AGE_S
+    then
+        s.count = s.count + 1
+        return s.partition
+    end
+
+    -- Reroll. Avoid landing on the same partition twice in a row when N>1
+    -- so we don't accidentally pin everything to one slot under low load.
+    local prev = s and s.partition or -1
+    local p = rand_intn(num_partitions)
+    if num_partitions > 1 and p == prev then
+        p = (p + 1) % num_partitions
+    end
+    self.sticky[topic_name] = {
+        partition       = p,
+        num_partitions  = num_partitions,
+        count           = 1,
+        started_at      = now,
+    }
+    return p
 end
 
 -- Millisecond-resolution timestamps. We'd love nanosecond precision to
@@ -88,17 +145,25 @@ Producer.__index = Producer
 function Producer.new(broker, acks)
     assert(getmetatable(broker) == brk.Broker, "broker must be a Broker instance")
     assert(type(acks) == "number", "acks must be a number")
+    assert(acks ~= AckMode.AckAll, ERR_ACKS_ALL_UNSUPPORTED)
 
     return setmetatable({
         broker = broker,
         acks = acks,
         partitioner = default_partitioner,
+        -- Sticky-partition state for empty-key sends. Keyed by topic name
+        -- since num_partitions varies per topic. See default_partitioner.
+        sticky = {},
     }, Producer)
 end
 
 function Producer:produce(topic_name, msg)
     assert(type(topic_name) == "string", "topic_name must be a string")
     assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
+
+    if self.acks == AckMode.AckAll then
+        return -1, -1, ERR_ACKS_ALL_UNSUPPORTED
+    end
 
     local valid, vErr = util.validate_topic_name(topic_name)
     if not valid then return -1, -1, vErr end
@@ -113,7 +178,7 @@ function Producer:produce(topic_name, msg)
     end
 
     local num_partitions = #topic.partitions
-    local partition_id   = self.partitioner(msg.key, num_partitions) + 1
+    local partition_id   = pick_partition(self, topic_name, msg.key, num_partitions) + 1
 
     local partition = topic.partitions[partition_id]
     if not partition then
@@ -125,9 +190,13 @@ function Producer:produce(topic_name, msg)
         return -1, -1, string.format("failed to write message: %s", werr)
     end
 
-    if self.acks > 0 then
-        -- True fsync, not just userspace flush; otherwise acks=1 lies.
-        local sok, serr = partition:sync()
+    if self.acks == AckMode.AckLeader then
+        -- request_sync coalesces concurrent acks=1 waiters into one fsync
+        -- when the partition has a committer attached (set at server boot
+        -- via Broker:attach_committer_factory). Without a committer it
+        -- behaves exactly like :sync() — single fsync per call. Either
+        -- way, this is a TRUE fsync, not just userspace flush.
+        local sok, serr = partition:request_sync()
         if not sok then
             return -1, -1, string.format("failed to sync partition: %s", serr)
         end
@@ -147,6 +216,15 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
     opts = opts or {}
     local ack_mode = opts.ack_mode or self.acks
     local timeout  = opts.timeout_in_seconds   -- nil = no limit
+
+    -- Reject acks=all at the API boundary rather than silently degrading
+    -- to acks=0 (the old `ack_mode == AckLeader` branch skipped the sync
+    -- for AckAll == -1, so callers got no durability at all).
+    if ack_mode == AckMode.AckAll then
+        local f = Future.new(scheduler)
+        f:resolve(ProduceResult.new(topic_name, -1, -1, ERR_ACKS_ALL_UNSUPPORTED))
+        return f
+    end
 
     if msg.timestamp == 0 then
         msg.timestamp = now_ms()
@@ -171,7 +249,7 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         end
 
         local num_partitions = #topic.partitions
-        local partition_id   = self.partitioner(msg.key, num_partitions) + 1
+        local partition_id   = pick_partition(self, topic_name, msg.key, num_partitions) + 1
         local partition      = topic.partitions[partition_id]
         if not partition then
             future:resolve(ProduceResult.new(topic_name, partition_id, -1,
@@ -187,7 +265,7 @@ function Producer:produce_async(scheduler, topic_name, msg, opts)
         end
 
         if ack_mode == AckMode.AckLeader then
-            local sok, serr = partition:sync()
+            local sok, serr = partition:request_sync()
             if not sok then
                 future:resolve(ProduceResult.new(topic_name, partition_id, -1,
                     string.format("failed to sync partition: %s", serr)))

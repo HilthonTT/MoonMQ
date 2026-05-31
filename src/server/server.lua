@@ -48,6 +48,14 @@ local DEFAULT_HANDSHAKE_DEADLINE  = 10
 local DEFAULT_HEARTBEAT_INTERVAL  = 30
 local DEFAULT_HEARTBEAT_MISS      = 3
 local DEFAULT_PUSH_INTERVAL       = 0.05
+-- Group-commit defaults. Linger is the max time a single acks=1 producer
+-- waits for siblings to join the batch; max_waiters caps batch size so
+-- a busy partition doesn't accumulate unbounded RAM. 2 ms is short
+-- enough to be invisible end-to-end yet long enough to collect a useful
+-- batch under any meaningful load — Kafka's default linger is 0 (per-
+-- request fsync) but with the segregated IO threads we don't yet have.
+local DEFAULT_GROUP_COMMIT_LINGER_S    = 0.002
+local DEFAULT_GROUP_COMMIT_MAX_WAITERS = 64
 
 local Server = {}
 Server.__index = Server
@@ -88,6 +96,11 @@ function Server.new(opts)
 
         authenticator        = opts.authenticator,
         rate_limiter_factory = opts.rate_limiter_factory,
+
+        group_commit_linger_s    = opts.group_commit_linger_s
+                                   or DEFAULT_GROUP_COMMIT_LINGER_S,
+        group_commit_max_waiters = opts.group_commit_max_waiters
+                                   or DEFAULT_GROUP_COMMIT_MAX_WAITERS,
     }, Server)
 end
 
@@ -451,6 +464,22 @@ function Server:start()
         function(sock, peer, ip) self:_handle(sock, peer, ip) end)
     if err then return nil, err end
 
+    -- Wire group commit. The factory closure is invoked on every
+    -- existing partition right now, and on every partition created by
+    -- future CREATE_TOPIC ops. Without this, request_sync falls back to
+    -- per-call fsync (same behaviour as before #8).
+    local linger      = self.group_commit_linger_s
+    local max_waiters = self.group_commit_max_waiters
+    local reactor     = self.reactor
+    self.broker:attach_committer_factory(function(p)
+        p:attach_committer(reactor, {
+            linger_s    = linger,
+            max_waiters = max_waiters,
+        })
+    end)
+    log:info("group commit: linger=%.3fs max_waiters=%d",
+        linger, max_waiters)
+
     self:_install_signal_handlers()
 
     log:info("listening on %s:%d (proto v%d, %s/%s)",
@@ -468,7 +497,15 @@ function Server:start()
 
     self.reactor:run()
 
-    -- Reactor returned (signal or :stop()). Close everything we own.
+    -- Reactor returned (signal or :stop()). Drain any pending group-
+    -- commit waiters before closing sockets so producers parked on
+    -- request_sync don't sit on an undelivered ACK forever. The data
+    -- they wrote is durable either way (their bytes hit the page cache
+    -- before they parked, and partition close fsyncs again), but
+    -- draining gives clients a chance to receive the success ACK if
+    -- they're still connected.
+    self.broker:detach_committers()
+
     log:info("reactor stopped, closing sockets")
     self.reactor:shutdown()
 

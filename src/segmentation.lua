@@ -91,10 +91,20 @@ local function write_meta(meta_path, t)
     f:close()
 end
 
-function SegmentedPartition.new(topic, id, dir)
+-- opts (optional): per-topic config overrides
+--   max_segment_size   bytes before rolling to a new segment (default 1 GiB)
+--   retention          seconds to keep sealed segments       (default 7d)
+--   cleaner_interval   seconds between retention sweeps      (default 1h)
+-- Unknown keys are ignored; nil/missing keys fall back to the defaults.
+-- Callers wanting per-topic tuning pass these via TopicManager:create_topic.
+function SegmentedPartition.new(topic, id, dir, opts)
     assert(getmetatable(topic) == topic_m, "topic must be a Topic instance")
     assert(type(id)  == "number", "id must be a number")
     assert(type(dir) == "string", "dir must be a string")
+    if opts ~= nil then
+        assert(type(opts) == "table", "opts must be a table or nil")
+    end
+    opts = opts or {}
 
     local partition_dir = fs_m.join_path(dir, string.format("partition-%d", id))
     local ok, err = fs_m.mkdir(partition_dir)
@@ -106,9 +116,9 @@ function SegmentedPartition.new(topic, id, dir)
         topic            = topic,
         id               = id,
         dir              = partition_dir,
-        max_segment_size = DEFAULT_MAX_SEGMENT_SIZE,
-        retention        = DEFAULT_RETENTION,
-        cleaner_interval = DEFAULT_CLEANER_INTERVAL,
+        max_segment_size = opts.max_segment_size or DEFAULT_MAX_SEGMENT_SIZE,
+        retention        = opts.retention        or DEFAULT_RETENTION,
+        cleaner_interval = opts.cleaner_interval or DEFAULT_CLEANER_INTERVAL,
         segments         = {},
         active_segment   = nil,
         offset           = 0,   -- leader-end / next-write offset
@@ -246,7 +256,7 @@ function SegmentedPartition:load_segments()
             end
             -- verify_file truncates at the first bad frame and returns the
             -- post-truncate byte position. Use it as authoritative size.
-            post_verify_size = last_good
+            post_verify_size = last_good or on_disk_size
         end
 
         local file, ferr = io.open(path, "a+b")
@@ -380,6 +390,142 @@ function SegmentedPartition:sync()
         return false, "no active segment"
     end
     return io_sync.sync(self.active_segment.file)
+end
+
+-- ---------------------------------------------------------------------------
+-- Group commit (Kafka-style)
+--
+-- attach_committer wires this partition to a scheduler so concurrent
+-- acks=1 producers can coalesce their fsyncs into one. Without it,
+-- request_sync() falls back to an immediate per-call fsync (the
+-- original behaviour, kept for unit tests and the synchronous BatchWriter
+-- path).
+--
+-- scheduler is duck-typed; it must provide:
+--   :spawn(fn)     — start fn in a new coroutine, return the coroutine
+--   :sleep(s)      — yield the current coroutine for s seconds
+--   :schedule(co)  — re-queue a parked coroutine for resumption (no args)
+--
+-- The Reactor in src/server/reactor.lua satisfies this interface as-is.
+--
+-- opts (optional):
+--   linger_s     max wait before fsync if batch isn't full (default 0.002)
+--   max_waiters  size cap — batch is committed immediately when reached
+--                regardless of linger (default 64)
+function SegmentedPartition:attach_committer(scheduler, opts)
+    assert(scheduler ~= nil, "scheduler required")
+    opts = opts or {}
+    self.committer = {
+        scheduler   = scheduler,
+        linger_s    = opts.linger_s    or 0.002,
+        max_waiters = opts.max_waiters or 64,
+        waiters     = {},
+        linger_co   = nil,
+        -- Generation counter: every commit bumps it. A stale linger
+        -- coroutine that wakes after its batch was force-committed sees
+        -- the mismatch and exits silently. Without this, a force-commit
+        -- followed by a no-op committer wake would issue an extra fsync.
+        generation  = 0,
+    }
+end
+
+function SegmentedPartition:detach_committer()
+    local c = self.committer
+    if not c then return end
+    -- Drain any in-flight waiters synchronously. Their parked coroutines
+    -- will be rescheduled with their result cell populated — even if the
+    -- reactor is shutting down and never resumes them, the data is on
+    -- disk so we haven't lost durability, only the ACK.
+    if #c.waiters > 0 then
+        self:_commit_now()
+    end
+    self.committer = nil
+end
+
+-- Internal: do one fsync, populate every parked waiter's result cell,
+-- and reschedule every waiter EXCEPT skip_co (single-threaded reactor →
+-- no lock needed; nothing else can interleave between c.waiters and the
+-- fsync).
+--
+-- skip_co exists for the request_sync fast path: when a caller's own
+-- arrival fills the batch, it calls _commit_now inline without yielding.
+-- Its coroutine is in c.waiters (so it gets ok/err set) but must NOT be
+-- rescheduled — it never parked, and resume() on a still-running or
+-- already-returned coroutine errors with "cannot resume dead coroutine".
+function SegmentedPartition:_commit_now(skip_co)
+    local c = self.committer
+    if not c then return self:sync() end
+
+    local waiters = c.waiters
+    c.waiters = {}
+    c.linger_co = nil
+    c.generation = c.generation + 1
+
+    local ok, err = self:sync()
+
+    for i = 1, #waiters do
+        local w = waiters[i]
+        -- Per-waiter result cells. Sharing a single c.last_ok/c.last_err
+        -- would race: a waker that yields after reading the shared value
+        -- could see a NEXT batch's result by the time it resumes.
+        w.ok, w.err = ok, err
+        if w.co ~= skip_co then
+            c.scheduler:schedule(w.co)
+        end
+    end
+    return ok, err
+end
+
+-- request_sync is the group-commit-aware entrypoint used by the producer
+-- when acks=1. Behaviour:
+--   * No committer attached OR called from the main thread → immediate
+--     fsync (same as :sync()). Keeps the sync test paths working.
+--   * Inside a coroutine with a committer → register as a waiter; the
+--     first waiter spawns a "linger" coroutine that fsyncs after
+--     linger_s. Hitting max_waiters short-circuits the linger and fsyncs
+--     immediately. The caller yields and is resumed with (ok, err) of
+--     that batch's fsync.
+function SegmentedPartition:request_sync()
+    local c = self.committer
+    if not c then return self:sync() end
+
+    local co, is_main = coroutine.running()
+    if is_main or not co then
+        return self:sync()
+    end
+
+    local w = { co = co, ok = nil, err = nil }
+    c.waiters[#c.waiters + 1] = w
+
+    -- Fast path: if this waiter just filled the batch, commit
+    -- synchronously. The current coroutine is mid-execution and is in
+    -- the waiter list; _commit_now will populate w.ok/w.err before
+    -- returning, so we don't need to yield.
+    if #c.waiters >= c.max_waiters then
+        self:_commit_now(co)
+        return w.ok, w.err
+    end
+
+    -- First waiter arms the linger. Subsequent waiters in the same
+    -- window just join the list — a single linger fires for all of them.
+    if not c.linger_co then
+        local my_gen = c.generation
+        local sched = c.scheduler
+        local self_ref = self
+        c.linger_co = sched:spawn(function()
+            sched:sleep(c.linger_s)
+            -- Skip stale wake-ups:
+            --   * generation advanced  → batch already committed via the
+            --     max_waiters fast path.
+            --   * committer detached   → shutdown raced us.
+            if self_ref.committer ~= c then return end
+            if c.generation ~= my_gen then return end
+            self_ref:_commit_now()
+        end)
+    end
+
+    coroutine.yield()
+    return w.ok, w.err
 end
 
 -- Locate the segment that owns `offset` (base_offset <= offset < base_offset

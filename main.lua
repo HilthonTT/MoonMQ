@@ -55,6 +55,7 @@ if is_main(arg, ...) then
     Log.configure({ level = Config.get(cfg, "Logging.Level", "INFO") })
 
     local s = cfg.Server or {}
+    local gc = s.GroupCommit or {}
     local srv = assert(Server.new({
         data_dir               = s.DataDir or "./data_server",
         host                   = s.Host or "0.0.0.0",
@@ -67,6 +68,11 @@ if is_main(arg, ...) then
         metrics_host =  "127.0.0.1",
         metrics_port = 9090,
         authenticator          = build_authenticator(cfg),
+        -- LingerMs is the JSON unit (Kafka-conventional); convert to seconds
+        -- at the boundary. Server.new accepts seconds so all internal math
+        -- stays in one unit (socket.gettime() is seconds).
+        group_commit_linger_s    = gc.LingerMs and gc.LingerMs / 1000 or nil,
+        group_commit_max_waiters = gc.MaxWaiters,
     }))
 
     log:info("env=%s host=%s port=%d data_dir=%s",
