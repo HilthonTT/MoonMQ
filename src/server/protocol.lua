@@ -174,6 +174,24 @@ function M.encode_error(correl_id, code, message)
     return encode_frame(M.OP_ERROR, correl_id, payload)
 end
 
+function M.encode_commit(correl_id, topic, partition, offset)
+    local payload = encode_string(topic) .. string.pack(">I4I8", partition, offset)
+    return encode_frame(M.OP_COMMIT, correl_id, payload)
+end
+
+function M.encode_create_topic(correl_id, name, num_partitions)
+    local payload = encode_string(name) .. string.pack(">I4", num_partitions)
+    return encode_frame(M.OP_CREATE_TOPIC, correl_id, payload)
+end
+
+function M.encode_list_topics(correl_id)
+    return encode_frame(M.OP_LIST_TOPICS, correl_id, "")
+end
+
+function M.encode_goodbye(correl_id)
+    return encode_frame(M.OP_GOODBYE, correl_id, "")
+end
+
 function M.encode_ping(correl_id) return encode_frame(M.OP_PING, correl_id, "") end
 function M.encode_pong(correl_id) return encode_frame(M.OP_PONG, correl_id, "") end
 function M.encode_ok(correl_id)   return encode_frame(M.OP_OK,   correl_id, "") end

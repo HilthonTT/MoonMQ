@@ -59,7 +59,7 @@ if is_main(arg, ...) then
     local srv = assert(Server.new({
         data_dir               = s.DataDir or "./data_server",
         host                   = s.Host or "0.0.0.0",
-        port                   = s.Port or 9092,
+        port                  = s.Port or 9092,
         max_connections        = s.MaxConnections,
         max_connections_per_ip = s.MaxConnectionsPerIP,
         max_frame              = s.MaxFrameSize,

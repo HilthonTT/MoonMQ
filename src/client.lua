@@ -7,14 +7,14 @@ local DEFAULT_TIMEOUT = 30
 local Client = {}
 Client.__index = Client
 
-function Client.new(opts)
+function Client.new(opts) 
     opts = opts or {}
     local host = opts.host or "127.0.0.1"
     local port = opts.port or 9092
 
     local sock, cerr = socket.connect(host, port)
     if not sock then
-        return nil, string.format("connect %s:%d", host, port, tostring(cerr))
+        return nil, string.format("connect %s:%d: %s", host, port, tostring(cerr))
     end
 
     local c = setmetatable({
@@ -150,5 +150,155 @@ function Client:_decode_record(payload)
         value     = value,
     }
 end
+
+function Client:produce(topic, key, value)
+    assert(type(topic) == "string", "topic must be a string")
+    assert(type(key) == "string", "key must be a string")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_produce(correl, topic, key, value))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+
+    if op == proto.OP_ERROR or not payload then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    local partition, offset = string.unpack(">I4I8", payload)
+    return { partition = partition, offset = offset }
+end
+
+function Client:fetch(topic, group, max_records)
+    max_records = max_records or 100
+    local correl = uuid.bytes()
+    local data = proto.encode_fetch(correl, topic, group, max_records)
+    local ok, err = self:_write(data)
+    if not ok then return nil end
+
+    local records = {}
+    while true do
+        local op, _, payload, rerr = self:_read_until(correl)
+        if not op then return nil, rerr end
+        if op == proto.OP_ERROR then
+            return nil, (proto.decode_error(payload) or { message = "?" }).message
+        end
+        if op == proto.OP_OK then return records end
+        if op == proto.OP_RECORD then
+            local r, derr = self:_decode_record(payload)
+            if not r then return nil, "decode record: " .. tostring(derr) end
+            records[#records + 1] = r
+        else
+            return nil, string.format("unexpected op 0x%02x during fetch", op)
+        end
+    end
+end
+
+function Client:subscribe(topic, group)
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_subscribe(correl, topic, group))
+    if not ok then return nil, err end
+ 
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_OK then
+        return nil, string.format("expected OK for subscribe, got 0x%02x", op)
+    end
+    return true
+end
+
+-- After subscribing, returns the next pushed record. Blocks until one
+-- arrives or `timeout` (seconds) elapses. Pass nil for no timeout.
+function Client:next_record(timeout)
+    local deadline = timeout and (socket.gettime() + timeout) or nil
+
+    -- Without the reactor, we poll the socket with short timeouts so we
+    -- can check the deadline. With the reactor, read_exact yields.
+    local original_timeout = self.timeout
+    if not self.reactor then
+        self.sock:settimeout(timeout and math.min(0.1, timeout) or 0.1)
+    end
+
+    local function restore()
+        if not self.reactor then self.sock:settimeout(original_timeout) end
+    end
+
+    while true do
+        if deadline and socket.gettime() > deadline then
+            restore()
+            return nil, "timeout"
+        end
+
+        local op, c, payload, err = self:_read_frame()
+        if not op then
+            if err == "timeout" then
+                -- Loop and re-check deadline
+            else
+                restore()
+                return nil, err
+            end
+        elseif op == proto.OP_HEARTBEAT_REQ then
+            self:_write(proto.encode_heartbeat_resp(c))
+        elseif op == proto.OP_RECORD and c == uuid.ZERO then
+            restore()
+            return self:_decode_record(payload)
+        end
+        -- Other frames ignored (heartbeat resps, etc.)
+    end
+end
+
+function Client:commit(topic, partition, offset)
+    local correl = uuid.bytes()
+    local data = proto.encode_commit(correl, topic, partition, offset)
+    local ok, err = self:_write(data)
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    return true
+end
+
+function Client:create_topic(name, num_partitions)
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_create_topic(correl, name, num_partitions))
+    if not ok then return nil, err end
+ 
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    return true
+end
+
+function Client:list_topics()
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_list_topics(correl))
+    if not ok then return nil, err end
+ 
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    return proto.decode_topic_list(payload)
+end
+
+function Client:close()
+    if self.closed then return end
+    self.closed = true
+    pcall(function()
+        self:_write(proto.encode_goodbye(uuid.bytes()))
+        self.sock:close()
+    end)
+end
+ 
 
 return Client
