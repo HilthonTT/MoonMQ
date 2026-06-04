@@ -12,8 +12,5 @@ local function is_main(_arg, ...)
 end
 
 if is_main(arg, ...) then
-    local client = Client.new("127.0.0.1", 9092)
-    client:send("hello world from client")
-    client:receive()
-    client:close()
+    local client = Client.new()
 end
