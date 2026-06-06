@@ -21,7 +21,18 @@ LogSegment.__index = LogSegment
 -- the file is opened with "a+b" and the seek dance interacts poorly with
 -- append semantics (writes always go to EOF, and a fresh a+b handle starts
 -- at position 0 rather than EOF — the old size() restored the wrong pos).
-function LogSegment.new(file, base_offset, start_time, bytes_written)
+--
+-- index_file (optional): handle to the segment's .timeindex sidecar. When
+-- nil, write_message skips indexing for this segment — handy for legacy
+-- callers/tests that don't care about time-based seek. Always non-nil on
+-- the SegmentedPartition path.
+--
+-- last_indexed_at: file position (within the segment) at which the most
+-- recent timeindex entry's message starts. nil means "no entry yet" — the
+-- next write is unconditionally indexed so every segment has at least one
+-- entry, which simplifies binary search.
+function LogSegment.new(file, base_offset, start_time, bytes_written,
+                        index_file, last_indexed_at)
     assert(type(base_offset) == "number", "base_offset must be a number")
     assert(type(start_time)  == "number", "start_time must be a number")
 
@@ -30,10 +41,12 @@ function LogSegment.new(file, base_offset, start_time, bytes_written)
     end
 
     return setmetatable({
-        file          = file,
-        base_offset   = base_offset,
-        start_time    = start_time,
-        bytes_written = bytes_written,
+        file            = file,
+        base_offset     = base_offset,
+        start_time      = start_time,
+        bytes_written   = bytes_written,
+        index_file      = index_file,
+        last_indexed_at = last_indexed_at,
     }, LogSegment)
 end
 
@@ -46,6 +59,10 @@ function LogSegment:close()
         self.file:close()
         self.file = nil
     end
+    if self.index_file then
+        self.index_file:close()
+        self.index_file = nil
+    end
 end
 
 function LogSegment:file_path(dir)
@@ -56,12 +73,27 @@ function LogSegment:meta_path(dir)
     return fs_m.join_path(dir, string.format("%020d.meta", self.base_offset))
 end
 
+function LogSegment:index_path(dir)
+    return fs_m.join_path(dir, string.format("%020d.timeindex", self.base_offset))
+end
+
 local SegmentedPartition = {}
 SegmentedPartition.__index = SegmentedPartition
 
 local DEFAULT_MAX_SEGMENT_SIZE = 1024 * 1024 * 1024  -- 1 GiB
 local DEFAULT_RETENTION        = 7 * 24 * time_m.HOUR
 local DEFAULT_CLEANER_INTERVAL = 1 * time_m.HOUR
+
+-- Sparse timestamp index: one (ts, file_pos) entry per this many bytes of
+-- log written. Smaller = faster time-based seek but more index bytes;
+-- larger = bigger linear-scan window in offset_for_timestamp. 4 KiB is
+-- the Kafka-tradition default for time index sparseness.
+local DEFAULT_INDEX_INTERVAL_BYTES = 4096
+
+-- Each entry: (timestamp:i8, file_pos_within_segment:i4) big-endian.
+-- file_pos is u32 so segments larger than 4 GiB would overflow — that's
+-- well past our 1 GiB default max_segment_size, but worth flagging.
+local INDEX_ENTRY_SIZE = 12
 
 -- Anchored Lua pattern (NOT a shell glob). fs_m.glob takes a Lua pattern.
 local LOG_FILE_PATTERN = "^%d+%.log$"
@@ -92,9 +124,10 @@ local function write_meta(meta_path, t)
 end
 
 -- opts (optional): per-topic config overrides
---   max_segment_size   bytes before rolling to a new segment (default 1 GiB)
---   retention          seconds to keep sealed segments       (default 7d)
---   cleaner_interval   seconds between retention sweeps      (default 1h)
+--   max_segment_size      bytes before rolling to a new segment (default 1 GiB)
+--   retention             seconds to keep sealed segments       (default 7d)
+--   cleaner_interval      seconds between retention sweeps      (default 1h)
+--   index_interval_bytes  bytes between timestamp-index entries (default 4 KiB)
 -- Unknown keys are ignored; nil/missing keys fall back to the defaults.
 -- Callers wanting per-topic tuning pass these via TopicManager:create_topic.
 function SegmentedPartition.new(topic, id, dir, opts)
@@ -113,15 +146,16 @@ function SegmentedPartition.new(topic, id, dir, opts)
     end
 
     local sp = setmetatable({
-        topic            = topic,
-        id               = id,
-        dir              = partition_dir,
-        max_segment_size = opts.max_segment_size or DEFAULT_MAX_SEGMENT_SIZE,
-        retention        = opts.retention        or DEFAULT_RETENTION,
-        cleaner_interval = opts.cleaner_interval or DEFAULT_CLEANER_INTERVAL,
-        segments         = {},
-        active_segment   = nil,
-        offset           = 0,   -- leader-end / next-write offset
+        topic                = topic,
+        id                   = id,
+        dir                  = partition_dir,
+        max_segment_size     = opts.max_segment_size     or DEFAULT_MAX_SEGMENT_SIZE,
+        retention            = opts.retention            or DEFAULT_RETENTION,
+        cleaner_interval     = opts.cleaner_interval     or DEFAULT_CLEANER_INTERVAL,
+        index_interval_bytes = opts.index_interval_bytes or DEFAULT_INDEX_INTERVAL_BYTES,
+        segments             = {},
+        active_segment       = nil,
+        offset               = 0,   -- leader-end / next-write offset
     }, SegmentedPartition)
 
     local lerr = sp:load_segments()
@@ -165,8 +199,20 @@ function SegmentedPartition:create_new_segment(base_offset)
         return string.format("failed to create segment file: %s", err)
     end
 
+    -- Time-index sidecar lives next to the .log. We open it "a+b" so
+    -- writes still append (POSIX append semantics) but seek/read works
+    -- for binary search in offset_for_timestamp later.
+    local index_path = fs_m.join_path(self.dir,
+        string.format("%020d.timeindex", base_offset))
+    local index_file, ierr = io.open(index_path, "a+b")
+    if not index_file then
+        -- Don't leak the .log handle if the .timeindex open failed.
+        pcall(function() file:close() end)
+        return string.format("failed to create timeindex file: %s", ierr)
+    end
+
     local now = socket.gettime()
-    local segment = LogSegment.new(file, base_offset, now, 0)
+    local segment = LogSegment.new(file, base_offset, now, 0, index_file, nil)
     table.insert(self.segments, segment)
     self.active_segment = segment
     self.offset = base_offset
@@ -279,8 +325,64 @@ function SegmentedPartition:load_segments()
             start_time = now
         end
 
+        -- Open (or create) the .timeindex sidecar. Missing file is
+        -- normal for segments that predate this feature; we just open
+        -- a fresh one — the segment will index from its next write.
+        --
+        -- If the segment was tail-truncated by verify_file, any index
+        -- entries pointing past post_verify_size are stale. Walk the
+        -- index from the end and ftruncate at the last entry whose
+        -- file_pos < post_verify_size. last_indexed_at is set to that
+        -- entry's file_pos so we don't double-index.
+        local index_path = fs_m.join_path(self.dir,
+            string.format("%020d.timeindex", base_offset))
+        local index_file, ierr = io.open(index_path, "a+b")
+        if not index_file then
+            pcall(function() file:close() end)
+            return string.format("failed to open timeindex %s: %s",
+                                 index_path, ierr)
+        end
+
+        local index_size = index_file:seek("end") or 0
+        local last_indexed_at = nil
+        if index_size > 0 then
+            local entry_count = math.floor(index_size / INDEX_ENTRY_SIZE)
+            local last_valid_entries = entry_count
+            -- Walk backwards to find the last entry whose file_pos is
+            -- still inside the post-verify log. Cheap — most loads
+            -- truncate zero entries.
+            while last_valid_entries > 0 do
+                local pos = (last_valid_entries - 1) * INDEX_ENTRY_SIZE
+                index_file:seek("set", pos)
+                local entry = index_file:read(INDEX_ENTRY_SIZE)
+                if not entry or #entry < INDEX_ENTRY_SIZE then
+                    last_valid_entries = last_valid_entries - 1
+                else
+                    local _, file_pos = string.unpack(">I8I4", entry)
+                    if file_pos < post_verify_size then
+                        last_indexed_at = file_pos
+                        break
+                    end
+                    last_valid_entries = last_valid_entries - 1
+                end
+            end
+
+            local truncate_to = last_valid_entries * INDEX_ENTRY_SIZE
+            if truncate_to < index_size then
+                local tok, terr = io_sync.truncate(index_file, truncate_to)
+                if not tok then
+                    pcall(function() file:close() end)
+                    pcall(function() index_file:close() end)
+                    return string.format(
+                        "failed to truncate stale timeindex %s: %s",
+                        index_path, terr)
+                end
+            end
+        end
+
         table.insert(self.segments,
-            LogSegment.new(file, base_offset, start_time, post_verify_size))
+            LogSegment.new(file, base_offset, start_time, post_verify_size,
+                           index_file, last_indexed_at))
     end
 
     -- Consume the clean-shutdown flag only now that recovery has fully
@@ -306,6 +408,38 @@ function SegmentedPartition:_write_checkpoint(value)
     return io_sync.atomic_rename(tmp, cp_path)
 end
 
+-- Internal: append a single (ts, file_pos) entry to the active segment's
+-- timeindex if either (a) this is the segment's first message or (b) we
+-- have written index_interval_bytes of log since the previous entry.
+--
+-- Errors are non-fatal — the index is advisory, and a transient write
+-- failure shouldn't fail the produce. We do log it so persistent index
+-- breakage is visible. Failed writes leave last_indexed_at unchanged, so
+-- the next call will try again.
+function SegmentedPartition:_maybe_index(segment, ts, file_pos)
+    if not segment.index_file then return end
+    if type(ts) ~= "number" then return end
+
+    local last = segment.last_indexed_at
+    if last ~= nil and (file_pos - last) < self.index_interval_bytes then
+        return
+    end
+
+    local entry = string.pack(">I8I4", ts, file_pos)
+    local ok, err = segment.index_file:write(entry)
+    if not ok then
+        log:warn("timeindex write segment=%020d: %s",
+            segment.base_offset, tostring(err))
+        return
+    end
+    -- Flush so a separate reader (recovery on next boot, or a
+    -- cross-process tail) sees the entry. Lua's userspace buffer
+    -- otherwise holds 12-byte writes for a long time. Sync waits for
+    -- the roll/close fsync; we don't pay that cost per entry.
+    segment.index_file:flush()
+    segment.last_indexed_at = file_pos
+end
+
 -- Internal: roll the active segment once it's full. Flushes + fsyncs the
 -- segment we're sealing, advances the on-disk checkpoint past it, and
 -- opens the next segment at the new base offset.
@@ -327,6 +461,21 @@ function SegmentedPartition:_roll_if_full(incoming_bytes)
     if not sok then
         return string.format("failed to fsync before roll: %s", serr)
     end
+
+    -- Flush + fsync the sealing segment's timeindex too. Without this,
+    -- a crash right after the roll could lose the last few index
+    -- entries for a now-sealed segment — recovery would still work
+    -- (offset_for_timestamp's linear-scan tail handles gaps) but a
+    -- larger linear-scan window per query is wasteful.
+    if self.active_segment.index_file then
+        self.active_segment.index_file:flush()
+        local iok, ierr = io_sync.sync(self.active_segment.index_file)
+        if not iok then
+            log:warn("timeindex fsync before roll segment=%020d: %s",
+                self.active_segment.base_offset, tostring(ierr))
+        end
+    end
+
     self:_write_checkpoint(new_base)
 
     local cerr = self:create_new_segment(new_base)
@@ -350,8 +499,11 @@ function SegmentedPartition:write_message(msg)
     local rerr = self:_roll_if_full(#bytes)
     if rerr then return nil, rerr end
 
-    local global_offset = self.active_segment.base_offset
-                        + self.active_segment.bytes_written
+    -- file_pos_in_segment = bytes_written BEFORE the append. This is
+    -- both the seek-target for read_message and the value we record in
+    -- the timeindex entry.
+    local file_pos_in_segment = self.active_segment.bytes_written
+    local global_offset = self.active_segment.base_offset + file_pos_in_segment
 
     local ok, werr = self.active_segment.file:write(bytes)
     if not ok then
@@ -361,6 +513,11 @@ function SegmentedPartition:write_message(msg)
 
     self.active_segment.bytes_written = self.active_segment.bytes_written + #bytes
     self.offset = self.offset + #bytes
+
+    -- Index this message if it crosses the interval (or is the segment's
+    -- first). Done after the log write so we never index a record that
+    -- failed to land on disk.
+    self:_maybe_index(self.active_segment, msg.timestamp, file_pos_in_segment)
 
     return global_offset, nil
 end
@@ -604,6 +761,94 @@ function SegmentedPartition:read_message(offset)
     return m, next_offset, nil
 end
 
+-- Internal helpers for offset_for_timestamp. Index files are short
+-- arrays of fixed-size entries — seek + read is fine even mid-append
+-- (POSIX a+b semantics: writes go to EOF, reads honour the seek).
+local function index_count(index_file)
+    local size = index_file:seek("end") or 0
+    return math.floor(size / INDEX_ENTRY_SIZE)
+end
+
+local function read_index_entry(index_file, idx)
+    index_file:seek("set", idx * INDEX_ENTRY_SIZE)
+    local b = index_file:read(INDEX_ENTRY_SIZE)
+    if not b or #b < INDEX_ENTRY_SIZE then return nil end
+    return string.unpack(">I8I4", b)  -- ts, file_pos
+end
+
+-- Binary-search for the greatest entry index whose timestamp <= target.
+-- Returns the entry's file_pos, or nil if no entry qualifies.
+local function index_floor_pos(index_file, n, target)
+    local lo, hi = 0, n - 1
+    local result_pos
+    while lo <= hi do
+        local mid = (lo + hi) // 2
+        local ts, pos = read_index_entry(index_file, mid)
+        if not ts then break end
+        if ts <= target then
+            result_pos = pos
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    return result_pos
+end
+
+-- offset_for_timestamp returns the global offset of the EARLIEST message
+-- whose timestamp is >= ts, mirroring Kafka's offsetForTimes semantics.
+-- Returns nil when the partition is empty or no message satisfies (i.e.
+-- ts is past every message's timestamp).
+--
+-- Strategy: the timeindex is sparse (one entry per index_interval_bytes),
+-- so we use it to pick a starting segment + file_pos, then linear-scan
+-- forward through records via read_message. The scan window is bounded
+-- by index_interval_bytes per query.
+function SegmentedPartition:offset_for_timestamp(ts)
+    assert(type(ts) == "number", "ts must be a number")
+    if #self.segments == 0 then return nil end
+
+    -- Pick the latest segment whose first index entry's ts is <= target.
+    -- That's the earliest segment that could still contain ts >= target
+    -- (later segments start later in time; earlier ones may overshoot but
+    -- the scan below catches that case). If no segment's first entry
+    -- qualifies, the target predates everything — start at the partition
+    -- head.
+    local start_seg     = self.segments[1]
+    local start_file_pos = 0
+    for i = #self.segments, 1, -1 do
+        local s = self.segments[i]
+        if s.index_file then
+            local n = index_count(s.index_file)
+            if n > 0 then
+                local first_ts = read_index_entry(s.index_file, 0)
+                if first_ts and first_ts <= ts then
+                    start_seg = s
+                    start_file_pos = index_floor_pos(s.index_file, n, ts) or 0
+                    break
+                end
+            end
+        end
+    end
+
+    -- Linear scan forward, crossing segment boundaries naturally via
+    -- read_message + _segment_for_offset.
+    local global = start_seg.base_offset + start_file_pos
+    while global < self.offset do
+        local m, next_offset, rerr = self:read_message(global)
+        if not m then
+            -- Mid-record tear or CRC failure — treat as no answer rather
+            -- than guessing past corruption.
+            return nil
+        end
+        if m.timestamp >= ts then
+            return global
+        end
+        global = next_offset
+    end
+    return nil
+end
+
 -- clean_old_segments removes segments whose start_time is older than the
 -- retention window. The active segment is never removed; the single newest
 -- "old" segment is also kept so consumers retain some historical data.
@@ -634,14 +879,16 @@ function SegmentedPartition:clean_old_segments()
         if keep then
             table.insert(kept, segment)
         else
-            local path = segment:file_path(self.dir)
-            local meta = segment:meta_path(self.dir)
+            local path  = segment:file_path(self.dir)
+            local meta  = segment:meta_path(self.dir)
+            local index = segment:index_path(self.dir)
             log:info("removing old segment %s (created at %s)",
                 path, os.date("!%Y-%m-%dT%H:%M:%SZ",
                               math.floor(segment.start_time)))
             segment:close()
             os.remove(path)
             os.remove(meta)
+            os.remove(index)
         end
     end
 
@@ -654,6 +901,15 @@ function SegmentedPartition:close()
     if self.active_segment then
         self.active_segment.file:flush()
         io_sync.sync(self.active_segment.file)
+
+        -- Flush + fsync the timeindex too. A clean shutdown promises
+        -- recovery doesn't re-verify sealed segments — same promise
+        -- has to extend to the index, otherwise the next boot reopens
+        -- with stale tail entries and lookups skew.
+        if self.active_segment.index_file then
+            self.active_segment.index_file:flush()
+            io_sync.sync(self.active_segment.index_file)
+        end
 
         local leo = self.active_segment.base_offset
                   + self.active_segment.bytes_written

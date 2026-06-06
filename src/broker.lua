@@ -1,5 +1,6 @@
 local fs_m       = require("src.fs")
 local tpm_m      = require("src.topic_manager")
+local topic_config = require("src.topic_config")
 local util_m     = require("src.util")
 
 local Broker = {}
@@ -70,11 +71,22 @@ function Broker:load_topics()
                         end
                     end
 
+                    -- Restore per-topic config from the sidecar. Missing
+                    -- file is normal for topics created before this
+                    -- feature; load() returns {} which means "use
+                    -- defaults" (status quo). Malformed file is loud —
+                    -- we'd rather fail loudly than silently quote-unquote-fix.
+                    local opts, oerr = topic_config.load(topic_dir)
+                    if not opts then
+                        return string.format(
+                            "failed to load topic %s config: %s", name, oerr)
+                    end
+
                     -- SegmentedPartition.new performs its own crash recovery
                     -- (verify_file with checkpoint/clean-shutdown protocol)
                     -- when it opens the partition dir, so the broker doesn't
                     -- need a separate recovery pass here.
-                    local _, cErr = self.topic_manager:create_topic(name, max_id)
+                    local _, cErr = self.topic_manager:create_topic(name, max_id, opts)
                     if cErr then
                         return string.format("failed to load topic %s: %s", name, cErr)
                     end

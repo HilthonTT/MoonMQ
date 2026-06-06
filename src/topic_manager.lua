@@ -1,6 +1,7 @@
 local fs_m        = require("src.fs")
 local Topic     = require("src.topic")
 local SegmentedPartition = require("src.segmentation").SegmentedPartition
+local topic_config = require("src.topic_config")
 local utl_m      = require("src.util")
 
 local TopicManager = {}
@@ -36,6 +37,20 @@ function TopicManager:create_topic(name, numPartitions, opts)
     local topicDir = fs_m.join_path(self.baseDir, name)
     local ok, err  = fs_m.mkdir(topicDir)
     if not ok then return nil, err end
+
+    -- Persist per-topic opts so Broker:load_topics can restore them on
+    -- restart. Done before opening any partitions so a sidecar failure
+    -- needs no partition cleanup. Only write when at least one known
+    -- key is set — that way a load-rebuild call (which passes whatever
+    -- the sidecar held, including `{}` for predates-this-feature
+    -- topics) doesn't add a spurious sidecar.
+    if opts and next(opts) ~= nil then
+        local sok, serr = topic_config.save(topicDir, opts)
+        if not sok then
+            return nil, string.format(
+                "failed to persist topic config: %s", serr)
+        end
+    end
 
     local topic = Topic.new(name)
 
