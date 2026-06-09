@@ -84,7 +84,6 @@ function Connection.new(server, sock, peer, ip)
         subscriber_co = nil,
 
         -- Application state (populated as handshake progresses)
-        authed = false,
         username = nil,
         client_name = nil,
         client_version = nil,

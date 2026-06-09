@@ -102,6 +102,12 @@ local function parse_hash(stored)
     if not iterations or iterations < 1 then
         return nil, "invalid iterations"
     end
+    -- Sanity cap. Stored hashes are server-controlled so this isn't a
+    -- DoS vector in practice, but a corrupted/typo'd config shouldn't
+    -- be able to wedge auth in a 2^31-iter PBKDF2 loop.
+    if iterations > 1000000 then
+        return nil, "iterations exceeds maximum (1000000)"
+    end
 
     local ok_s, salt = pcall(sha2.hex_to_bin, salt_hex)
     if not ok_s then return nil, "invalid salt hex" end

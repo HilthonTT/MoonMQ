@@ -117,11 +117,10 @@ function ConsumerGroup:join(member_id, topics)
                 return nil, string.format("failed to get topic %s: %s", topic_name, err)
             end
 
-            -- Partition ids are 0-based to match the Go version.
-            -- If your Lua broker uses 1-based partition ids, change this to `i`.
+            -- Broker partition ids are 1-based (see topic_manager:create_topic).
             local partitions = {}
             for i = 1, #topic.partitions do
-                partitions[i] = i - 1
+                partitions[i] = i
             end
             self.topics[topic_name] = partitions
         end

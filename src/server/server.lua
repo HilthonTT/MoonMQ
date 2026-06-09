@@ -237,7 +237,6 @@ function Server:_handle_auth(conn, correl, payload)
 
     if not self.authenticator then
         log:warn("no authenticator configured, allowing")
-        conn.authed   = true
         conn.username = a.username
         conn:transition_to(Connection.STATE_AUTHENTICATED)
         conn:send(proto.encode_auth_ok(correl))
@@ -252,7 +251,6 @@ function Server:_handle_auth(conn, correl, payload)
         return
     end
 
-    conn.authed   = true
     conn.username = a.username
     conn:transition_to(Connection.STATE_AUTHENTICATED)
     conn:send(proto.encode_auth_ok(correl))
