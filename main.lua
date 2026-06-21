@@ -52,21 +52,32 @@ if is_main(arg, ...) then
         os.exit(1)
     end
 
-    Log.configure({ level = Config.get(cfg, "Logging.Level", "INFO") })
+    -- Empty string from JSON means "no file" (cleaner than nil/missing
+    -- key distinction); Logger.configure interprets that as stderr-only.
+    local log_file = Config.get(cfg, "Logging.File", "")
+    if log_file == "" then log_file = nil end
+    Log.configure({
+        level         = Config.get(cfg, "Logging.Level", "INFO"),
+        file_path     = log_file,
+        log_to_stderr = Config.get(cfg, "Logging.LogToStderr", true),
+    })
 
     local s = cfg.Server or {}
     local gc = s.GroupCommit or {}
     local srv = assert(Server.new({
         data_dir               = s.DataDir or "./data_server",
         host                   = s.Host or "0.0.0.0",
-        port                  = s.Port or 9092,
+        port                   = s.Port or 9092,
         max_connections        = s.MaxConnections,
         max_connections_per_ip = s.MaxConnectionsPerIP,
         max_frame              = s.MaxFrameSize,
         idle_deadline          = s.IdleDeadline,
+        pre_auth_read_deadline = s.PreAuthReadDeadline,
         handshake_deadline     = s.HandshakeDeadline,
-        metrics_host =  "127.0.0.1",
-        metrics_port = 9090,
+        max_topics             = s.MaxTopics,
+        max_list_topics        = s.MaxListTopics,
+        metrics_host           = s.MetricsHost or "127.0.0.1",
+        metrics_port           = s.MetricsPort or 9090,
         authenticator          = build_authenticator(cfg),
         -- LingerMs is the JSON unit (Kafka-conventional); convert to seconds
         -- at the boundary. Server.new accepts seconds so all internal math

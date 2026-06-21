@@ -7,6 +7,19 @@ local socket = require("socket")
 local io_sync = require("src.io_sync")
 local verify_file = require("src.segment_verify")
 local log = require("src.log.logger").get("segmentation")
+-- Metrics. Loaded lazily-tolerant: if the server metrics module isn't on
+-- the path (e.g. unit tests run segmentation in isolation), fall back to
+-- a no-op shim so the production path stays instrumented without
+-- forcing test scaffolds to mock anything out.
+local ok_m, metrics = pcall(require, "src.server.metrics")
+if not ok_m then
+    metrics = {
+        inc     = function() end,
+        set     = function() end,
+        observe = function() end,
+        timer   = function() return function() end end,
+    }
+end
 
 -- Optional: luafilesystem for accurate per-segment mtime fallback. Without
 -- it, segments fall back to their .meta sidecar or (last resort) "now".
@@ -482,6 +495,12 @@ function SegmentedPartition:_roll_if_full(incoming_bytes)
     if cerr then
         return string.format("failed to roll segment: %s", cerr)
     end
+
+    -- Counter: one increment per successful roll. Labels by topic so
+    -- a hot topic's roll rate is observable independent of others.
+    metrics.inc("moonmq_segment_rolls_total", 1,
+        { topic = self.topic.name })
+
     return nil
 end
 
@@ -519,6 +538,13 @@ function SegmentedPartition:write_message(msg)
     -- failed to land on disk.
     self:_maybe_index(self.active_segment, msg.timestamp, file_pos_in_segment)
 
+    -- log_bytes gauge: total bytes on disk across all segments. Cheap
+    -- to maintain incrementally; the alternative is a full segments
+    -- walk per scrape. Cardinality: bounded by max_topics * partitions.
+    metrics.set("moonmq_partition_log_bytes", self.offset,
+        { topic = self.topic.name,
+          partition = tostring(self.id) })
+
     return global_offset, nil
 end
 
@@ -546,7 +572,14 @@ function SegmentedPartition:sync()
     if not self.active_segment or not self.active_segment.file then
         return false, "no active segment"
     end
-    return io_sync.sync(self.active_segment.file)
+    -- Histogram so operators can see fsync tail-latency per topic.
+    -- p99 fsync time is the single most useful signal for "is the
+    -- disk slow / am I hitting fsync contention" diagnosis.
+    local stop = metrics.timer("moonmq_fsync_duration_seconds",
+        { topic = self.topic.name })
+    local ok, err = io_sync.sync(self.active_segment.file)
+    stop()
+    return ok, err
 end
 
 -- ---------------------------------------------------------------------------
@@ -686,14 +719,43 @@ function SegmentedPartition:request_sync()
 end
 
 -- Locate the segment that owns `offset` (base_offset <= offset < base_offset
--- + bytes_written). Linear scan — partitions are expected to have few
--- segments, and this avoids the bookkeeping cost of a binary search index
--- that would need maintaining on roll/clean.
+-- + bytes_written).
+--
+-- Fast path: a one-slot memo (`_last_seg`) covers the sequential-read
+-- hot path — consumers walking a partition step through offsets in one
+-- segment until they cross the boundary, so the same segment satisfies
+-- many calls in a row.
+--
+-- Slow path: binary search on `self.segments`. The list is implicitly
+-- sorted by `base_offset` (append-only — new segments come in via
+-- create_new_segment which always extends, and clean_old_segments
+-- preserves order). For partitions with thousands of segments this
+-- beats the previous linear scan; for small partitions it costs ~1
+-- extra comparison.
+--
+-- The memo is invalidated whenever `self.segments` shrinks (clean) —
+-- additions don't invalidate because a memoized hit on an older
+-- segment is still correct.
 function SegmentedPartition:_segment_for_offset(offset)
-    for i = 1, #self.segments do
-        local s = self.segments[i]
-        if offset >= s.base_offset
-           and offset < s.base_offset + s.bytes_written then
+    local memo = self._last_seg
+    if memo
+       and offset >= memo.base_offset
+       and offset < memo.base_offset + memo.bytes_written
+    then
+        return memo
+    end
+
+    local segs = self.segments
+    local lo, hi = 1, #segs
+    while lo <= hi do
+        local mid = (lo + hi) // 2
+        local s = segs[mid]
+        if offset < s.base_offset then
+            hi = mid - 1
+        elseif offset >= s.base_offset + s.bytes_written then
+            lo = mid + 1
+        else
+            self._last_seg = s
             return s
         end
     end
@@ -889,6 +951,11 @@ function SegmentedPartition:clean_old_segments()
             os.remove(path)
             os.remove(meta)
             os.remove(index)
+            -- Drop the segment-lookup memo if it pointed at this
+            -- segment; otherwise next call would return a closed file.
+            if self._last_seg == segment then
+                self._last_seg = nil
+            end
         end
     end
 

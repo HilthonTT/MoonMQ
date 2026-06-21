@@ -76,14 +76,25 @@ Stop it with Ctrl+C (SIGINT) for a clean shutdown.
 
 ### Configuration
 
-`appsettings.json` has two sections:
+`appsettings.json` is structured into sections:
 
-- **`Server`** — `Host`, `Port` (default `9092`), `DataDir`, `MaxConnections`,
-  `MaxConnectionsPerIP`, `MaxFrameSize`, `IdleDeadline`, `HandshakeDeadline`.
+- **`Server`** — `Host`, `Port` (default `9092`), `DataDir`,
+  `MaxConnections`, `MaxConnectionsPerIP`, `MaxFrameSize`, `MaxTopics`
+  (broker-wide cap, default `1024`), `MaxListTopics` (cap on
+  `LIST_TOPICS` response), `IdleDeadline` (per-frame timeout once
+  authenticated, default `60`), `PreAuthReadDeadline` (per-frame
+  timeout before AUTH completes, default `5`), `HandshakeDeadline`
+  (overall handshake budget, default `5`), `MetricsHost`,
+  `MetricsPort` (set to `null` to disable the metrics HTTP server).
 - **`Auth`** — `Username`, plus either `PasswordHash` (a
   `pbkdf2-sha256$<iter>$<salt_hex>$<hash_hex>` string) or a plaintext
   `Password`. `MaxFailures`, `FailureWindow`, and `BanDuration` control
-  per-IP lockout after repeated failures.
+  per-IP lockout after repeated failures. Password hashes default to
+  600 000 PBKDF2 iterations (NIST 2024 guidance); existing stored
+  hashes keep their original iteration count.
+- **`Logging`** — `Level` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `File`
+  (path; empty string = stderr only), `LogToStderr` (boolean; default
+  true even when `File` is set, so logs go to both).
 
 If `Auth` has no usable credential, the server starts **open** (no
 authentication) and logs a warning.
@@ -111,6 +122,101 @@ Some modules under `src/` depend on libraries that may not be present:
 - **`src/snappy.lua`** needs LuaJIT's FFI and `libsnappy` (Snappy support).
 - **`src/replica.lua`** loads on stock Lua, but real replication needs a peer
   broker exposing an HTTP `/replicate` endpoint.
+
+### Logging to a file
+
+Set `Logging.File` to an absolute path; the server appends to it with
+line-buffered I/O so a crash loses at most one partial line. There is no
+built-in rotation — pair with `logrotate(8)` using `copytruncate` (the
+broker holds the FD open; logrotate copies and zero-truncates):
+
+```
+/var/log/moonmq.log {
+    daily
+    rotate 14
+    compress
+    copytruncate
+    missingok
+}
+```
+
+If the file path can't be opened the broker logs a one-time WARN and
+falls back to stderr-only. `LogToStderr=true` (the default) tees stderr
+even when a file is configured, which is what you want under systemd
+(stderr goes to the journal).
+
+### Observability
+
+The broker exposes two HTTP endpoints on `MetricsHost:MetricsPort`
+(default `127.0.0.1:9090`):
+
+- `GET /metrics` — Prometheus exposition format. Counters and gauges:
+
+  | Metric                                 | Type      | Labels                |
+  | -------------------------------------- | --------- | --------------------- |
+  | `moonmq_connections_open`              | gauge     | —                     |
+  | `moonmq_connections_accepted_total`    | counter   | —                     |
+  | `moonmq_connections_closed_total`      | counter   | `reason`              |
+  | `moonmq_bytes_sent_total`              | counter   | —                     |
+  | `moonmq_frames_sent_total`             | counter   | —                     |
+  | `moonmq_frames_received_total`         | counter   | `op`                  |
+  | `moonmq_send_duration_seconds`         | histogram | —                     |
+  | `moonmq_dispatch_duration_seconds`     | histogram | `op`                  |
+  | `moonmq_produce_records_total`         | counter   | `topic`               |
+  | `moonmq_idempotent_produce_total`      | counter   | `topic`               |
+  | `moonmq_fetch_records_total`           | counter   | `topic`               |
+  | `moonmq_segment_rolls_total`           | counter   | `topic`               |
+  | `moonmq_fsync_duration_seconds`        | histogram | `topic`               |
+  | `moonmq_topic_count`                   | gauge     | —                     |
+  | `moonmq_partition_log_bytes`           | gauge     | `topic`, `partition`  |
+
+  `moonmq_partition_log_bytes` is per-partition — at the default
+  `MaxTopics=1024` with a typical partition count this stays a few
+  thousand series, which is fine for Prometheus. Lift `MaxTopics`
+  cautiously.
+
+- `GET /stats` — JSON broker snapshot. Human-readable, bounded:
+  summarises broker version, open connection count, topic count, and
+  the top 10 topics by bytes-on-disk. Truncates the topic list at
+  `MaxListTopics`. Intended for `curl | jq` operator inspection, not
+  for monitoring agents — use `/metrics` for that.
+
+The metrics server is unauthenticated; bind it to `127.0.0.1` or
+firewall the port unless your network is trusted.
+
+### Idempotent producer
+
+MoonMQ supports a session-scoped idempotent producer: the broker
+assigns a producer ID (PID) on demand, and dedupes retries of the same
+`(PID, topic, seq)` by replaying the original `(partition, offset)`
+instead of appending a duplicate. PIDs are not durable across the
+broker process or the client's socket — see
+[`docs/transactions.md`](docs/transactions.md) for the full deferred
+Kafka-style transaction design.
+
+```lua
+local Client = require("src.client")
+
+local c = assert(Client.new{
+    host       = "127.0.0.1",
+    port       = 9092,
+    username   = "admin",
+    password   = "admin",
+    idempotent = true,        -- triggers INIT_PRODUCER_ID after AUTH
+})
+
+local ack = assert(c:produce("orders", "key-1", "payload"))
+-- ack = { partition, offset, seq }
+
+-- A retry with the same seq returns the ORIGINAL offset; no duplicate.
+local replay = assert(c:produce_at_seq("orders", "key-1", "payload", ack.seq))
+assert(replay.offset == ack.offset)
+```
+
+Out-of-order or skipped sequences are rejected with
+`ERR_OUT_OF_ORDER_SEQUENCE` (code `11`), letting the client detect lost
+records. `ERR_NO_PRODUCER_ID` (code `10`) fires if the client sends
+`PRODUCE_IDEMPOTENT` without first calling `INIT_PRODUCER_ID`.
 
 ## Wire protocol
 
@@ -142,8 +248,11 @@ Opcodes are split into client requests (`0x01`–`0x7F`) and server replies
 | `CREATE_TOPIC`               | client → server | Create a partitioned topic               |
 | `LIST_TOPICS`                | client → server | List existing topics                     |
 | `PING`/`GOODBYE`             | client → server | Liveness / clean disconnect              |
+| `INIT_PRODUCER_ID`           | client → server | Request a u64 PID for idempotent produce |
+| `PRODUCE_IDEMPOTENT`         | client → server | Idempotent append: `(PID, seq, ...)`     |
 | `WELCOME` / `AUTH_OK`        | server → client | Handshake / auth acceptance              |
 | `PRODUCE_ACK`                | server → client | Partition + offset of an appended record |
+| `PRODUCER_ID`                | server → client | Assigned u64 PID                         |
 | `RECORD`                     | server → client | A delivered record (fetch or push)       |
 | `TOPIC_LIST` / `PONG` / `OK` | server → client | Query results / acks                     |
 | `ERROR`                      | server → client | Numeric error code + message             |
@@ -197,7 +306,7 @@ Current coverage:
 | `buffer_spec.lua`        | `src/buffer.lua` — accumulating byte buffer        |
 | `crc32_spec.lua`         | `src/crc32.lua` — IEEE 802.3 CRC-32                |
 | `future_spec.lua`        | `src/future.lua` — one-shot coroutine future       |
-| `message_spec.lua`       | `src/message.lua` — message wire format + pool     |
+| `message_spec.lua`       | `src/message.lua` — message wire format            |
 | `partition_spec.lua`     | `src/partition.lua` — append, read, recovery       |
 | `time_spec.lua`          | `src/time.lua` — duration constants                |
 | `topic_manager_spec.lua` | `src/topic_manager.lua` — topic/partition creation |

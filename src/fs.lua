@@ -88,13 +88,21 @@ local function read_dir(dir)
         return nil, "failed to open pipe for read_dir"
     end
 
+    -- pcall so that an iterator error (child process death mid-read,
+    -- pipe broken, etc.) doesn't leak the pipe handle. We always close
+    -- the pipe, then re-surface any iterator error to the caller.
     local entries = {}
-    for name in pipe:lines() do
-        if name ~= "." and name ~= ".." then
-            entries[#entries + 1] = name
+    local ok, iter_err = pcall(function()
+        for name in pipe:lines() do
+            if name ~= "." and name ~= ".." then
+                entries[#entries + 1] = name
+            end
         end
-    end
+    end)
     pipe:close()
+    if not ok then
+        return nil, string.format("read_dir iterator failed: %s", tostring(iter_err))
+    end
     return entries, nil
 end
 

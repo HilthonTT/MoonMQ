@@ -43,6 +43,7 @@ Connection.REASON_CLIENT_GOODBYE = "client_goodbye"
 Connection.REASON_PEER_CLOSED = "peer_closed"
 Connection.REASON_READ_ERROR = "read_error"
 Connection.REASON_WRITE_DEADLINE = "write_deadline_exceeded"
+Connection.REASON_READ_DEADLINE_EXCEEDED = "read_deadline_exceeded"
 Connection.REASON_HANDSHAKE_TIMEOUT = "handshake_timeout"
 Connection.REASON_HEARTBEAT_TIMEOUT = "heartbeat_timeout"
 Connection.REASON_AUTH_FAILED = "auth_failed"
@@ -92,6 +93,17 @@ function Connection.new(server, sock, peer, ip)
         mode = nil,  -- "push" (SUBSCRIBE) | "pull" (FETCH)
         rate_limiter = server.rate_limiter_factory
                           and server.rate_limiter_factory() or nil,
+        -- Idempotent producer state. pid is set once via INIT_PRODUCER_ID
+        -- and lives for the connection's lifetime — there's no PID
+        -- persistence so reconnecting requires a fresh INIT_PRODUCER_ID.
+        -- seq_state maps topic_name → { last_seq, last_offset, last_partition }
+        -- letting the broker dedup retries of the same (PID, topic, seq)
+        -- tuple. Per-topic (not per-partition) because TCP's in-order
+        -- delivery makes a single monotonic counter per topic both
+        -- consistent AND lets the client get away with not knowing the
+        -- broker's partition count or hash function.
+        pid = nil,
+        seq_state = {},
 
         -- Telemetry
         started_at = socket.gettime(),
@@ -287,8 +299,22 @@ end
 function Connection:run_reader()
     self.reader_co = coroutine.running()
     while self.state ~= Connection.STATE_CLOSED do
+        -- Per-frame read deadline. Without this a slowloris peer can
+        -- send 4 bytes of length prefix and then dribble payload bytes
+        -- for the full heartbeat interval (default 90s) per connection,
+        -- multiplied by max_connections_per_ip. The deadline tightens
+        -- before AUTH (pre-auth peers should complete the handshake
+        -- fast; this also caps the cost of the handshake watchdog
+        -- gathering enough rope to fire) and relaxes once authenticated.
+        local deadline
+        if self.state == Connection.STATE_AUTHENTICATED then
+            deadline = socket.gettime() + self.server.idle_deadline
+        else
+            deadline = socket.gettime() + self.server.pre_auth_read_deadline
+        end
+
         local body, ferr = framer.read_frame(
-            self.server.reactor, self.sock, self.server.max_frame, nil)
+            self.server.reactor, self.sock, self.server.max_frame, deadline)
 
         if not body then
             if ferr and ferr:find("exceeds max", 1, true) then
@@ -296,6 +322,9 @@ function Connection:run_reader()
                     proto.ERR_FRAME_TOO_LARGE, ferr)
             elseif ferr == "closed" then
                 self:close(Connection.REASON_PEER_CLOSED)
+            elseif ferr and ferr:find("deadline", 1, true) then
+                self:close(Connection.REASON_READ_DEADLINE_EXCEEDED,
+                    proto.ERR_INTERNAL, ferr)
             else
                 self:close(Connection.REASON_READ_ERROR)
             end

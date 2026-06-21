@@ -29,6 +29,13 @@ function Consumer.new(broker, group_id)
         broker      = broker,
         group_id    = group_id,
         offsets     = {}, -- topic_name -> partition_id -> offset
+        -- Topic-ref cache. Populated at subscribe time; consulted in
+        -- poll() instead of going through broker:get_topic on every
+        -- iteration. The broker's topic table doesn't move references
+        -- around (topics are not re-created in place), so the cached
+        -- ref stays valid for the consumer's lifetime — when a topic
+        -- is dropped (not currently supported) we'd invalidate here.
+        topics      = {},
         auto_commit = true,
     }, Consumer)
 end
@@ -44,6 +51,7 @@ function Consumer:subscribe(topic_name)
     local topic, err = self.broker:get_topic(topic_name)
     if not topic then return nil, err end
 
+    self.topics[topic_name] = topic
     if not self.offsets[topic_name] then
         self.offsets[topic_name] = {}
     end
@@ -75,9 +83,18 @@ function Consumer:poll()
     local records = {}
 
     for topic_name, partition_offsets in pairs(self.offsets) do
-        local topic, err = self.broker:get_topic(topic_name)
+        -- Use the cached topic ref from subscribe(); fall back to
+        -- broker:get_topic only if it's missing (defensive — should
+        -- only happen if offsets[] is populated without going through
+        -- subscribe(), which the public API doesn't allow).
+        local topic = self.topics[topic_name]
         if not topic then
-            return nil, string.format("failed to get topic: %s", err)
+            local t, err = self.broker:get_topic(topic_name)
+            if not t then
+                return nil, string.format("failed to get topic: %s", err)
+            end
+            topic = t
+            self.topics[topic_name] = t
         end
 
         for partition_id, offset in pairs(partition_offsets) do

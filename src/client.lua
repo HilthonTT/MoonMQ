@@ -25,6 +25,15 @@ function Client.new(opts)
         port = port,
         closed = false,
         push_handler = nil,
+        -- Idempotent producer state. pid is assigned by the broker via
+        -- INIT_PRODUCER_ID if opts.idempotent is true; once set, every
+        -- subsequent :produce() routes through OP_PRODUCE_IDEMPOTENT
+        -- and carries the next per-topic sequence number. Retries of
+        -- the same (topic, seq) get the original (partition, offset)
+        -- back from the broker — at-most-once delivery without
+        -- application-level dedup.
+        pid = nil,
+        next_seq = {},  -- topic -> next u32 seq to send
     }, Client)
 
     if not c.reactor then
@@ -61,7 +70,7 @@ function Client.new(opts)
         ok, err = c:_write(proto.encode_auth(acorrel,
             opts.username, opts.password or ""))
         if not ok then c:close(); return nil, "send auth: " .. err end
- 
+
         op, _, payload, rerr = c:_read_until(acorrel)
         if not op then c:close(); return nil, "read auth_ok: " .. rerr end
         if op == proto.OP_ERROR then
@@ -73,6 +82,34 @@ function Client.new(opts)
             c:close()
             return nil, string.format("expected AUTH_OK, got 0x%02x", op)
         end
+    end
+
+    -- Idempotent producer init (optional). On reconnect the caller must
+    -- pass idempotent=true again — PIDs are not durable across the
+    -- broker process or this socket. See docs/transactions.md for the
+    -- coordinator-backed design that would make PIDs survivable.
+    if opts.idempotent then
+        local icorrel = uuid.bytes()
+        ok, err = c:_write(proto.encode_init_producer_id(icorrel))
+        if not ok then c:close(); return nil, "send init_producer_id: " .. err end
+
+        op, _, payload, rerr = c:_read_until(icorrel)
+        if not op then c:close(); return nil, "read producer_id: " .. rerr end
+        if op == proto.OP_ERROR then
+            local e = proto.decode_error(payload)
+            c:close()
+            return nil, "init_producer_id: " .. (e and e.message or "?")
+        end
+        if op ~= proto.OP_PRODUCER_ID then
+            c:close()
+            return nil, string.format("expected PRODUCER_ID, got 0x%02x", op)
+        end
+        local pinfo, perr = proto.decode_producer_id(payload)
+        if not pinfo then
+            c:close()
+            return nil, "decode producer_id: " .. perr
+        end
+        c.pid = pinfo.pid
     end
 
     return c
@@ -156,7 +193,24 @@ function Client:produce(topic, key, value)
     assert(type(key) == "string", "key must be a string")
 
     local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_produce(correl, topic, key, value))
+    local frame
+    local seq_used
+
+    if self.pid then
+        -- Idempotent path: include PID + per-topic monotonic sequence.
+        -- The broker memoizes (PID, topic, seq) → (partition, offset),
+        -- so a retry with the same seq returns the original ack
+        -- without re-appending. On error we DON'T bump next_seq —
+        -- the caller can retry with the same seq for at-most-once
+        -- delivery. On success we commit the bump.
+        seq_used = self.next_seq[topic] or 0
+        frame = proto.encode_produce_idempotent(
+            correl, self.pid, seq_used, topic, key, value)
+    else
+        frame = proto.encode_produce(correl, topic, key, value)
+    end
+
+    local ok, err = self:_write(frame)
     if not ok then return nil, err end
 
     local op, _, payload, rerr = self:_read_until(correl)
@@ -166,7 +220,34 @@ function Client:produce(topic, key, value)
         return nil, (proto.decode_error(payload) or { message = "?" }).message
     end
     local partition, offset = string.unpack(">I4I8", payload)
-    return { partition = partition, offset = offset }
+    if seq_used ~= nil then
+        -- Only advance after a confirmed success; failures leave the
+        -- seq slot unused so a retry replays the same sequence number.
+        self.next_seq[topic] = seq_used + 1
+    end
+    return { partition = partition, offset = offset, seq = seq_used }
+end
+
+-- Inject a duplicate (PID, topic, seq) into the next produce — testing
+-- helper that bypasses the next_seq counter, used by the example below
+-- to demonstrate broker-side dedup.
+function Client:produce_at_seq(topic, key, value, seq)
+    assert(self.pid, "produce_at_seq requires an idempotent client")
+    assert(type(seq) == "number" and seq >= 0, "seq must be a non-negative number")
+
+    local correl = uuid.bytes()
+    local frame = proto.encode_produce_idempotent(
+        correl, self.pid, seq, topic, key, value)
+    local ok, err = self:_write(frame)
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR or not payload then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    local partition, offset = string.unpack(">I4I8", payload)
+    return { partition = partition, offset = offset, seq = seq }
 end
 
 function Client:fetch(topic, group, max_records)

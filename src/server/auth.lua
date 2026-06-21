@@ -10,7 +10,11 @@ local log    = require("src.log.logger").get("auth")
 
 local M = {}
 
-local DEFAULT_PBKDF2_ITERATIONS = 10000
+-- NIST SP 800-132 / OWASP 2024 guidance for PBKDF2-HMAC-SHA256.
+-- 10000 (the previous default) is brute-forceable on commodity GPUs in
+-- 2026. New hashes use 600k; existing stored hashes encode their own
+-- iteration count so this only affects hash_password() callers.
+local DEFAULT_PBKDF2_ITERATIONS = 600000
 local DEFAULT_SALT_BYTES        = 16
 local DEFAULT_HASH_BYTES        = 32
 

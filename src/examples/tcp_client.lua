@@ -78,6 +78,58 @@ local cok, cerr2 = client:commit(topic, ack.partition, ack.offset + 1)
 if not cok then die("commit: %s", cerr2) end
 print("  ok.")
 
--- 6. Clean shutdown — sends GOODBYE and closes the socket.
+-- 6. Idempotent producer demo. Opens a SECOND connection with
+--    idempotent=true; the broker assigns a PID and tracks per-(PID,
+--    topic) sequences. We then deliberately resend the same (seq) and
+--    expect the broker to return the ORIGINAL (partition, offset)
+--    rather than re-appending — proving session-scoped dedup.
+print("opening idempotent producer ...")
+local iclient, ierr = Client.new{
+    host           = host,
+    port           = port,
+    client_name    = "tcp_client_example_idempotent",
+    client_version = "0.1.0",
+    username       = username,
+    password       = password,
+    idempotent     = true,
+}
+if not iclient then die("idempotent client: %s", ierr) end
+print(string.format("  assigned producer_id=%d", iclient.pid))
+
+local itopic = topic
+local ikey   = "idem-key"
+local ivalue = string.format("idempotent at %d", os.time())
+
+print(string.format("produce(%q, %q, %q) [seq=0] ...", itopic, ikey, ivalue))
+local iack1, ie1 = iclient:produce(itopic, ikey, ivalue)
+if not iack1 then die("idempotent produce 1: %s", ie1) end
+print(string.format("  ack partition=%d offset=%d seq=%d",
+    iack1.partition, iack1.offset, iack1.seq))
+
+-- Resend the SAME seq. Server should reply with the same (partition, offset).
+print(string.format("retry at seq=0 (expect same offset back) ..."))
+local iack2, ie2 = iclient:produce_at_seq(itopic, ikey, ivalue, 0)
+if not iack2 then die("idempotent retry: %s", ie2) end
+if iack2.partition == iack1.partition and iack2.offset == iack1.offset then
+    print(string.format("  dedup OK — broker returned original offset %d",
+        iack2.offset))
+else
+    die("dedup FAILED: got partition=%d offset=%d, expected %d/%d",
+        iack2.partition, iack2.offset, iack1.partition, iack1.offset)
+end
+
+-- Try an out-of-order seq (skipping seq=1). Expect an error.
+print(string.format("send seq=42 (gap; expect error) ..."))
+local _, ie3 = iclient:produce_at_seq(itopic, ikey, ivalue, 42)
+if ie3 then
+    print(string.format("  expected error: %s", ie3))
+else
+    die("out-of-order seq was accepted; broker dedup is broken")
+end
+
+iclient:close()
+print("idempotent demo done.")
+
+-- 7. Clean shutdown — sends GOODBYE and closes the socket.
 client:close()
 print("done.")

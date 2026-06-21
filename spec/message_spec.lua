@@ -2,7 +2,6 @@ local message_m = require("src.message")
 local Message       = message_m.Message
 local MessageHeader = message_m.MessageHeader
 local serialize     = message_m.serialize_message
-local Pool          = message_m.Pool
 
 describe("Message.new", function()
     it("creates a message with the given fields", function()
@@ -91,39 +90,3 @@ describe("serialize_message", function()
     end)
 end)
 
-describe("Pool", function()
-    it("uses the factory when empty", function()
-        local n = 0
-        local p = Pool.new(function() n = n + 1; return {id = n} end)
-        local a = p:get()
-        local b = p:get()
-        assert.are.equal(1, a.id)
-        assert.are.equal(2, b.id)
-    end)
-
-    it("recycles items via put/get", function()
-        local p = Pool.new(function() return {} end)
-        local a = p:get()
-        p:put(a)
-        local b = p:get()
-        assert.are.equal(a, b)
-    end)
-
-    it("calls reset() before retaining an item", function()
-        local reset_calls = 0
-        local p = Pool.new(
-            function() return {x = 99} end,
-            function(o) reset_calls = reset_calls + 1; o.x = 0 end
-        )
-        local item = p:get()
-        p:put(item)
-        assert.are.equal(1, reset_calls)
-        assert.are.equal(0, item.x)
-    end)
-
-    it("drops items beyond max", function()
-        local p = Pool.new(function() return {} end, nil, 2)
-        p:put({}); p:put({}); p:put({})
-        assert.are.equal(2, p.count)
-    end)
-end)

@@ -20,6 +20,7 @@
 --   - Pending-send cap reinterpreted as a per-write deadline
 --   - Pre-auth opcode whitelist (only HELLO/AUTH/IDENTIFY/HEARTBEAT allowed)
 
+local socket      = require("socket")
 local Reactor     = require("src.server.reactor")
 local proto       = require("src.server.protocol")
 local Connection  = require("src.server.connection")
@@ -44,10 +45,30 @@ local DEFAULT_MAX_PENDING_BYTES   = 16 * 1024 * 1024
 -- slow-consumer detection at the cost of dropping legitimately slow
 -- networks.
 local DEFAULT_SEND_DEADLINE       = 30
-local DEFAULT_HANDSHAKE_DEADLINE  = 10
+-- Tightened from 10 -> 5s. Legitimate clients complete HELLO + AUTH in
+-- well under a second on a working network; 5s is generous enough to
+-- absorb a TCP slow start but short enough that a banned/attacker IP
+-- doesn't tie up a connection slot for long. See run_handshake_watchdog.
+local DEFAULT_HANDSHAKE_DEADLINE  = 5
+-- Per-frame deadline for the reader. Splits into pre-auth (short, to
+-- bound slowloris-style partial-frame attacks at the front door) and
+-- steady-state (after AUTHENTICATED — longer, since legitimate
+-- consumers may sit between FETCHes).
+local DEFAULT_PRE_AUTH_READ_DEADLINE = 5
+local DEFAULT_IDLE_DEADLINE          = 60
 local DEFAULT_HEARTBEAT_INTERVAL  = 30
 local DEFAULT_HEARTBEAT_MISS      = 3
 local DEFAULT_PUSH_INTERVAL       = 0.05
+-- Cap on the number of topics the broker will accept. Without this a
+-- client (authenticated or not, depending on config) could call
+-- CREATE_TOPIC in a loop and exhaust both in-memory state and the
+-- LIST_TOPICS response budget.
+local DEFAULT_MAX_TOPICS = 1024
+-- Bound on the wire size of a LIST_TOPICS response. Independently of
+-- max_topics, the response includes 4 bytes per topic plus the names,
+-- and we cap topics' names at 249 bytes, so worst-case
+-- 1024 * (4 + 249) ≈ 256 KiB. Truncate well before that.
+local DEFAULT_MAX_LIST_TOPICS = 1024
 -- Group-commit defaults. Linger is the max time a single acks=1 producer
 -- waits for siblings to join the batch; max_waiters caps batch size so
 -- a busy partition doesn't accumulate unbounded RAM. 2 ms is short
@@ -67,6 +88,11 @@ function Server.new(opts)
     local broker, berr = brk_m.Broker.new(opts.data_dir)
     if not broker then return nil, berr end
 
+    -- Seed the topic_count gauge from what we just loaded so the gauge
+    -- is meaningful immediately after restart, before any CREATE_TOPIC
+    -- runs to bump it.
+    metrics.set("moonmq_topic_count", #broker:list_topics())
+
     local producer = prd_m.Producer.new(broker, prd_m.AckMode.AckLeader)
 
     return setmetatable({
@@ -76,13 +102,24 @@ function Server.new(opts)
         host     = opts.host or "0.0.0.0",
         port     = opts.port or 9092,
 
+        -- Idempotent producer state. next_pid is a monotonic counter
+        -- assigned by INIT_PRODUCER_ID; the value lives only for this
+        -- broker process (no persistence — see docs/transactions.md
+        -- for the full-coordinator design that would make PIDs durable).
+        -- Starts at 1 so 0 can be reserved as "unassigned" in client code.
+        next_pid = 1,
+
         max_frame                = opts.max_frame                or DEFAULT_MAX_FRAME,
         max_pending_bytes        = opts.max_pending_bytes        or DEFAULT_MAX_PENDING_BYTES,
         send_deadline            = opts.send_deadline            or DEFAULT_SEND_DEADLINE,
         handshake_deadline       = opts.handshake_deadline       or DEFAULT_HANDSHAKE_DEADLINE,
+        pre_auth_read_deadline   = opts.pre_auth_read_deadline   or DEFAULT_PRE_AUTH_READ_DEADLINE,
+        idle_deadline            = opts.idle_deadline            or DEFAULT_IDLE_DEADLINE,
         heartbeat_interval       = opts.heartbeat_interval       or DEFAULT_HEARTBEAT_INTERVAL,
         heartbeat_miss_threshold = opts.heartbeat_miss_threshold or DEFAULT_HEARTBEAT_MISS,
         push_interval            = opts.push_interval            or DEFAULT_PUSH_INTERVAL,
+        max_topics               = opts.max_topics               or DEFAULT_MAX_TOPICS,
+        max_list_topics          = opts.max_list_topics          or DEFAULT_MAX_LIST_TOPICS,
 
         max_connections        = opts.max_connections        or 1024,
         max_connections_per_ip = opts.max_connections_per_ip or 32,
@@ -176,16 +213,18 @@ function Server:dispatch(conn, op, correl, payload)
         "moonmq_dispatch_duration_seconds", 
         { op = string.format("0x%02x", op) })
 
-    if     op == proto.OP_HELLO           then self:_handle_hello(conn, correl, payload)
-    elseif op == proto.OP_AUTH            then self:_handle_auth(conn, correl, payload)
-    elseif op == proto.OP_IDENTIFY_CLIENT then self:_handle_identify_client(conn, correl, payload)
-    elseif op == proto.OP_PRODUCE         then self:_handle_produce(conn, correl, payload)
-    elseif op == proto.OP_SUBSCRIBE       then self:_handle_subscribe(conn, correl, payload)
-    elseif op == proto.OP_FETCH           then self:_handle_fetch(conn, correl, payload)
-    elseif op == proto.OP_COMMIT          then self:_handle_commit(conn, correl, payload)
-    elseif op == proto.OP_CREATE_TOPIC    then self:_handle_create_topic(conn, correl, payload)
-    elseif op == proto.OP_LIST_TOPICS     then self:_handle_list_topics(conn, correl, payload)
-    elseif op == proto.OP_GOODBYE         then conn:close(Connection.REASON_CLIENT_GOODBYE)
+    if     op == proto.OP_HELLO              then self:_handle_hello(conn, correl, payload)
+    elseif op == proto.OP_AUTH               then self:_handle_auth(conn, correl, payload)
+    elseif op == proto.OP_IDENTIFY_CLIENT    then self:_handle_identify_client(conn, correl, payload)
+    elseif op == proto.OP_PRODUCE            then self:_handle_produce(conn, correl, payload)
+    elseif op == proto.OP_INIT_PRODUCER_ID   then self:_handle_init_producer_id(conn, correl, payload)
+    elseif op == proto.OP_PRODUCE_IDEMPOTENT then self:_handle_produce_idempotent(conn, correl, payload)
+    elseif op == proto.OP_SUBSCRIBE          then self:_handle_subscribe(conn, correl, payload)
+    elseif op == proto.OP_FETCH              then self:_handle_fetch(conn, correl, payload)
+    elseif op == proto.OP_COMMIT             then self:_handle_commit(conn, correl, payload)
+    elseif op == proto.OP_CREATE_TOPIC       then self:_handle_create_topic(conn, correl, payload)
+    elseif op == proto.OP_LIST_TOPICS        then self:_handle_list_topics(conn, correl, payload)
+    elseif op == proto.OP_GOODBYE            then conn:close(Connection.REASON_CLIENT_GOODBYE)
     else
         conn:send(proto.encode_error(correl, proto.ERR_UNKNOWN_OP,
             string.format("op 0x%02X", op)))
@@ -278,6 +317,8 @@ function Server:_handle_produce(conn, correl, payload)
         return
     end
 
+    metrics.inc("moonmq_produce_records_total", 1, { topic = p.topic })
+
     conn:send(proto.encode_produce_ack(correl, part_id, offset))
 end
 
@@ -291,6 +332,100 @@ local function ensure_consumer(conn, broker, group_id)
     end
     conn.consumer = consumer_m.Consumer.new(broker, group_id)
     return conn.consumer
+end
+
+-- INIT_PRODUCER_ID: assign a u64 producer ID to this connection. Repeated
+-- calls on the same connection are tolerated but reset all per-PID seq
+-- state (a client that asks for a fresh PID has lost track of its
+-- sequences). PIDs are not durable.
+function Server:_handle_init_producer_id(conn, correl, _payload)
+    local pid = self.next_pid
+    self.next_pid = self.next_pid + 1
+    conn.pid = pid
+    conn.seq_state = {}
+    log:info("conn=%s assigned producer_id=%d", conn.id_short, pid)
+    conn:send(proto.encode_producer_id(correl, pid))
+end
+
+-- PRODUCE_IDEMPOTENT: like PRODUCE, but checks (PID, topic, seq) for
+-- monotonicity. Dedup contract per (PID, topic):
+--   * seq == last_seq + 1  → append, return offset, update memo.
+--   * seq == last_seq      → idempotent retry. DON'T append; return the
+--     original offset+partition. Without this the retry would duplicate.
+--   * seq <  last_seq      → ERR_OUT_OF_ORDER_SEQUENCE (stale).
+--   * seq >  last_seq + 1  → ERR_OUT_OF_ORDER_SEQUENCE (gap).
+-- First record's seq must be 0 (last_seq starts at -1 implicitly).
+--
+-- Why per-(PID, topic) and not per-(PID, topic, partition)? Two reasons:
+-- (1) it lets the client track ONE seq counter per topic without
+-- needing to know the broker's partition count or hash function, and
+-- (2) TCP guarantees per-connection in-order delivery, so a single
+-- monotonic counter across partitions is consistent. The full
+-- Kafka-style per-partition seq becomes necessary only when producers
+-- batch across partitions in parallel, which we don't.
+function Server:_handle_produce_idempotent(conn, correl, payload)
+    if conn.rate_limiter and not conn.rate_limiter:take(1) then
+        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
+            "produce rate exceeded"))
+        return
+    end
+
+    if not conn.pid then
+        conn:send(proto.encode_error(correl, proto.ERR_NO_PRODUCER_ID,
+            "INIT_PRODUCER_ID required before PRODUCE_IDEMPOTENT"))
+        return
+    end
+
+    local p, err = proto.decode_produce_idempotent(payload)
+    if not p then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    if p.pid ~= conn.pid then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            string.format("pid mismatch: frame=%d conn=%d",
+                p.pid, conn.pid)))
+        return
+    end
+
+    local slot = conn.seq_state[p.topic]
+    local last_seq = slot and slot.last_seq or -1
+
+    if p.seq == last_seq and slot then
+        -- Idempotent retry: replay the original ack.
+        conn:send(proto.encode_produce_ack(correl,
+            slot.last_partition, slot.last_offset))
+        return
+    elseif p.seq < last_seq or p.seq > last_seq + 1 then
+        conn:send(proto.encode_error(correl, proto.ERR_OUT_OF_ORDER_SEQUENCE,
+            string.format("expected seq %d, got %d (pid=%d %s)",
+                last_seq + 1, p.seq, conn.pid, p.topic)))
+        return
+    end
+
+    -- seq == last_seq + 1: fresh record. Route through the normal
+    -- producer so partitioning + group-commit fsync behave identically
+    -- to the non-idempotent path. The (partition, offset) we get back
+    -- is what we memo so a retry can replay the same ack.
+    local msg = msg_m.Message.new(p.key, p.value, 0)
+    local partition_id, offset, werr = self.producer:produce(p.topic, msg)
+    if werr then
+        local code = werr:find("does not exist", 1, true)
+            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
+        conn:send(proto.encode_error(correl, code, werr))
+        return
+    end
+
+    conn.seq_state[p.topic] = {
+        last_seq       = p.seq,
+        last_offset    = offset,
+        last_partition = partition_id,
+    }
+    metrics.inc("moonmq_produce_records_total", 1, { topic = p.topic })
+    metrics.inc("moonmq_idempotent_produce_total", 1, { topic = p.topic })
+
+    conn:send(proto.encode_produce_ack(correl, partition_id, offset))
 end
 
 function Server:_handle_subscribe(conn, correl, payload)
@@ -340,6 +475,7 @@ function Server:_subscriber_loop(conn)
                 local frame = proto.encode_record(uuid.ZERO,
                     r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
                 if not conn:send(frame) then return end
+                metrics.inc("moonmq_fetch_records_total", 1, { topic = r.topic })
             end
         else
             self.reactor:sleep(self.push_interval)
@@ -387,6 +523,9 @@ function Server:_handle_fetch(conn, correl, payload)
                 r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
             if not conn:send(frame) then return end
         end
+        if limit > 0 then
+            metrics.inc("moonmq_fetch_records_total", limit, { topic = f.topic })
+        end
     end
     conn:send(proto.encode_ok(correl))
 end
@@ -400,6 +539,22 @@ function Server:_handle_commit(conn, correl, payload)
     if not conn.consumer then
         conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
             "commit requires prior subscribe/fetch"))
+        return
+    end
+    -- Bounds-check the partition against the topic before forwarding to
+    -- the consumer. Without this, a client could commit to any u32
+    -- partition id — currently the consumer stub silently accepts it,
+    -- but that's a future foot-gun once offset persistence lands.
+    local topic, terr = self.broker:get_topic(c.topic)
+    if not topic then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
+            terr or "topic missing"))
+        return
+    end
+    if c.partition < 1 or c.partition > #topic.partitions then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
+            string.format("partition %d out of range (1..%d)",
+                c.partition, #topic.partitions)))
         return
     end
     local ok, cerr = conn.consumer:commit_offset(c.topic, c.partition, c.offset)
@@ -422,16 +577,39 @@ function Server:_handle_create_topic(conn, correl, payload)
             "num_partitions out of range (1..1024)"))
         return
     end
+    -- Topic-count cap. Without this a client (authenticated or not,
+    -- depending on the auth config) can CREATE_TOPIC in a loop and
+    -- exhaust the broker's in-memory topic table + descriptors. We
+    -- check the current count against max_topics before allocating
+    -- anything on disk.
+    local current = #self.broker:list_topics()
+    if current >= self.max_topics then
+        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
+            string.format("topic limit reached (%d)", self.max_topics)))
+        return
+    end
     local _, terr = self.broker:create_topic(c.name, c.num_partitions)
     if terr then
         conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, terr))
         return
     end
+    metrics.set("moonmq_topic_count", current + 1)
     conn:send(proto.encode_ok(correl))
 end
 
 function Server:_handle_list_topics(conn, correl, _payload)
-    conn:send(proto.encode_topic_list(correl, self.broker:list_topics()))
+    -- Bound response size. Sorting by name first so the truncation is
+    -- deterministic across calls (rather than depending on table-pair
+    -- iteration order). For the common case the bound is irrelevant —
+    -- it only kicks in if max_topics has been raised past max_list_topics.
+    local all = self.broker:list_topics()
+    table.sort(all)
+    if #all > self.max_list_topics then
+        local truncated = {}
+        for i = 1, self.max_list_topics do truncated[i] = all[i] end
+        all = truncated
+    end
+    conn:send(proto.encode_topic_list(correl, all))
 end
 
 -- Install handlers for SIGINT, SIGTERM, and SIGTSTP (Ctrl+Z) so the
@@ -489,6 +667,7 @@ function Server:start()
             reactor = self.reactor,
             host    = self.metrics_host,
             port    = self.metrics_port,
+            server  = self,  -- powers /stats snapshot
         })
         mh:start()
     end
@@ -516,6 +695,74 @@ function Server:stop()
             proto.ERR_INTERNAL, "server shutting down")
     end
     self.reactor:stop()
+end
+
+-- snapshot returns a Lua table summarising broker state for the JSON
+-- /stats endpoint. Deliberately bounded — full topic enumeration is
+-- truncated past `max_list_topics` (the same cap the wire endpoint uses)
+-- and partitions surface counts rather than per-partition byte arrays.
+-- A separate `top_topics_by_bytes` list gives operators visibility into
+-- where data lives without exploding the response under high topic counts.
+function Server:snapshot()
+    local topics = self.broker:list_topics()
+    table.sort(topics)
+    local truncated = false
+    if #topics > self.max_list_topics then
+        local keep = {}
+        for i = 1, self.max_list_topics do keep[i] = topics[i] end
+        topics = keep
+        truncated = true
+    end
+
+    local topic_summaries = {}
+    local with_bytes = {}
+    for _, name in ipairs(topics) do
+        local t = self.broker.topic_manager.topics[name]
+        if t then
+            local parts = t.partitions or {}
+            local total_bytes = 0
+            local total_segments = 0
+            for _, p in ipairs(parts) do
+                total_bytes = total_bytes + (p.offset or 0)
+                total_segments = total_segments + (p.segments and #p.segments or 0)
+            end
+            topic_summaries[#topic_summaries + 1] = {
+                name           = name,
+                partitions     = #parts,
+                bytes_on_disk  = total_bytes,
+                segment_count  = total_segments,
+            }
+            with_bytes[#with_bytes + 1] = topic_summaries[#topic_summaries]
+        end
+    end
+
+    table.sort(with_bytes, function(a, b)
+        return a.bytes_on_disk > b.bytes_on_disk
+    end)
+    local top_n = {}
+    for i = 1, math.min(10, #with_bytes) do top_n[i] = with_bytes[i] end
+
+    return {
+        server = {
+            name           = proto.SERVER_NAME,
+            version        = proto.SERVER_VERSION,
+            protocol       = proto.PROTOCOL_VERSION,
+            host           = self.host,
+            port           = self.port,
+        },
+        connections = {
+            open                  = self.connections,
+            max                   = self.max_connections,
+            max_per_ip            = self.max_connections_per_ip,
+        },
+        topics = {
+            count                 = #self.broker:list_topics(),
+            max                   = self.max_topics,
+            listed                = #topic_summaries,
+            listed_truncated      = truncated,
+            top_by_bytes          = top_n,
+        },
+    }
 end
 
 return Server

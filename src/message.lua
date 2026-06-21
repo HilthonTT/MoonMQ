@@ -60,48 +60,8 @@ local function serialize_message(msg)
         .. string.pack(">I4", payload_crc), nil
 end
 
-local Pool = {}
-Pool.__index = Pool
-
--- factory: () -> object, called when the pool is empty
--- reset:   (object) -> (), called before returning to the pool (optional)
--- max:     cap on retained objects (optional; default 1024)
-function Pool.new(factory, reset, max)
-    return setmetatable({
-        items = {},
-        count = 0,
-        factory = factory,
-        reset = reset,
-        max = max or 1024,
-    }, Pool)
-end
-
-function Pool:get()
-    local n = self.count
-
-    if n > 0 then
-        local item = self.items[n]
-        self.items[n] = nil
-        self.count = n - 1
-        return item
-    end
-
-    return self.factory()
-end
-
-function Pool:put(item)
-    if self.count >= self.max then
-        return -- drop on the floor; let GC handle it
-    end
-
-    if self.reset then self.reset(item) end
-    self.count = self.count + 1
-    self.items[self.count] = item
-end
-
 return {
     Message = Message,
     MessageHeader = MessageHeader,
     serialize_message = serialize_message,
-    Pool = Pool,
 }

@@ -3,6 +3,7 @@
 --
 -- Routes:
 --   GET /metrics  → Prometheus text exposition
+--   GET /stats    → JSON broker snapshot (human/operator readable)
 --   GET /health   → "ok\n" (liveness probe)
 --   GET /         → tiny HTML index
 --   anything else → 404
@@ -18,6 +19,7 @@
 
 local socket  = require("socket")
 local metrics = require("src.server.metrics")
+local json    = require("dkjson")
 local log     = require("src.log.logger").get("metrics")
  
 local M = {}
@@ -34,15 +36,20 @@ local INDEX_HTML = [[<!doctype html>
 <h1>moonmq</h1>
 <ul>
   <li><a href="/metrics"><code>/metrics</code></a> — Prometheus exposition</li>
+  <li><a href="/stats"><code>/stats</code></a> — JSON broker snapshot</li>
   <li><a href="/health"><code>/health</code></a> — liveness probe</li>
 </ul>
 ]]
 
+-- opts.server: the Server instance, used to render /stats. Optional —
+-- when nil, /stats responds 503. Passing it through is the cleanest way
+-- to avoid making metrics_http reach back through globals.
 function M.new(opts)
     return setmetatable({
         reactor = assert(opts.reactor, "reactor required"),
         host    = opts.host or "127.0.0.1",  -- safe default
         port    = opts.port or 9090,         -- Prometheus convention
+        server  = opts.server,               -- for /stats snapshot
     }, M)
 end
 
@@ -97,6 +104,7 @@ local STATUS_TEXT = {
     [404] = "Not Found",
     [405] = "Method Not Allowed",
     [500] = "Internal Server Error",
+    [503] = "Service Unavailable",
 }
 
 local function write_response(reactor, sock, status, content_type, body)
@@ -148,6 +156,24 @@ function M:_handle(sock, peer)
         else
             status, ctype, body = 500, "text/plain",
                 "metrics render failed: " .. tostring(rendered) .. "\n"
+        end
+    elseif path == "/stats" then
+        if not self.server then
+            status, ctype, body = 503, "text/plain",
+                "stats unavailable: server snapshot not wired\n"
+        else
+            local ok, snap = pcall(self.server.snapshot, self.server)
+            if not ok then
+                status, ctype, body = 500, "text/plain",
+                    "snapshot failed: " .. tostring(snap) .. "\n"
+            else
+                -- dkjson with indent=true yields a human-readable shape.
+                -- Operators read this; Prometheus does not.
+                local rendered = json.encode(snap, { indent = true })
+                status, ctype, body = 200,
+                    "application/json; charset=utf-8",
+                    rendered .. "\n"
+            end
         end
     elseif path == "/health" then
         status, ctype, body = 200, "text/plain", "ok\n"
