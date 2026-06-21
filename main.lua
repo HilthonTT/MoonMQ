@@ -1,6 +1,7 @@
 local Server = require("src.server.server")
 local Config = require("src.server.config")
 local auth_m = require("src.server.auth")
+local version_m = require("src.version")
 local Log    = require("src.log.logger")
 
 local log = Log.get("main")
@@ -10,6 +11,22 @@ local function is_main(_arg, ...)
     if n_arg == select("#", ...) then
         for i = 1, n_arg do
             if _arg[i] ~= select(i, ...) then return false end
+        end
+        return true
+    end
+    return false
+end
+
+local function run_cli_command(argv)
+    local cmd = argv and argv[1]
+    if cmd == "version" or cmd == "--version" or cmd == "-v" then
+        local sub = argv[2]
+        if sub == "--json" then
+            print(version_m.GetVersionJSON())
+        elseif sub == "--short" then
+            print(version_m.GetVersionInfo():Short())
+        else
+            print(version_m.GetVersionInfo():String())
         end
         return true
     end
@@ -46,6 +63,10 @@ local function build_authenticator(cfg)
 end
 
 if is_main(arg, ...) then
+    if run_cli_command(arg) then
+        os.exit(0)
+    end
+
     local cfg, cerr = Config.load()
     if not cfg then
         log:error("config: %s", cerr)
