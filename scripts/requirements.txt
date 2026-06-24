@@ -1,3 +1,4 @@
-# Dependencies for lag_monitor.py
+# Dependencies for lag_monitor.py and performance_monitor.py
 requests>=2.32,<3
 prometheus-client>=0.20,<1
+psutil>=5.9,<8
