@@ -16,8 +16,8 @@
 -- with `#` are skipped. Unknown keys are ignored on read (forward-
 -- compat) and never written. Lives at <topic_dir>/topic.config.
 
-local fs_m    = require("src.fs")
-local io_sync = require("src.io_sync")
+local fs_m    = require("src.io.fs")
+local io_sync = require("src.io.io_sync")
 
 local FILE_NAME = "topic.config"
 

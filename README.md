@@ -49,7 +49,7 @@ Verify with: `lua5.4 -e 'print(require("posix.unistd").fsync)'` — should print
 
 ### Windows
 
-`src/io_sync.lua` falls back to LuaJIT FFI on Windows (`_commit`, `_chsize_s` from the C runtime). Running on Windows therefore requires LuaJIT rather than stock Lua 5.4.
+`src/io/io_sync.lua` falls back to LuaJIT FFI on Windows (`_commit`, `_chsize_s` from the C runtime). Running on Windows therefore requires LuaJIT rather than stock Lua 5.4.
 
 ## Running the server
 
@@ -118,9 +118,9 @@ it at startup and logs a warning.
 
 Some modules under `src/` depend on libraries that may not be present:
 
-- **`src/compression.lua`** needs the `zlib` LuaRocks module (gzip support).
-- **`src/snappy.lua`** needs LuaJIT's FFI and `libsnappy` (Snappy support).
-- **`src/replica.lua`** loads on stock Lua, but real replication needs a peer
+- **`src/record/compression.lua`** needs the `zlib` LuaRocks module (gzip support).
+- **`src/record/snappy.lua`** needs LuaJIT's FFI and `libsnappy` (Snappy support).
+- **`src/server/replica.lua`** loads on stock Lua, but real replication needs a peer
   broker exposing an HTTP `/replicate` endpoint.
 
 ### Logging to a file
@@ -303,11 +303,11 @@ Current coverage:
 
 | Spec file                | Module under test                                  |
 | ------------------------ | -------------------------------------------------- |
-| `buffer_spec.lua`        | `src/buffer.lua` — accumulating byte buffer        |
-| `crc32_spec.lua`         | `src/crc32.lua` — IEEE 802.3 CRC-32                |
-| `future_spec.lua`        | `src/future.lua` — one-shot coroutine future       |
-| `message_spec.lua`       | `src/message.lua` — message wire format            |
-| `partition_spec.lua`     | `src/partition.lua` — append, read, recovery       |
-| `time_spec.lua`          | `src/time.lua` — duration constants                |
-| `topic_manager_spec.lua` | `src/topic_manager.lua` — topic/partition creation |
-| `util_spec.lua`          | `src/util.lua` — topic-name validation             |
+| `buffer_spec.lua`        | `src/core/buffer.lua` — accumulating byte buffer        |
+| `crc32_spec.lua`         | `src/core/crc32.lua` — IEEE 802.3 CRC-32                |
+| `future_spec.lua`        | `src/core/future.lua` — one-shot coroutine future       |
+| `message_spec.lua`       | `src/record/message.lua` — message wire format          |
+| `partition_spec.lua`     | `src/storage/partition.lua` — append, read, recovery    |
+| `time_spec.lua`          | `src/core/time.lua` — duration constants                |
+| `topic_manager_spec.lua` | `src/storage/topic_manager.lua` — topic/partition creation |
+| `util_spec.lua`          | `src/core/util.lua` — topic-name validation             |

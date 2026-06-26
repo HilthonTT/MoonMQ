@@ -1,5 +1,5 @@
-local brk_m  = require("src.broker")
-local util_m = require("src.util")
+local brk_m  = require("src.storage.broker")
+local util_m = require("src.core.util")
 local log    = require("src.log.logger").get("consumer")
 
 -- ConsumerRecord holds a consumed message with its metadata

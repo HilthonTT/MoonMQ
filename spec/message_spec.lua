@@ -1,4 +1,4 @@
-local message_m = require("src.message")
+local message_m = require("src.record.message")
 local Message       = message_m.Message
 local MessageHeader = message_m.MessageHeader
 local serialize     = message_m.serialize_message
@@ -72,7 +72,7 @@ describe("serialize_message", function()
     end)
 
     it("round-trips header and payload CRCs that validate", function()
-        local crc32 = require("src.crc32")
+        local crc32 = require("src.core.crc32")
         local m = Message.new("AA", "BBBB", 7)
         local bytes = serialize(m)
 

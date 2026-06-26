@@ -1,5 +1,5 @@
-local TopicManager = require("src.topic_manager")
-local os_utils     = require("src.utils.os")
+local TopicManager = require("src.storage.topic_manager")
+local os_utils     = require("src.core.os")
 
 local BASE_DIR     = os_utils.IS_WINDOWS and "C:\\Temp\\lua_kafka_test" or "/tmp/lua_kafka_test"
 

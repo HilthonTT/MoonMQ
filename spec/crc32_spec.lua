@@ -1,4 +1,4 @@
-local crc32 = require("src.crc32")
+local crc32 = require("src.core.crc32")
 
 describe("crc32 (IEEE 802.3)", function()
     it("returns 0 for an empty string", function()

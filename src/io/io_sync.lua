@@ -9,7 +9,7 @@
 -- Windows: fall back to LuaJIT FFI against the C runtime, since luaposix
 -- doesn't ship there.
 
-local os_utils = require("src.utils.os")
+local os_utils = require("src.core.os")
 
 -- atomic_rename: POSIX `rename(2)` is atomic over an existing target. On
 -- Windows it isn't — the target must not exist, otherwise os.rename fails.

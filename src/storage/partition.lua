@@ -1,9 +1,9 @@
-local time_m    = require("src.time")
-local fs_m      = require("src.fs")
+local time_m    = require("src.core.time")
+local fs_m      = require("src.io.fs")
 local socket  = require("socket")
-local msg_m = require("src.message")
-local crc32   = require("src.crc32")
-local io_sync = require("src.io_sync")
+local msg_m = require("src.record.message")
+local crc32   = require("src.core.crc32")
+local io_sync = require("src.io.io_sync")
 local log     = require("src.log.logger").get("partition")
 
 -- Patterns we treat as transient. We can't introspect errno from plain

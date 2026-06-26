@@ -1,4 +1,4 @@
-local os_utils = require("src.utils.os")
+local os_utils = require("src.core.os")
 
 -- LuaJIT FFI is used on Windows so that is_dir does not have to write a
 -- probe file (the old implementation did, which had two sharp edges:

@@ -1,8 +1,8 @@
-local fs_m        = require("src.fs")
-local Topic     = require("src.topic")
-local SegmentedPartition = require("src.segmentation").SegmentedPartition
-local topic_config = require("src.topic_config")
-local utl_m      = require("src.util")
+local fs_m        = require("src.io.fs")
+local Topic     = require("src.storage.topic")
+local SegmentedPartition = require("src.storage.segmentation").SegmentedPartition
+local topic_config = require("src.storage.topic_config")
+local utl_m      = require("src.core.util")
 
 local TopicManager = {}
 TopicManager.__index = TopicManager
@@ -17,7 +17,7 @@ function TopicManager.new(baseDir)
 end
 
 -- opts (optional): per-topic config forwarded to every SegmentedPartition
--- under this topic. See src/segmentation.lua SegmentedPartition.new for
+-- under this topic. See src/storage/segmentation.lua SegmentedPartition.new for
 -- the supported keys (max_segment_size, retention, cleaner_interval).
 -- Unknown keys are ignored.
 function TopicManager:create_topic(name, numPartitions, opts)

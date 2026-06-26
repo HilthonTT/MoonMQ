@@ -1,5 +1,5 @@
 # Default `luarocks` on Debian/Ubuntu targets Lua 5.1, but this project
-# requires 5.4 (native bitops in src/crc32.lua etc.). Always invoke the
+# requires 5.4 (native bitops in src/core/crc32.lua etc.). Always invoke the
 # 5.4-suffixed launcher so deps land in /usr/local/{share,lib}/lua/5.4.
 LUA      ?= lua5.4
 LUAROCKS ?= luarocks-5.4
@@ -20,7 +20,7 @@ test:
 
 # Start the MoonMQ TCP broker. Binds to Server.Host:Server.Port from
 # appsettings.json (default 0.0.0.0:9092). This is the listener that
-# native TCP clients (src/client.lua, src/examples/tcp_client.lua, and
+# native TCP clients (src/client/init.lua, src/examples/tcp_client.lua, and
 # the gateway's connection pool) connect to. Metrics on 127.0.0.1:9090.
 run server:
 	$(LUA) main.lua

@@ -1,8 +1,8 @@
-local message = require("src.message")
+local message = require("src.record.message")
 local socket  = require("socket")
-local brk     = require("src.broker")
-local Future  = require("src.future")
-local util    = require("src.util")
+local brk     = require("src.storage.broker")
+local Future  = require("src.core.future")
+local util    = require("src.core.util")
 local log     = require("src.log.logger").get("producer")
 
 -- AckMode defines the producer acknowledgment levels
@@ -12,7 +12,7 @@ local AckMode = {
     -- AckLeader means the leader must acknowledge (fsync after write)
     AckLeader   = 1,
     -- AckAll means all replicas must acknowledge. Currently rejected at
-    -- the API boundary: src/replica.lua drains fire-and-forget over HTTP
+    -- the API boundary: src/server/replica.lua drains fire-and-forget over HTTP
     -- and has no high-watermark, so we cannot honour the contract. The
     -- prior behaviour silently degraded acks=-1 to acks=0 (because the
     -- `self.acks > 0` guard is false for -1), which is worse than failing

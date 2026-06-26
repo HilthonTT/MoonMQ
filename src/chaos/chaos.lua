@@ -1,7 +1,7 @@
 local socket = require("socket")
-local prd_m  = require("src.producer")
-local time_m = require("src.time")
-local msg_m  = require("src.message")
+local prd_m  = require("src.client.producer")
+local time_m = require("src.core.time")
+local msg_m  = require("src.record.message")
 
 local M = {}
 

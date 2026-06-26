@@ -9,15 +9,15 @@
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-local fs_m              = require("src.fs")
-local Topic             = require("src.topic")
-local seg_m             = require("src.segmentation")
+local fs_m              = require("src.io.fs")
+local Topic             = require("src.storage.topic")
+local seg_m             = require("src.storage.segmentation")
 local SegmentedPartition = seg_m.SegmentedPartition
-local message           = require("src.message")
-local topic_config      = require("src.topic_config")
-local TopicManager      = require("src.topic_manager")
-local broker_m          = require("src.broker")
-local os_utils          = require("src.utils.os")
+local message           = require("src.record.message")
+local topic_config      = require("src.storage.topic_config")
+local TopicManager      = require("src.storage.topic_manager")
+local broker_m          = require("src.storage.broker")
+local os_utils          = require("src.core.os")
 
 local BASE = os_utils.IS_WINDOWS
     and "C:\\Temp\\moonmq_storage_smoke"

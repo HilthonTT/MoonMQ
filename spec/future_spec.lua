@@ -1,4 +1,4 @@
-local Future = require("src.future")
+local Future = require("src.core.future")
 
 -- Minimal scheduler stub: resume() just dispatches to coroutine.resume.
 -- That is enough for the Future contract since :await() returns whatever

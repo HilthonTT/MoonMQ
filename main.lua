@@ -1,7 +1,7 @@
 local Server = require("src.server.server")
 local Config = require("src.server.config")
 local auth_m = require("src.server.auth")
-local version_m = require("src.version")
+local version_m = require("src.core.version")
 local Log    = require("src.log.logger")
 
 local log = Log.get("main")

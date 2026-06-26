@@ -115,7 +115,7 @@ local replay = c:produce_at_seq("orders", "key-1", "value-1", 0)
 The work below is blocked on two prerequisites:
 
 - **Consumer subsystem.** Today `commit_offset` and `load_offset` are
-  no-ops (see `src/consumer.lua`). Until offsets are durable, the
+  no-ops (see `src/client/consumer.lua`). Until offsets are durable, the
   transactional offset commit can't be implemented.
 - **`__consumer_offsets` topic.** Real Kafka stores committed offsets
   in an internal topic with the same replication and storage path as

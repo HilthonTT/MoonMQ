@@ -1,4 +1,4 @@
-local util = require("src.util")
+local util = require("src.core.util")
 
 describe("validate_topic_name", function()
     it("accepts a simple alphanumeric name", function()

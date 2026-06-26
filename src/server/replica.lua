@@ -2,7 +2,7 @@ local socket = require("socket")
 local http   = require("socket.http")
 local ltn12  = require("ltn12")
 local json   = require("dkjson")        -- only needs json.decode
-local msg_m  = require("src.message")
+local msg_m  = require("src.record.message")
 local log    = require("src.log.logger").get("replicate")
 
 local DEFAULT_QUEUE_SIZE = 1000

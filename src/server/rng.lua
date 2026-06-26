@@ -6,7 +6,7 @@
 -- on Windows via FFI). Fall back to math.random ONLY with a loud
 -- warning.
 
-local os_utils = require("src.utils.os")
+local os_utils = require("src.core.os")
 local log      = require("src.log.logger").get("rng")
 
 local M = {}

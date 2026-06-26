@@ -1,5 +1,5 @@
-local crc32   = require("src.crc32")
-local io_sync = require("src.io_sync")
+local crc32   = require("src.core.crc32")
+local io_sync = require("src.io.io_sync")
 local log     = require("src.log.logger").get("segment_verify")
 
 local HEADER_SIZE    = 8

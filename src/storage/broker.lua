@@ -1,7 +1,7 @@
-local fs_m       = require("src.fs")
-local tpm_m      = require("src.topic_manager")
-local topic_config = require("src.topic_config")
-local util_m     = require("src.util")
+local fs_m       = require("src.io.fs")
+local tpm_m      = require("src.storage.topic_manager")
+local topic_config = require("src.storage.topic_config")
+local util_m     = require("src.core.util")
 
 local Broker = {}
 Broker.__index = Broker
@@ -99,7 +99,7 @@ function Broker:load_topics()
 end
 
 -- opts (optional): per-topic config forwarded to the TopicManager. See
--- src/segmentation.lua SegmentedPartition.new for supported keys.
+-- src/storage/segmentation.lua SegmentedPartition.new for supported keys.
 function Broker:create_topic(name, num_partitions, opts)
     assert(type(name) == "string", "name must be a string")
     assert(type(num_partitions) == "number", "num_partitions must be a number")

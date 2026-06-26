@@ -1,4 +1,4 @@
-local time_m = require("src.time")
+local time_m = require("src.core.time")
 
 describe("time constants", function()
     it("expresses second-scale units as multiples of SECOND", function()

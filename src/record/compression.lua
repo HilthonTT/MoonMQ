@@ -1,5 +1,5 @@
-local msg_m = require("src.message")
-local snappy = require("src.snappy")
+local msg_m = require("src.record.message")
+local snappy = require("src.record.snappy")
 local zlib = require("zlib")
 
 -- CompressionType defines the compression algorithm used

@@ -1,5 +1,5 @@
-local msg_m = require("src.message")
-local seg_m = require("src.segmentation")
+local msg_m = require("src.record.message")
+local seg_m = require("src.storage.segmentation")
 
 local BatchWriter = {}
 BatchWriter.__index = BatchWriter

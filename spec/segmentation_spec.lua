@@ -1,9 +1,9 @@
-local Topic              = require("src.topic")
-local seg_m              = require("src.segmentation")
+local Topic              = require("src.storage.topic")
+local seg_m              = require("src.storage.segmentation")
 local SegmentedPartition = seg_m.SegmentedPartition
-local message            = require("src.message")
-local os_utils           = require("src.utils.os")
-local fs_m               = require("src.fs")
+local message            = require("src.record.message")
+local os_utils           = require("src.core.os")
+local fs_m               = require("src.io.fs")
 
 local BASE_DIR = os_utils.IS_WINDOWS and "C:\\Temp\\lua_seg_test" or "/tmp/lua_seg_test"
 

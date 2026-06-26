@@ -8,7 +8,7 @@
 -- payload + payload_crc(4). Both CRCs are IEEE 802.3 CRC-32 over the
 -- preceding bytes, big-endian.
 
-local crc32 = require("src.crc32")
+local crc32 = require("src.core.crc32")
 
 local Message = {}
 Message.__index = Message

@@ -1,4 +1,4 @@
-local Buffer = require("src.buffer")
+local Buffer = require("src.core.buffer")
 
 describe("Buffer", function()
     local buf

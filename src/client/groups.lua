@@ -1,4 +1,4 @@
-local broker_m = require("src.broker")
+local broker_m = require("src.storage.broker")
 local socket   = require("socket")
 
 local GroupMember = {}

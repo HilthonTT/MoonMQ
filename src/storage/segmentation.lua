@@ -1,11 +1,11 @@
-local topic_m = require("src.topic")
-local time_m = require("src.time")
-local fs_m = require("src.fs")
-local msg_m = require("src.message")
-local crc32 = require("src.crc32")
+local topic_m = require("src.storage.topic")
+local time_m = require("src.core.time")
+local fs_m = require("src.io.fs")
+local msg_m = require("src.record.message")
+local crc32 = require("src.core.crc32")
 local socket = require("socket")
-local io_sync = require("src.io_sync")
-local verify_file = require("src.segment_verify")
+local io_sync = require("src.io.io_sync")
+local verify_file = require("src.storage.segment_verify")
 local log = require("src.log.logger").get("segmentation")
 -- Metrics. Loaded lazily-tolerant: if the server metrics module isn't on
 -- the path (e.g. unit tests run segmentation in isolation), fall back to

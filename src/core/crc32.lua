@@ -2,7 +2,7 @@
 -- Uses zlib via FFI when available (fast path); falls back to a
 -- table-driven pure-Lua implementation otherwise.
 
-local os_utils = require("src.utils.os")
+local os_utils = require("src.core.os")
 
 local has_ffi, ffi = pcall(require, "ffi")
 
