@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.jpg" alt="MoonMQ logo" width="200" style="border-radius: 16px;" />
+</p>
+
 # MoonMQ
 
 A log-structured message broker written in pure Lua. Clients connect over
@@ -152,23 +156,23 @@ The broker exposes two HTTP endpoints on `MetricsHost:MetricsPort`
 
 - `GET /metrics` — Prometheus exposition format. Counters and gauges:
 
-  | Metric                                 | Type      | Labels                |
-  | -------------------------------------- | --------- | --------------------- |
-  | `moonmq_connections_open`              | gauge     | —                     |
-  | `moonmq_connections_accepted_total`    | counter   | —                     |
-  | `moonmq_connections_closed_total`      | counter   | `reason`              |
-  | `moonmq_bytes_sent_total`              | counter   | —                     |
-  | `moonmq_frames_sent_total`             | counter   | —                     |
-  | `moonmq_frames_received_total`         | counter   | `op`                  |
-  | `moonmq_send_duration_seconds`         | histogram | —                     |
-  | `moonmq_dispatch_duration_seconds`     | histogram | `op`                  |
-  | `moonmq_produce_records_total`         | counter   | `topic`               |
-  | `moonmq_idempotent_produce_total`      | counter   | `topic`               |
-  | `moonmq_fetch_records_total`           | counter   | `topic`               |
-  | `moonmq_segment_rolls_total`           | counter   | `topic`               |
-  | `moonmq_fsync_duration_seconds`        | histogram | `topic`               |
-  | `moonmq_topic_count`                   | gauge     | —                     |
-  | `moonmq_partition_log_bytes`           | gauge     | `topic`, `partition`  |
+  | Metric                              | Type      | Labels               |
+  | ----------------------------------- | --------- | -------------------- |
+  | `moonmq_connections_open`           | gauge     | —                    |
+  | `moonmq_connections_accepted_total` | counter   | —                    |
+  | `moonmq_connections_closed_total`   | counter   | `reason`             |
+  | `moonmq_bytes_sent_total`           | counter   | —                    |
+  | `moonmq_frames_sent_total`          | counter   | —                    |
+  | `moonmq_frames_received_total`      | counter   | `op`                 |
+  | `moonmq_send_duration_seconds`      | histogram | —                    |
+  | `moonmq_dispatch_duration_seconds`  | histogram | `op`                 |
+  | `moonmq_produce_records_total`      | counter   | `topic`              |
+  | `moonmq_idempotent_produce_total`   | counter   | `topic`              |
+  | `moonmq_fetch_records_total`        | counter   | `topic`              |
+  | `moonmq_segment_rolls_total`        | counter   | `topic`              |
+  | `moonmq_fsync_duration_seconds`     | histogram | `topic`              |
+  | `moonmq_topic_count`                | gauge     | —                    |
+  | `moonmq_partition_log_bytes`        | gauge     | `topic`, `partition` |
 
   `moonmq_partition_log_bytes` is per-partition — at the default
   `MaxTopics=1024` with a typical partition count this stays a few
@@ -301,13 +305,13 @@ The `busted` binary at `/usr/local/bin/busted` is installed by `make deps` and i
 
 Current coverage:
 
-| Spec file                | Module under test                                  |
-| ------------------------ | -------------------------------------------------- |
-| `buffer_spec.lua`        | `src/core/buffer.lua` — accumulating byte buffer        |
-| `crc32_spec.lua`         | `src/core/crc32.lua` — IEEE 802.3 CRC-32                |
-| `future_spec.lua`        | `src/core/future.lua` — one-shot coroutine future       |
-| `message_spec.lua`       | `src/record/message.lua` — message wire format          |
-| `partition_spec.lua`     | `src/storage/partition.lua` — append, read, recovery    |
-| `time_spec.lua`          | `src/core/time.lua` — duration constants                |
+| Spec file                | Module under test                                          |
+| ------------------------ | ---------------------------------------------------------- |
+| `buffer_spec.lua`        | `src/core/buffer.lua` — accumulating byte buffer           |
+| `crc32_spec.lua`         | `src/core/crc32.lua` — IEEE 802.3 CRC-32                   |
+| `future_spec.lua`        | `src/core/future.lua` — one-shot coroutine future          |
+| `message_spec.lua`       | `src/record/message.lua` — message wire format             |
+| `partition_spec.lua`     | `src/storage/partition.lua` — append, read, recovery       |
+| `time_spec.lua`          | `src/core/time.lua` — duration constants                   |
 | `topic_manager_spec.lua` | `src/storage/topic_manager.lua` — topic/partition creation |
-| `util_spec.lua`          | `src/core/util.lua` — topic-name validation             |
+| `util_spec.lua`          | `src/core/util.lua` — topic-name validation                |
