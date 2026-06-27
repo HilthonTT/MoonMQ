@@ -22,20 +22,31 @@ local io_sync = require("src.io.io_sync")
 local FILE_NAME = "topic.config"
 
 -- Keys we recognise. Anything else in the file is dropped on read; any
--- extra keys handed to save() are ignored. Kept as an array (not a set)
--- so save() writes in a stable order — easier to diff.
-local KNOWN_KEYS = {
+-- extra keys handed to save() are ignored. Kept as arrays (not sets) so
+-- save() writes in a stable order — easier to diff. Numeric keys are parsed
+-- with tonumber (a non-numeric value is an error); string keys (the storage
+-- backend selector and its cleanup policy) are stored verbatim.
+local NUMBER_KEYS = {
     "max_segment_size",
     "retention",
     "cleaner_interval",
+    "max_log_bytes",
 }
 
-local function is_known(key)
-    for i = 1, #KNOWN_KEYS do
-        if KNOWN_KEYS[i] == key then return true end
+local STRING_KEYS = {
+    "backend",
+    "cleanup_policy",
+}
+
+local function in_list(list, key)
+    for i = 1, #list do
+        if list[i] == key then return true end
     end
     return false
 end
+
+local function is_number_key(key) return in_list(NUMBER_KEYS, key) end
+local function is_string_key(key) return in_list(STRING_KEYS, key) end
 
 -- Returns the table of opts loaded from the sidecar. An absent file
 -- returns an empty table (callers treat that as "use defaults"); a
@@ -67,7 +78,7 @@ local function load(topic_dir)
                 return nil, string.format(
                     "%s: malformed line %d: %q", path, lineno, line)
             end
-            if is_known(key) then
+            if is_number_key(key) then
                 local n = tonumber(val)
                 if not n then
                     return nil, string.format(
@@ -75,6 +86,8 @@ local function load(topic_dir)
                         path, key, lineno, val)
                 end
                 opts[key] = n
+            elseif is_string_key(key) then
+                opts[key] = val
             end
             -- Unknown key: silently ignored (forward-compat).
         end
@@ -83,17 +96,18 @@ local function load(topic_dir)
     return opts, nil
 end
 
--- Writes the sidecar atomically (tmp + rename). Only the three known
--- keys are emitted, in KNOWN_KEYS order. Non-numeric values are
--- rejected; nil values are skipped (so partial opts work and the
--- defaults path covers the rest on load).
+-- Writes the sidecar atomically (tmp + rename). Only known keys are emitted,
+-- numeric keys first then string keys, each in declaration order. A numeric
+-- key with a non-number value (or a string key with a non-string value) is
+-- rejected; nil values are skipped (so partial opts work and the defaults
+-- path covers the rest on load).
 local function save(topic_dir, opts)
     assert(type(topic_dir) == "string", "topic_dir must be a string")
     assert(type(opts) == "table", "opts must be a table")
 
     local lines = {}
-    for i = 1, #KNOWN_KEYS do
-        local key = KNOWN_KEYS[i]
+    for i = 1, #NUMBER_KEYS do
+        local key = NUMBER_KEYS[i]
         local val = opts[key]
         if val ~= nil then
             if type(val) ~= "number" then
@@ -104,6 +118,17 @@ local function save(topic_dir, opts)
             -- integer-looking form for the integer values we ship and
             -- still round-trips through tonumber on load.
             lines[#lines + 1] = string.format("%s=%.f", key, val)
+        end
+    end
+    for i = 1, #STRING_KEYS do
+        local key = STRING_KEYS[i]
+        local val = opts[key]
+        if val ~= nil then
+            if type(val) ~= "string" then
+                return false, string.format(
+                    "opts.%s must be a string, got %s", key, type(val))
+            end
+            lines[#lines + 1] = string.format("%s=%s", key, val)
         end
     end
 

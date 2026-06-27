@@ -60,8 +60,58 @@ local function serialize_message(msg)
         .. string.pack(">I4", payload_crc), nil
 end
 
+local HEADER_LEN = 12
+
+--- Reads exactly one record from `file` at its current position, validating
+--- both CRCs, and returns (Message, framed_size, nil) where framed_size is the
+--- total on-disk byte length consumed (8-byte length prefix + body). On a
+--- short read (EOF / torn tail) or a corrupt record it returns
+--- (nil, nil, err). Mirrors the decode logic in Partition:read_message /
+--- SegmentedPartition:read_message so all readers stay in lock-step.
+local function deserialize_record(file)
+    local size_bytes = file:read(8)
+    if not size_bytes or #size_bytes < 8 then
+        return nil, nil, "failed to read message size: unexpected EOF"
+    end
+    local total_size = string.unpack(">I8", size_bytes)
+
+    local body = file:read(total_size)
+    if not body or #body < total_size then
+        return nil, nil, "failed to read message body: unexpected EOF"
+    end
+
+    if total_size < HEADER_LEN + 4 + 4 then
+        return nil, nil, "corrupt header: total_size too small"
+    end
+
+    local header_bytes       = body:sub(1, HEADER_LEN)
+    local stored_header_crc  = string.unpack(">I4", body, HEADER_LEN + 1)
+    local payload_start      = HEADER_LEN + 4 + 1
+    local payload_end        = #body - 4
+    local payload            = body:sub(payload_start, payload_end)
+    local stored_payload_crc = string.unpack(">I4", body, payload_end + 1)
+
+    if crc32(header_bytes) ~= stored_header_crc then
+        return nil, nil, "header checksum mismatch"
+    end
+    if crc32(payload) ~= stored_payload_crc then
+        return nil, nil, "payload checksum mismatch"
+    end
+
+    local key_size, timestamp = string.unpack(">I4I8", header_bytes)
+    if key_size < 0 or key_size > #payload then
+        return nil, nil, "corrupt header: key_size out of range"
+    end
+
+    local key   = payload:sub(1, key_size)
+    local value = payload:sub(key_size + 1)
+
+    return Message.new(key, value, timestamp), 8 + total_size, nil
+end
+
 return {
     Message = Message,
     MessageHeader = MessageHeader,
     serialize_message = serialize_message,
+    deserialize_record = deserialize_record,
 }

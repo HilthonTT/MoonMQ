@@ -85,7 +85,9 @@ function Server.new(opts)
     opts = opts or {}
     assert(opts.data_dir, "opts.data_dir required")
 
-    local broker, berr = brk_m.Broker.new(opts.data_dir)
+    local broker, berr = brk_m.Broker.new(opts.data_dir, {
+        default_backend = opts.default_backend,
+    })
     if not broker then return nil, berr end
 
     -- Seed the topic_count gauge from what we just loaded so the gauge

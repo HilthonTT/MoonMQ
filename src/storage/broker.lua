@@ -6,15 +6,25 @@ local util_m     = require("src.core.util")
 local Broker = {}
 Broker.__index = Broker
 
-function Broker.new(data_dir)
+-- opts (optional):
+--   default_backend  storage backend for topics that don't request one
+--                    ("segmented" | "commitlog"; default "segmented"). Per-topic
+--                    `backend` opts and persisted sidecars still take precedence.
+function Broker.new(data_dir, opts)
     assert(type(data_dir) == "string", "data dir must be a string")
+    if opts ~= nil then
+        assert(type(opts) == "table", "opts must be a table or nil")
+    end
+    opts = opts or {}
 
     local success, err = fs_m.mkdir(data_dir)
     if not success then
         return nil, err
     end
 
-    local topic_manager = tpm_m.new(data_dir)
+    local topic_manager = tpm_m.new(data_dir, {
+        default_backend = opts.default_backend,
+    })
     local broker = setmetatable({
         topic_manager = topic_manager,
     }, Broker)

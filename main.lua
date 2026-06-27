@@ -87,6 +87,9 @@ if is_main(arg, ...) then
     local gc = s.GroupCommit or {}
     local srv = assert(Server.new({
         data_dir               = s.DataDir or "./data_server",
+        -- Storage engine for topics that don't pin one themselves: "segmented"
+        -- (default) or "commitlog". Per-topic config sidecars still win.
+        default_backend        = s.StorageBackend,
         host                   = s.Host or "0.0.0.0",
         port                   = s.Port or 9092,
         max_connections        = s.MaxConnections,
