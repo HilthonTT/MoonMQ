@@ -315,3 +315,9 @@ Current coverage:
 | `time_spec.lua`          | `src/core/time.lua` — duration constants                   |
 | `topic_manager_spec.lua` | `src/storage/topic_manager.lua` — topic/partition creation |
 | `util_spec.lua`          | `src/core/util.lua` — topic-name validation                |
+
+Credit:
+
+https://github.com/kyleconroy/lua-state-machine/tree/master
+https://github.com/travisjeffery/jocko/tree/master
+https://support.tools/post/building-kafka-clone-in-go/
