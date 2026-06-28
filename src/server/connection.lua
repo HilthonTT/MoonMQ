@@ -91,6 +91,12 @@ function Connection.new(server, sock, peer, ip)
         consumer = nil,
         subscriptions = {},
         mode = nil,  -- "push" (SUBSCRIBE) | "pull" (FETCH)
+        -- Consumer-group membership. Set by JOIN_GROUP; one connection maps
+        -- to at most one (group_id, member_id). Cleared on LEAVE_GROUP, and
+        -- the server departs the group automatically when the conn closes
+        -- (see Server:_unregister_conn).
+        group_id = nil,
+        member_id = nil,
         rate_limiter = server.rate_limiter_factory
                           and server.rate_limiter_factory() or nil,
         -- Idempotent producer state. pid is set once via INIT_PRODUCER_ID

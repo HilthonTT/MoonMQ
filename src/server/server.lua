@@ -28,6 +28,7 @@ local uuid        = require("src.server.uuid")
 local brk_m       = require("src.storage.broker")
 local prd_m       = require("src.client.producer")
 local consumer_m  = require("src.client.consumer")
+local groups_m    = require("src.client.groups")
 local msg_m       = require("src.record.message")
 local metrics     = require("src.server.metrics")
 local MetricsHttp = require("src.server.metrics_http")
@@ -77,6 +78,12 @@ local DEFAULT_MAX_LIST_TOPICS = 1024
 -- request fsync) but with the segregated IO threads we don't yet have.
 local DEFAULT_GROUP_COMMIT_LINGER_S    = 0.002
 local DEFAULT_GROUP_COMMIT_MAX_WAITERS = 64
+-- How often the coordinator ticks ConsumerGroup:check_heartbeats to evict
+-- members that stopped sending GROUP_HEARTBEAT. The group's own session
+-- deadline is 30s (src/client/groups.lua); polling every 10s detects a
+-- dead member within ~10s of the deadline, which is plenty responsive for
+-- a rebalance without spinning the reactor.
+local DEFAULT_GROUP_REAPER_INTERVAL_S  = 10
 
 local Server = {}
 Server.__index = Server
@@ -140,6 +147,15 @@ function Server.new(opts)
                                    or DEFAULT_GROUP_COMMIT_LINGER_S,
         group_commit_max_waiters = opts.group_commit_max_waiters
                                    or DEFAULT_GROUP_COMMIT_MAX_WAITERS,
+
+        -- Consumer-group coordinators, keyed by group_id. Shared across
+        -- connections (each connection is one member), created lazily on
+        -- the first JOIN_GROUP for a group. The reaper loop in :start()
+        -- ages out members that stop heartbeating.
+        groups                = {},
+        group_reaper_interval = opts.group_reaper_interval
+                                or DEFAULT_GROUP_REAPER_INTERVAL_S,
+        running               = false,
     }, Server)
 end
 
@@ -160,6 +176,16 @@ function Server:_unregister_conn(conn)
     -- close() is idempotent; bail if already unregistered.
     if self.connections_by_id[conn.id] == nil then return end
     self.connections_by_id[conn.id] = nil
+
+    -- A member's connection dropping is an implicit LEAVE_GROUP — depart
+    -- now and rebalance survivors rather than waiting out the heartbeat
+    -- deadline. Guarded by connections_by_id above so it runs exactly once.
+    if conn.group_id then
+        local group = self.groups[conn.group_id]
+        if group then group:leave(conn.member_id) end
+        conn.group_id = nil
+        conn.member_id = nil
+    end
 
     if self.connections > 0 then
         self.connections = self.connections - 1
@@ -226,6 +252,9 @@ function Server:dispatch(conn, op, correl, payload)
     elseif op == proto.OP_COMMIT             then self:_handle_commit(conn, correl, payload)
     elseif op == proto.OP_CREATE_TOPIC       then self:_handle_create_topic(conn, correl, payload)
     elseif op == proto.OP_LIST_TOPICS        then self:_handle_list_topics(conn, correl, payload)
+    elseif op == proto.OP_JOIN_GROUP         then self:_handle_join_group(conn, correl, payload)
+    elseif op == proto.OP_LEAVE_GROUP        then self:_handle_leave_group(conn, correl, payload)
+    elseif op == proto.OP_GROUP_HEARTBEAT    then self:_handle_group_heartbeat(conn, correl, payload)
     elseif op == proto.OP_GOODBYE            then conn:close(Connection.REASON_CLIENT_GOODBYE)
     else
         conn:send(proto.encode_error(correl, proto.ERR_UNKNOWN_OP,
@@ -614,6 +643,124 @@ function Server:_handle_list_topics(conn, correl, _payload)
     conn:send(proto.encode_topic_list(correl, all))
 end
 
+-- Lazily fetch (or create) the coordinator for a group. Shared across all
+-- connections whose members belong to the group.
+function Server:_get_or_create_group(group_id)
+    local group = self.groups[group_id]
+    if not group then
+        group = groups_m.ConsumerGroup.new(self.broker, group_id)
+        self.groups[group_id] = group
+    end
+    return group
+end
+
+-- JOIN_GROUP: register this connection as a member of a group subscribing
+-- to one or more topics, and reply with the partitions assigned to it.
+-- An empty member_id means "first join, assign me one" — we use the
+-- connection's short id so it's stable for this connection's lifetime.
+function Server:_handle_join_group(conn, correl, payload)
+    local j, err = proto.decode_join_group(payload)
+    if not j then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+    if #j.topics == 0 then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
+            "join_group requires at least one topic"))
+        return
+    end
+    -- One group membership per connection: a connection already bound to a
+    -- different group must LEAVE_GROUP (or reconnect) before joining another.
+    if conn.group_id and conn.group_id ~= j.group_id then
+        conn:send(proto.encode_error(correl, proto.ERR_GROUP_CONFLICT,
+            string.format("connection already in group %s", conn.group_id)))
+        return
+    end
+
+    local member_id = j.member_id
+    if member_id == "" then
+        member_id = conn.member_id or conn.id_short
+    end
+
+    local group = self:_get_or_create_group(j.group_id)
+    local assignment, jerr = group:join(member_id, j.topics)
+    if not assignment then
+        -- join() fails when a subscribed topic doesn't exist, or the group
+        -- has been closed. Map the missing-topic case to a precise code.
+        local code = (jerr and jerr:find("get topic", 1, true))
+            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
+        conn:send(proto.encode_error(correl, code, jerr or "join failed"))
+        return
+    end
+
+    conn.group_id  = j.group_id
+    conn.member_id = member_id
+    log:info("conn=%s joined group=%s member=%s state=%s",
+        conn.id_short, j.group_id, member_id, group:state())
+    conn:send(proto.encode_group_assignment(correl, member_id, assignment))
+end
+
+-- LEAVE_GROUP: voluntary departure. Survivors rebalance; an emptied group
+-- collapses back to its empty state (handled inside ConsumerGroup:leave).
+function Server:_handle_leave_group(conn, correl, payload)
+    local l, err = proto.decode_leave_group(payload)
+    if not l then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+    local group = self.groups[l.group_id]
+    if not group or conn.group_id ~= l.group_id then
+        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
+            "not a member of this group"))
+        return
+    end
+
+    group:leave(conn.member_id)
+    log:info("conn=%s left group=%s member=%s state=%s",
+        conn.id_short, l.group_id, conn.member_id, group:state())
+    conn.group_id  = nil
+    conn.member_id = nil
+    conn:send(proto.encode_ok(correl))
+end
+
+-- GROUP_HEARTBEAT: renew the member's lease so the reaper doesn't evict it.
+-- A heartbeat for a member the coordinator has already reaped (or never
+-- saw) returns GROUP_MEMBER_UNKNOWN, signalling the client to re-JOIN_GROUP.
+function Server:_handle_group_heartbeat(conn, correl, payload)
+    local h, err = proto.decode_group_heartbeat(payload)
+    if not h then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+    local group = self.groups[h.group_id]
+    if not group or conn.group_id ~= h.group_id then
+        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
+            "not a member of this group"))
+        return
+    end
+
+    local ok, herr = group:heartbeat(conn.member_id)
+    if not ok then
+        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
+            herr or "unknown member"))
+        return
+    end
+    conn:send(proto.encode_ok(correl))
+end
+
+-- Periodically age out group members that stopped heartbeating. Runs for
+-- the lifetime of the reactor; ConsumerGroup:check_heartbeats evicts stale
+-- members and rebalances survivors (or collapses an emptied group).
+function Server:_run_group_reaper()
+    while self.running do
+        self.reactor:sleep(self.group_reaper_interval)
+        if not self.running then return end
+        for _, group in pairs(self.groups) do
+            group:check_heartbeats()
+        end
+    end
+end
+
 -- Install handlers for SIGINT, SIGTERM, and SIGTSTP (Ctrl+Z) so the
 -- reactor stops on the next tick. The handler must do as little as
 -- possible — just flip the flag. Real teardown happens after run()
@@ -660,6 +807,11 @@ function Server:start()
 
     self:_install_signal_handlers()
 
+    -- Start the consumer-group reaper. running gates its loop so it exits
+    -- cleanly when the reactor stops (set false after :run() returns).
+    self.running = true
+    self.reactor:spawn(function() self:_run_group_reaper() end)
+
     log:info("listening on %s:%d (proto v%d, %s/%s)",
         self.host, self.port, proto.PROTOCOL_VERSION,
         proto.SERVER_NAME, proto.SERVER_VERSION)
@@ -675,6 +827,7 @@ function Server:start()
     end
 
     self.reactor:run()
+    self.running = false
 
     -- Reactor returned (signal or :stop()). Drain any pending group-
     -- commit waiters before closing sockets so producers parked on
@@ -748,9 +901,9 @@ function Server:snapshot()
         server = {
             name           = proto.SERVER_NAME,
             version        = proto.SERVER_VERSION,
-            protocol       = proto.PROTOCOL_VERSION,
-            host           = self.host,
-            port           = self.port,
+            protocol      = proto.PROTOCOL_VERSION,
+            host                   = self.host,
+            port                   = self.port,
         },
         connections = {
             open                  = self.connections,
@@ -759,10 +912,10 @@ function Server:snapshot()
         },
         topics = {
             count                 = #self.broker:list_topics(),
-            max                   = self.max_topics,
+            max                            = self.max_topics,
             listed                = #topic_summaries,
             listed_truncated      = truncated,
-            top_by_bytes          = top_n,
+            top_by_bytes            = top_n,
         },
     }
 end

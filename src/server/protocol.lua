@@ -43,6 +43,16 @@ M.OP_IDENTIFY_CLIENT  = 0x0D
 M.OP_INIT_PRODUCER_ID = 0x0E
 M.OP_PRODUCE_IDEMPOTENT = 0x0F
 
+-- Consumer-group coordination (Kafka-style). JOIN_GROUP registers this
+-- connection as a member subscribing to one or more topics and gets back
+-- the partition assignment the broker's ConsumerGroup computed for it.
+-- GROUP_HEARTBEAT renews the member's lease (distinct from the connection
+-- liveness HEARTBEAT_REQ/RESP); LEAVE_GROUP departs voluntarily. A member
+-- is also dropped automatically when its connection closes.
+M.OP_JOIN_GROUP       = 0x10
+M.OP_LEAVE_GROUP      = 0x11
+M.OP_GROUP_HEARTBEAT  = 0x12
+
 -- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
@@ -57,6 +67,7 @@ M.OP_PONG          = 0x85
 M.OP_OK            = 0x86
 M.OP_IDENTIFY_ACK  = 0x87
 M.OP_PRODUCER_ID   = 0x88
+M.OP_GROUP_ASSIGNMENT = 0x89
 M.OP_ERROR         = 0xFE
 
 -- Correlation IDs are 16-byte UUIDs.
@@ -80,6 +91,14 @@ M.ERR_FRAME_TOO_LARGE      = 9
 --   error fires only when sequences appear truly out of order (gap).
 M.ERR_NO_PRODUCER_ID       = 10
 M.ERR_OUT_OF_ORDER_SEQUENCE = 11
+-- Consumer-group error codes.
+-- GROUP_MEMBER_UNKNOWN: heartbeat/leave naming a member the coordinator
+--   has no record of — either it was reaped for inactivity (client should
+--   re-JOIN_GROUP) or it never joined on this connection.
+-- GROUP_CONFLICT: a connection tried to join a second, different group;
+--   one connection maps to at most one group membership.
+M.ERR_GROUP_MEMBER_UNKNOWN = 12
+M.ERR_GROUP_CONFLICT       = 13
 
 local function encode_string(s)
     assert(type(s) == "string", "s must be a string")
@@ -236,6 +255,57 @@ function M.encode_list_topics(correl_id)
     return encode_frame(M.OP_LIST_TOPICS, correl_id, "")
 end
 
+-- Consumer-group wire formats.
+--
+-- JOIN_GROUP request:
+--   string group_id | string member_id | u32 topic_count | (string topic)*
+-- An empty member_id asks the broker to assign one (first join); the
+-- assigned id comes back in the GROUP_ASSIGNMENT reply.
+function M.encode_join_group(correl_id, group_id, member_id, topics)
+    local parts = {
+        encode_string(group_id),
+        encode_string(member_id),
+        string.pack(">I4", #topics),
+    }
+    for i = 1, #topics do
+        parts[#parts + 1] = encode_string(topics[i])
+    end
+    return encode_frame(M.OP_JOIN_GROUP, correl_id, table.concat(parts))
+end
+
+-- GROUP_ASSIGNMENT reply:
+--   string member_id | u32 topic_count
+--     | (string topic | u32 part_count | (u32 partition_id)*)*
+-- `assignment` is { [topic] = { partition_id, ... }, ... }. Topics are
+-- emitted in sorted order so the wire bytes are deterministic.
+function M.encode_group_assignment(correl_id, member_id, assignment)
+    local topics = {}
+    for topic in pairs(assignment) do topics[#topics + 1] = topic end
+    table.sort(topics)
+
+    local parts = { encode_string(member_id), string.pack(">I4", #topics) }
+    for _, topic in ipairs(topics) do
+        local ids = assignment[topic]
+        parts[#parts + 1] = encode_string(topic)
+        parts[#parts + 1] = string.pack(">I4", #ids)
+        for i = 1, #ids do
+            parts[#parts + 1] = string.pack(">I4", ids[i])
+        end
+    end
+    return encode_frame(M.OP_GROUP_ASSIGNMENT, correl_id, table.concat(parts))
+end
+
+-- LEAVE_GROUP / GROUP_HEARTBEAT share a body: string group_id | string member_id.
+function M.encode_leave_group(correl_id, group_id, member_id)
+    return encode_frame(M.OP_LEAVE_GROUP, correl_id,
+        encode_string(group_id) .. encode_string(member_id))
+end
+
+function M.encode_group_heartbeat(correl_id, group_id, member_id)
+    return encode_frame(M.OP_GROUP_HEARTBEAT, correl_id,
+        encode_string(group_id) .. encode_string(member_id))
+end
+
 function M.encode_goodbye(correl_id)
     return encode_frame(M.OP_GOODBYE, correl_id, "")
 end
@@ -280,10 +350,17 @@ M.MAX_STRING_LEN = MAX_STRING_LEN
 -- to remember to add a second check.
 local MAX_TOPIC_NAME    = 249
 local MAX_GROUP_ID      = 256
+local MAX_MEMBER_ID     = 256
 local MAX_CLIENT_NAME   = 128
 local MAX_CLIENT_VERSION = 64
+-- Cap topics-per-join so a single JOIN_GROUP frame can't ask us to
+-- decode an attacker-chosen number of length-prefixed strings. 256 is
+-- far above any realistic subscription set.
+local MAX_GROUP_TOPICS  = 256
 M.MAX_TOPIC_NAME = MAX_TOPIC_NAME
 M.MAX_GROUP_ID   = MAX_GROUP_ID
+M.MAX_MEMBER_ID  = MAX_MEMBER_ID
+M.MAX_GROUP_TOPICS = MAX_GROUP_TOPICS
 
 function M.decode_hello(payload)
     if #payload < 4 then return nil, "short hello" end
@@ -328,6 +405,69 @@ function M.decode_fetch(payload)
         max_records = string.unpack(">I4", payload, p2),
     }, nil
 end
+
+function M.decode_join_group(payload)
+    local group, p, gerr = decode_string(payload, 1, MAX_GROUP_ID)
+    if not group then return nil, gerr end
+    local member, p2, merr = decode_string(payload, p, MAX_MEMBER_ID)
+    if not member then return nil, merr end
+    if #payload - p2 + 1 < 4 then return nil, "short join_group topic count" end
+
+    local count, pos = string.unpack(">I4", payload, p2)
+    if count > MAX_GROUP_TOPICS then
+        return nil, string.format("too many topics (%d > %d)", count, MAX_GROUP_TOPICS)
+    end
+
+    local topics = {}
+    for i = 1, count do
+        local t, np, terr = decode_string(payload, pos, MAX_TOPIC_NAME)
+        if not t then return nil, terr end
+        topics[i] = t
+        pos = np
+    end
+    return { group_id = group, member_id = member, topics = topics }, nil
+end
+
+-- Inverse of encode_group_assignment. Returns
+-- { member_id, assignment = { [topic] = { partition_id, ... } } }.
+function M.decode_group_assignment(payload)
+    local member, p, merr = decode_string(payload, 1, MAX_MEMBER_ID)
+    if not member then return nil, merr end
+    if #payload - p + 1 < 4 then return nil, "short assignment topic count" end
+
+    local tcount, pos = string.unpack(">I4", payload, p)
+    local assignment = {}
+    for _ = 1, tcount do
+        local topic, np, terr = decode_string(payload, pos, MAX_TOPIC_NAME)
+        if not topic then return nil, terr end
+        pos = np
+
+        if #payload - pos + 1 < 4 then return nil, "short assignment partition count" end
+        local pcount, pp = string.unpack(">I4", payload, pos)
+        pos = pp
+
+        local ids = {}
+        for i = 1, pcount do
+            if #payload - pos + 1 < 4 then return nil, "short assignment partition id" end
+            local id, npp = string.unpack(">I4", payload, pos)
+            ids[i] = id
+            pos = npp
+        end
+        assignment[topic] = ids
+    end
+    return { member_id = member, assignment = assignment }, nil
+end
+
+-- LEAVE_GROUP and GROUP_HEARTBEAT carry the same body.
+local function decode_group_member_ref(payload)
+    local group, p, gerr = decode_string(payload, 1, MAX_GROUP_ID)
+    if not group then return nil, gerr end
+    local member, _, merr = decode_string(payload, p, MAX_MEMBER_ID)
+    if not member then return nil, merr end
+    return { group_id = group, member_id = member }, nil
+end
+M.decode_leave_group     = decode_group_member_ref
+M.decode_group_heartbeat = decode_group_member_ref
 
 function M.decode_identify_client(payload)
     local name, p, err = decode_string(payload, 1, MAX_CLIENT_NAME)

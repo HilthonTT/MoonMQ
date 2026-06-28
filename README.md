@@ -222,6 +222,103 @@ Out-of-order or skipped sequences are rejected with
 records. `ERR_NO_PRODUCER_ID` (code `10`) fires if the client sends
 `PRODUCE_IDEMPOTENT` without first calling `INIT_PRODUCER_ID`.
 
+### Consumer groups
+
+A topic's partitions can be shared across a group of consumers so each
+partition is owned by exactly one member. `src/client/groups.lua` provides
+the server-side coordinator (`ConsumerGroup`) that tracks membership,
+assigns partitions with a Kafka-style **range** strategy, and ages out
+members that stop heartbeating. Durable per-group offsets are kept
+separately by the `OffsetManager` (the internal `__consumer_offsets`
+topic), so a rebalanced consumer resumes from the committed position.
+
+The group's lifecycle is an explicit finite-state machine
+(`src/fsm/state_machine.lua`), mirroring Kafka's GroupCoordinator:
+
+```
+        join (1st member)        membership settled       assignments synced
+empty ──────────────────▶ preparing_rebalance ─▶ completing_rebalance ─▶ stable
+  ▲                              │                                          │
+  │ last member leaves / evicted │  another join or leave triggers a new    │
+  └──────────────────────────────┴──────────── rebalance ◀──────────────────┘
+
+  any state ──close()──▶ dead   (terminal: join/leave/heartbeat all reject)
+```
+
+A single broker drives joins synchronously, so one `join`/`leave` walks the
+group straight through `preparing → completing → stable`. The FSM still pays
+its way: it makes the state inspectable (`group:state()`), guards operations
+that are illegal in the current state (you can't heartbeat a `dead` group),
+and gives one place to log every transition.
+
+```lua
+local brk_m   = require("src.storage.broker")
+local group_m = require("src.client.groups")
+
+local broker = assert(brk_m.Broker.new("./data_server"))
+assert(broker:create_topic("orders", 4))
+
+local g = group_m.ConsumerGroup.new(broker, "billing")
+assert(g:state() == group_m.STATES.EMPTY)
+
+-- First member owns every partition; the group is now stable.
+local m1 = assert(g:join("m1", { "orders" }))   -- m1.orders = {1,2,3,4}
+
+-- Second member triggers a rebalance: range splits 4 partitions 2-and-2.
+local m2 = assert(g:join("m2", { "orders" }))   -- m2.orders = {3,4}
+assert(g:state() == group_m.STATES.STABLE)
+
+-- Members renew their lease; the reaper evicts anyone past the 30s deadline.
+g:heartbeat("m1")
+g:check_heartbeats()
+
+g:leave("m2")          -- survivors rebalance; an emptied group returns to EMPTY
+g:close()              -- terminal: g:state() == group_m.STATES.DEAD
+```
+
+A runnable, in-process walkthrough of the whole lifecycle (with the state
+printed after each step) lives at `src/examples/consumer_group.lua`:
+
+```bash
+lua5.4 src/examples/consumer_group.lua
+```
+
+#### Over the wire
+
+The coordinator is reachable over TCP. A connected client uses
+`JOIN_GROUP` / `GROUP_HEARTBEAT` / `LEAVE_GROUP`; the broker keeps one
+`ConsumerGroup` per group id, shared across all member connections. A
+connection is at most one member — when it drops, the broker departs the
+group on its behalf and rebalances the survivors. Members that stop
+heartbeating past the 30s session deadline are reaped by a background loop
+(every 10s by default; see `group_reaper_interval`).
+
+```lua
+local Client = require("src.client")
+
+local c = assert(Client.new{ host = "127.0.0.1", port = 9092,
+                             username = "admin", password = "admin" })
+
+-- Pass no member_id on the first join; the broker assigns one and the
+-- client remembers it for subsequent heartbeats/leave.
+local res = assert(c:join_group("billing", { "orders" }))
+-- res = { member_id = "...", assignment = { orders = { 1, 2, 3, 4 } } }
+
+assert(c:group_heartbeat())   -- renew the lease (uses the remembered ids)
+assert(c:leave_group())       -- or just close the connection
+```
+
+If `group_heartbeat` (or a re-`join_group`) comes back with a
+`GROUP_MEMBER_UNKNOWN` error, the member was reaped for inactivity — the
+client should `join_group` again to get a fresh assignment. Joining a
+second, different group on one connection is rejected with
+`GROUP_CONFLICT`.
+
+> Note: `JOIN_GROUP` hands back the partitions a member owns, but `FETCH` /
+> `SUBSCRIBE` still consume every partition of a subscribed topic — honoring
+> the assignment (each member reading only its partitions) is the natural
+> next step and isn't wired yet.
+
 ## Wire protocol
 
 Clients and the broker speak a compact binary protocol over TCP
@@ -254,9 +351,13 @@ Opcodes are split into client requests (`0x01`–`0x7F`) and server replies
 | `PING`/`GOODBYE`             | client → server | Liveness / clean disconnect              |
 | `INIT_PRODUCER_ID`           | client → server | Request a u64 PID for idempotent produce |
 | `PRODUCE_IDEMPOTENT`         | client → server | Idempotent append: `(PID, seq, ...)`     |
+| `JOIN_GROUP`                 | client → server | Join a consumer group; get an assignment |
+| `LEAVE_GROUP`                | client → server | Depart a consumer group                  |
+| `GROUP_HEARTBEAT`            | client → server | Renew a group member's lease             |
 | `WELCOME` / `AUTH_OK`        | server → client | Handshake / auth acceptance              |
 | `PRODUCE_ACK`                | server → client | Partition + offset of an appended record |
 | `PRODUCER_ID`                | server → client | Assigned u64 PID                         |
+| `GROUP_ASSIGNMENT`           | server → client | Member id + assigned partitions per topic |
 | `RECORD`                     | server → client | A delivered record (fetch or push)       |
 | `TOPIC_LIST` / `PONG` / `OK` | server → client | Query results / acks                     |
 | `ERROR`                      | server → client | Numeric error code + message             |
@@ -310,7 +411,10 @@ Current coverage:
 | `buffer_spec.lua`        | `src/core/buffer.lua` — accumulating byte buffer           |
 | `crc32_spec.lua`         | `src/core/crc32.lua` — IEEE 802.3 CRC-32                   |
 | `future_spec.lua`        | `src/core/future.lua` — one-shot coroutine future          |
+| `group_spec.lua`         | `src/client/groups.lua` — consumer-group lifecycle FSM     |
+| `group_protocol_spec.lua`| `src/server/protocol.lua` — JOIN/LEAVE/HEARTBEAT wire format|
 | `message_spec.lua`       | `src/record/message.lua` — message wire format             |
+| `offset_manager_spec.lua`| `src/storage/offset_manager.lua` — durable group offsets   |
 | `partition_spec.lua`     | `src/storage/partition.lua` — append, read, recovery       |
 | `time_spec.lua`          | `src/core/time.lua` — duration constants                   |
 | `topic_manager_spec.lua` | `src/storage/topic_manager.lua` — topic/partition creation |

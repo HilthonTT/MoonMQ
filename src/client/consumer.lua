@@ -148,19 +148,28 @@ function Consumer:commit_offsets()
     return true, nil
 end
 
--- commit_offset persists a single offset (stub — extend for file/DB storage).
--- Returns (true, nil) on success, (nil, err) on failure.
+-- commit_offset persists a single offset via the broker's OffsetManager
+-- (durable, keyed by this consumer's group). Returns (true, nil) or (nil, err).
 function Consumer:commit_offset(topic_name, partition_id, offset)
-    log:debug("committed offset %d for topic '%s', partition %d",
-        offset, topic_name, partition_id)
+    local ok, err = self.broker:commit_offset(
+        self.group_id, topic_name, partition_id, offset)
+    if not ok then
+        return nil, err
+    end
+    log:debug("committed offset %d for group '%s' topic '%s' partition %d",
+        offset, self.group_id, topic_name, partition_id)
     return true, nil
 end
 
--- load_offset loads a persisted offset from storage.
--- Returns (offset, nil) when found, (nil, "no stored offset") when absent,
--- or (nil, err) on I/O failure. Stub always reports "absent".
+-- load_offset reads the durable committed offset for this group from the
+-- broker's OffsetManager. Returns (offset, nil) when found, or
+-- (nil, "no stored offset") when this group has never committed it.
 function Consumer:load_offset(topic_name, partition_id)
-    return nil, "no stored offset"
+    local offset = self.broker:fetch_offset(self.group_id, topic_name, partition_id)
+    if offset == nil then
+        return nil, "no stored offset"
+    end
+    return offset, nil
 end
 
 return {

@@ -130,6 +130,27 @@ end
 iclient:close()
 print("idempotent demo done.")
 
--- 7. Clean shutdown — sends GOODBYE and closes the socket.
+-- 7. Consumer-group demo over the wire. Join the group (no member_id →
+--    the broker assigns one), inspect the partition assignment, renew the
+--    lease once, then leave. A lone member owns every partition of the
+--    topic.
+print(string.format("join_group(%q, {%q}) ...", group, topic))
+local jres, jerr = client:join_group(group, { topic })
+if not jres then die("join_group: %s", jerr) end
+local owned = jres.assignment[topic] or {}
+print(string.format("  member_id=%s owns partitions {%s}",
+    jres.member_id, table.concat(owned, ", ")))
+
+print("group_heartbeat() ...")
+local hok, herr = client:group_heartbeat()
+if not hok then die("group_heartbeat: %s", herr) end
+print("  lease renewed.")
+
+print("leave_group() ...")
+local lgok, lgerr = client:leave_group()
+if not lgok then die("leave_group: %s", lgerr) end
+print("  left group.")
+
+-- 8. Clean shutdown — sends GOODBYE and closes the socket.
 client:close()
 print("done.")

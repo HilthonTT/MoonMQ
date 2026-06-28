@@ -34,6 +34,11 @@ function Client.new(opts)
         -- application-level dedup.
         pid = nil,
         next_seq = {},  -- topic -> next u32 seq to send
+        -- Consumer-group membership, populated by join_group(). The
+        -- broker-assigned member_id is reused by group_heartbeat/leave_group
+        -- so callers don't have to thread it through every call.
+        group_id = nil,
+        member_id = nil,
     }, Client)
 
     if not c.reactor then
@@ -370,6 +375,79 @@ function Client:list_topics()
         return nil, (proto.decode_error(payload) or { message = "?" }).message
     end
     return proto.decode_topic_list(payload)
+end
+
+-- join_group registers this client as a member of `group_id` subscribing to
+-- `topics` (a topic name or array of names) and returns the broker's
+-- assignment: { member_id = "...", assignment = { [topic] = { part_id, ... } } }.
+-- Pass member_id to rejoin under a known identity; omit it on first join and
+-- the broker assigns one (remembered on the client for heartbeat/leave).
+function Client:join_group(group_id, topics, member_id)
+    assert(type(group_id) == "string", "group_id must be a string")
+    if type(topics) == "string" then topics = { topics } end
+    assert(type(topics) == "table" and #topics > 0, "topics must be a non-empty list")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_join_group(correl, group_id, member_id or "", topics))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_GROUP_ASSIGNMENT then
+        return nil, string.format("expected GROUP_ASSIGNMENT, got 0x%02x", op)
+    end
+
+    local res, derr = proto.decode_group_assignment(payload)
+    if not res then return nil, "decode assignment: " .. tostring(derr) end
+    self.group_id  = group_id
+    self.member_id = res.member_id
+    return res
+end
+
+-- group_heartbeat renews this member's lease. Returns (true, nil), or
+-- (nil, err) — notably when the broker has reaped the member, in which case
+-- the caller should join_group again. Defaults to the joined group/member.
+function Client:group_heartbeat(group_id, member_id)
+    group_id  = group_id  or self.group_id
+    member_id = member_id or self.member_id
+    assert(group_id and member_id, "not a member of any group (call join_group first)")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_group_heartbeat(correl, group_id, member_id))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    return true
+end
+
+-- leave_group departs the group. Returns (true, nil) or (nil, err).
+function Client:leave_group(group_id, member_id)
+    group_id  = group_id  or self.group_id
+    member_id = member_id or self.member_id
+    assert(group_id and member_id, "not a member of any group (call join_group first)")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_leave_group(correl, group_id, member_id))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    self.group_id  = nil
+    self.member_id = nil
+    return true
 end
 
 function Client:close()

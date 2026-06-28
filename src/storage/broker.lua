@@ -2,6 +2,7 @@ local fs_m       = require("src.io.fs")
 local tpm_m      = require("src.storage.topic_manager")
 local topic_config = require("src.storage.topic_config")
 local util_m     = require("src.core.util")
+local offmgr_m   = require("src.storage.offset_manager")
 
 local Broker = {}
 Broker.__index = Broker
@@ -33,6 +34,17 @@ function Broker.new(data_dir, opts)
     if lerr then
         return nil, lerr
     end
+
+    -- Durable consumer offsets live in an internal __consumer_offsets topic.
+    -- Build the manager after user topics are loaded (load_topics will have
+    -- already recreated the internal topic from disk on a restart; the manager
+    -- detects that and replays it rather than re-creating). opts.offsets is an
+    -- optional { num_partitions = N } passed through to first-time creation.
+    local offsets, oerr = offmgr_m.OffsetManager.new(topic_manager, opts.offsets)
+    if not offsets then
+        return nil, oerr
+    end
+    broker.offsets = offsets
 
     return broker, nil
 end
@@ -169,9 +181,24 @@ end
 function Broker:list_topics()
     local topics = {}
     for topic_name, _ in pairs(self.topic_manager.topics) do
-        topics[#topics + 1] = topic_name
+        -- Hide internal topics (e.g. __consumer_offsets) from the public
+        -- listing and from the topic-count cap that gates CREATE_TOPIC.
+        if topic_name:sub(1, 2) ~= "__" then
+            topics[#topics + 1] = topic_name
+        end
     end
     return topics
+end
+
+-- commit_offset / fetch_offset delegate to the OffsetManager. They sit on the
+-- Broker so the per-connection Consumer can reach durable storage through the
+-- broker reference it already holds, without OffsetManager plumbing of its own.
+function Broker:commit_offset(group, topic, partition, offset)
+    return self.offsets:commit(group, topic, partition, offset)
+end
+
+function Broker:fetch_offset(group, topic, partition)
+    return self.offsets:fetch(group, topic, partition)
 end
 
 return {
