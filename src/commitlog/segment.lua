@@ -156,6 +156,20 @@ function Segment:write(record)
     return true, nil
 end
 
+-- rewind undoes the most recent write(s): it truncates the log back to byte
+-- `position` and restores the offset/position counters. The CommitLog uses
+-- this when an index write fails right after a log write, so the segment never
+-- reports a record the index doesn't cover. Returns (true, nil) or (false, err).
+function Segment:rewind(position, next_offset)
+    assert(type(position) == "number", "position must be a number")
+    assert(type(next_offset) == "number", "next_offset must be a number")
+    local ok, err = io_sync.truncate(self.file, position)
+    if not ok then return false, err end
+    self.position    = position
+    self.next_offset = next_offset
+    return true, nil
+end
+
 -- read_at reads the record stored at byte `position`, returning
 -- (Message, framed_size, nil) or (nil, nil, err).
 function Segment:read_at(position)

@@ -929,12 +929,12 @@ function SegmentedPartition:clean_old_segments()
             keep = true
         elseif segment.start_time > cutoff then
             keep = true
-        elseif i > 1
-            and self.segments[i - 1].start_time < cutoff
-            and (i == #self.segments or self.segments[i + 1].start_time > cutoff)
-        then
-            -- Boundary segment: last "old" one before any "new" ones. Keep
-            -- it so consumers can still read recent-ish history after sweep.
+        elseif i < #self.segments and self.segments[i + 1].start_time > cutoff then
+            -- Newest "old" segment: the last one whose successor is still
+            -- inside the retention window. Keep it so consumers can read
+            -- recent-ish history after the sweep. This must fire even when
+            -- it's the only old segment (i == 1) — the old `i > 1` guard
+            -- wrongly deleted a lone sealed segment.
             keep = true
         end
 

@@ -118,8 +118,12 @@ end
 -- by CommitLog:read_at — a single seek + read.
 function Index:lookup(offset)
     assert(type(offset) == "number", "offset must be a number")
-    local _, position = self:read_entry_at_log_offset(offset - self.base_offset)
-    if not position then
+    -- read_entry_at_log_offset returns (abs_offset, position) on success and
+    -- (nil, errstring) on failure. Key off the FIRST value: on the error path
+    -- `position` holds the (truthy) error string, so guarding on it would let
+    -- that string be returned as if it were a valid byte position.
+    local abs, position = self:read_entry_at_log_offset(offset - self.base_offset)
+    if not abs then
         return nil, string.format("offset %d not in index", offset)
     end
     return position, nil

@@ -39,6 +39,14 @@ function M.set(name, value, labels)
     M.gauges[key(name, labels)] = value
 end
 
+-- delete drops a single gauge series. Needed for per-label series whose label
+-- set is unbounded over a process's lifetime (e.g. one series per connection):
+-- without removal they accumulate forever, leaking memory and bloating every
+-- /metrics scrape with dead series.
+function M.delete(name, labels)
+    M.gauges[key(name, labels)] = nil
+end
+
 -- Histogram buckets: explicit boundaries, Prometheus-style. Stores
 -- bucket counts + sum + count, so quantiles are reconstructable.
 -- The "+Inf" bucket is implicit: its count equals h.count (Prometheus

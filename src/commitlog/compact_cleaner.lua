@@ -1,10 +1,12 @@
 -- CompactCleaner performs key-based log compaction: for each key it retains
 -- only the record with the highest offset, dropping superseded versions. Port
--- of jocko's commitlog/compact_cleaner.go (xxhash swapped for the project's
--- CRC-32, which is the hash already vendored here).
+-- of jocko's commitlog/compact_cleaner.go. Jocko keys its latest-offset map on
+-- a 64-bit xxhash of the key; we key on the raw key bytes directly (Lua tables
+-- hash by string value), which is collision-free — a hashed key would let two
+-- distinct keys collide and silently drop one key's records entirely.
 --
 -- Two passes, exactly as jocko:
---   1. Scan every segment building key-hash -> latest-offset.
+--   1. Scan every segment building key -> latest-offset.
 --   2. Re-scan each segment into a ".cleaned" twin, writing back only records
 --      whose key still maps to an offset <= the record's own (i.e. this record
 --      is that key's latest), then atomically replacing the original.
@@ -17,20 +19,18 @@
 
 local segment_m = require("src.commitlog.segment")
 local message_m = require("src.record.message")
-local crc32     = require("src.core.crc32")
 
 local Segment = segment_m.Segment
-
-local function hash(b)
-    return crc32(b)
-end
 
 local CompactCleaner = {}
 CompactCleaner.__index = CompactCleaner
 
 function CompactCleaner.new()
     return setmetatable({
-        -- key-hash -> latest offset seen. Carried across calls, like jocko's.
+        -- key -> latest offset seen. Carried across calls, like jocko's.
+        -- Keyed on the raw key bytes (Lua tables key on string value), so
+        -- distinct keys never collide the way a 32-bit hash would — a
+        -- collision there would silently drop one key's records entirely.
         m = {},
     }, CompactCleaner)
 end
@@ -44,7 +44,7 @@ function CompactCleaner:clean(segments)
     -- Pass 1: latest offset per key.
     for _, seg in ipairs(segments) do
         seg:each(function(offset, msg)
-            self.m[hash(msg.key)] = offset
+            self.m[msg.key] = offset
         end)
     end
 
@@ -57,7 +57,7 @@ function CompactCleaner:clean(segments)
         local write_err
         seg:each(function(offset, msg)
             if write_err then return end
-            if self.m[hash(msg.key)] <= offset then
+            if self.m[msg.key] <= offset then
                 local record, serr = message_m.serialize_message(msg)
                 if not record then
                     write_err = string.format("serialize during compaction: %s",

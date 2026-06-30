@@ -111,6 +111,14 @@ local function set_in_map(map, group, topic, partition, offset)
     t[partition] = offset
 end
 
+-- _partition_for maps a group to its internal partition (1-based). FNV-1a
+-- gives a stable, platform-independent bucket so a group's offset history
+-- always replays from the same partition. The `% nparts` yields 0..nparts-1;
+-- the +1 converts to Lua's 1-based partitions array.
+function OffsetManager:_partition_for(group)
+    return (fnv1a(group) % self.nparts) + 1
+end
+
 -- commit appends an offset record and updates the in-memory map.
 -- Returns (true, nil) or (nil, err).
 function OffsetManager:commit(group, topic, partition, offset)

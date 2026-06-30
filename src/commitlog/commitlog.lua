@@ -220,9 +220,16 @@ function CommitLog:append(record)
     if not ok then return nil, werr end
 
     -- Index the record after the log write succeeds, so we never point the
-    -- index at bytes that failed to land.
+    -- index at bytes that failed to land. If indexing fails, roll the log
+    -- write back: otherwise the segment's next_offset/position would count a
+    -- record the index can't resolve, and a later read of that tail offset
+    -- would fault. `offset` is the pre-write next_offset, so it's exactly the
+    -- counter value to restore.
     local ierr = seg.index:write_entry(offset, position)
-    if ierr then return nil, ierr end
+    if ierr then
+        seg:rewind(position, offset)
+        return nil, ierr
+    end
 
     return offset, nil
 end

@@ -21,6 +21,9 @@ function M.replace(str, old, new)
     assert(type(old) == "string", "old must be a string")
     assert(type(new) == "string", "new must be a string")
 
+    -- An empty `old` has no well-defined replacement and would match endlessly.
+    if old == "" then return str end
+
     local s = str
     local search_start_idx = 1
 
@@ -30,10 +33,13 @@ function M.replace(str, old, new)
             break
         end
 
-        local postfix = s:sub(end_idx + 1)
-        s = s:sub(1, (start_idx - 1)) .. new .. postfix
+        s = s:sub(1, (start_idx - 1)) .. new .. s:sub(end_idx + 1)
 
-        search_start_idx = -1 * postfix:len()
+        -- Resume right after the inserted `new`, as an absolute (positive)
+        -- index. The old `-#postfix` trick became -0 == 0 when the match ended
+        -- at end-of-string; Lua clamps a find init of 0 up to 1, rescanning the
+        -- just-inserted text and looping forever when `new` contains `old`.
+        search_start_idx = start_idx + #new
     end
 
     return s

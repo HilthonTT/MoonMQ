@@ -242,6 +242,10 @@ function Connection:close(reason, err_code, err_msg)
     pcall(function() self.sock:close() end)
     self.server:_unregister_conn(self)
 
+    -- Drop this connection's per-conn gauge series so it doesn't linger in the
+    -- registry (and every scrape) for the life of the process.
+    metrics.delete("moonmq_pending_bytes", { conn = self.id_short })
+
     -- Wake sender so it observes state==closed and exits.
     if self.sender_suspended then
         local co = self.sender_suspended

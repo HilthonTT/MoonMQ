@@ -44,7 +44,18 @@ end
 local function serialize_message(msg)
     assert(getmetatable(msg) == Message, "msg must be a Message instance")
 
-    local header  = string.pack(">I4I8", #msg.key, msg.timestamp)
+    -- The wire format stores the timestamp as an unsigned 64-bit integer.
+    -- Message.new only checks `type == "number"`, so a fractional or negative
+    -- value gets this far; reject it with the module's (nil, err) contract
+    -- rather than letting string.pack raise an opaque "unsigned overflow" /
+    -- "no integer representation" error.
+    local ts = msg.timestamp
+    if ts < 0 or ts % 1 ~= 0 then
+        return nil, string.format(
+            "timestamp must be a non-negative integer, got %s", tostring(ts))
+    end
+
+    local header  = string.pack(">I4I8", #msg.key, ts)
     local payload = msg.key .. msg.value
 
     local header_crc  = crc32(header)

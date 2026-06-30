@@ -113,7 +113,8 @@ end
 
 function Machine:can(e)
   local event = self.events[e]
-  local to = event and event.map[self.current] or event.map['*']
+  if not event then return false, nil end
+  local to = event.map[self.current] or event.map['*']
   return to ~= nil, to
 end
 

@@ -207,6 +207,15 @@ function Reactor:run()
             timeout = math.max(0, math.min(1.0, soonest - socket.gettime()))
         end
 
+        -- Coroutines scheduled during this tick (e.g. a sender woken by
+        -- Connection:send, or a just-fired timer) are sitting in self.ready
+        -- but weren't in the snapshot we drained. Don't block on select/sleep
+        -- while runnable work is pending — poll instead and loop right back to
+        -- the drain, or they'd wait up to a full second to transmit.
+        if #self.ready > 0 then
+            timeout = 0
+        end
+
         if #read_set == 0 and #write_set == 0 then
             socket.sleep(timeout)
         else

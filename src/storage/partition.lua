@@ -22,9 +22,9 @@ local RETRYABLE_PATTERNS = {
 }
 
 local function is_retryable_error(err)
+    if not err then return false end
     assert(type(err) == "string", "err must be a string")
 
-    if not err then return false end
     local low = err:lower()
 
     for i = 1, #RETRYABLE_PATTERNS do

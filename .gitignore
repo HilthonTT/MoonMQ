@@ -43,3 +43,4 @@ luac.out
 
 scripts/venv/
 scripts/__pycache__/
+data_server/

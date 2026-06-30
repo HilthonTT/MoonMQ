@@ -14,8 +14,12 @@ local function deep_merge(base, override)
     if type(override) ~= "table" then return override end
     if type(base) ~= "table" then return deep_merge({}, override) end
 
-    -- Treat as array (replace wholesale) if it looks like one.
-    if override[1] ~= nil then
+    -- Treat as array (replace wholesale) if either side looks like a list.
+    -- We also key off `base` because a JSON empty-array override decodes to {},
+    -- indistinguishable from an empty map by `override[1]` alone; without the
+    -- base check, `"Replicas": []` would fall through to the map-merge branch
+    -- and silently keep the base array instead of clearing it.
+    if override[1] ~= nil or base[1] ~= nil then
         local copy = {}
         for i = 1, #override do copy[i] = override[i] end
         return copy
