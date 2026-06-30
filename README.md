@@ -425,3 +425,4 @@ Credit:
 https://github.com/kyleconroy/lua-state-machine/tree/master
 https://github.com/travisjeffery/jocko/tree/master
 https://support.tools/post/building-kafka-clone-in-go/
+https://github.com/dpapavas/luaprompt
