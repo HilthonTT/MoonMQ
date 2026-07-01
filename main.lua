@@ -3,6 +3,7 @@ local Config = require("src.server.config")
 local auth_m = require("src.server.auth")
 local version_m = require("src.core.version")
 local Log    = require("src.log.logger")
+local repl = require("src.repl.repl")
 
 local log = Log.get("main")
 
@@ -19,6 +20,12 @@ end
 
 local function run_cli_command(argv)
     local cmd = argv and argv[1]
+
+    if cmd == "--repl" then
+        repl()
+        return true
+    end
+
     if cmd == "version" or cmd == "--version" or cmd == "-v" then
         local sub = argv[2]
         if sub == "--json" then

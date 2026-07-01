@@ -8,6 +8,11 @@ deps:
 	$(LUAROCKS) install luasocket
 	$(LUAROCKS) install dkjson
 	$(LUAROCKS) install lua-zlib
+	$(LUAROCKS) install sirocco
+	$(LUAROCKS) install hump
+	$(LUAROCKS) install lpeg
+	$(LUAROCKS) install argparse
+	$(LUAROCKS) install compat53
 	bash scripts/setup-deps.sh
 
 test:

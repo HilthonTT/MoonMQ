@@ -319,6 +319,104 @@ second, different group on one connection is rejected with
 > the assignment (each member reading only its partitions) is the natural
 > next step and isn't wired yet.
 
+## Interactive console (MQL)
+
+MoonMQ ships an interactive console that speaks a small **SQL-like language**
+instead of raw Lua. It connects to a running broker over TCP and lets you
+create topics, produce/fetch records, and drive consumer groups from a prompt.
+
+Launch it from the project root:
+
+```bash
+lua5.4 main.lua --repl
+```
+
+On startup it connects to the local broker (`127.0.0.1:9092`), authenticating
+with the shipped default credentials (`admin`/`admin`). The broker requires an
+`AUTH` handshake even in OPEN mode, so the console always authenticates; use
+`CONNECT ... USER '...' PASSWORD '...'` to point it elsewhere or supply real
+credentials. If the broker drops an idle socket between statements, the console
+transparently reconnects and retries the command. Every statement ends with a semicolon `;` and
+may span multiple lines (the prompt switches to `..>` until you close it).
+Command words are case-insensitive; topic and group names are not. Strings are
+single- or double-quoted (`''` escapes a quote), and `-- ...` is a comment.
+
+The language is implemented as a proper lexer → parser → executor pipeline
+under `src/repl/sql/` (`lexer.lua`, `parser.lua`, `executor.lua`), so the syntax
+is validated with real error positions rather than pattern-matched.
+
+### Command reference
+
+| Statement                                                         | Maps to (client)          |
+| ----------------------------------------------------------------- | ------------------------- |
+| `CONNECT ['host'] [HOST 'h'] [PORT n] [USER 'u'] [PASSWORD 'p'];` | `Client.new`              |
+| `DISCONNECT;`                                                     | `Client:close`            |
+| `CREATE TOPIC <name> [PARTITIONS n];`                             | `create_topic`            |
+| `LIST TOPICS;` (alias `SHOW TOPICS;`)                             | `list_topics`             |
+| `PRODUCE INTO <topic> [KEY '<k>'] VALUE '<payload>';`             | `produce`                 |
+| `FETCH FROM <topic> [GROUP <g>] [LIMIT n];`                       | `fetch`                   |
+| `SUBSCRIBE [TO] <topic> [GROUP <g>] [TIMEOUT secs] [LIMIT n];`    | `subscribe`/`next_record` |
+| `COMMIT <topic> PARTITION <n> OFFSET <n>;`                        | `commit`                  |
+| `CREATE GROUP <name> SUBSCRIBE <topic>[, ...];`                   | `join_group`              |
+| `JOIN GROUP <name> SUBSCRIBE <topic>[, ...];`                     | `join_group`              |
+| `SHOW GROUP;`                                                     | current assignment        |
+| `HEARTBEAT;`                                                      | `group_heartbeat`         |
+| `LEAVE [GROUP];`                                                  | `leave_group`             |
+| `HELP [<command>];` · `EXIT;` / `QUIT;`                           | —                         |
+
+### A sample session
+
+```sql
+mq> CONNECT 'localhost' PORT 9092 USER 'admin' PASSWORD 'admin';
+OK connected to localhost:9092 as admin
+
+mq> CREATE TOPIC orders PARTITIONS 4;
+OK topic 'orders' created (4 partitions)
+
+mq> LIST TOPICS;
++--------+------------+
+| topic  | partitions |
++--------+------------+
+| orders | 4          |
++--------+------------+
+(1 topic)
+
+mq> PRODUCE INTO orders KEY 'k1' VALUE 'hello world';
+OK produced to orders → partition 2, offset 0
+
+mq> FETCH FROM orders GROUP billing LIMIT 10;
++-----------+--------+-----+-------------+
+| partition | offset | key | value       |
++-----------+--------+-----+-------------+
+| 2         | 0      | k1  | hello world |
++-----------+--------+-----+-------------+
+(1 record)
+
+mq> -- create/join a consumer group and inspect the assignment
+mq> CREATE GROUP billing SUBSCRIBE orders;
++--------+------------+
+| topic  | partitions |
++--------+------------+
+| orders | 0,1,2,3    |
++--------+------------+
+(joined group 'billing' as m-1a2b...)
+
+mq> COMMIT orders PARTITION 2 OFFSET 1;
+OK committed orders[2] @ offset 1
+
+mq> LEAVE GROUP;
+OK left group 'billing'
+
+mq> EXIT;
+```
+
+A statement can also span several lines — handy for longer commands:
+
+```sql
+mq> CREATE GROUP analytics
+..>   SUBSCRIBE orders, payments, audit;
+```
+
 ## Wire protocol
 
 Clients and the broker speak a compact binary protocol over TCP
@@ -338,29 +436,29 @@ own CRC since the disk layer can corrupt independently.
 Opcodes are split into client requests (`0x01`–`0x7F`) and server replies
 (`0x80`–`0xFE`):
 
-| Op                           | Direction       | Purpose                                  |
-| ---------------------------- | --------------- | ---------------------------------------- |
-| `HELLO`                      | client → server | Protocol-version handshake               |
-| `AUTH`                       | client → server | Username/password authentication         |
-| `PRODUCE`                    | client → server | Append a record to a topic               |
-| `FETCH`                      | client → server | Pull a batch of records (pull mode)      |
-| `SUBSCRIBE`                  | client → server | Stream records as they arrive (push)     |
-| `COMMIT`                     | client → server | Commit a consumer-group offset           |
-| `CREATE_TOPIC`               | client → server | Create a partitioned topic               |
-| `LIST_TOPICS`                | client → server | List existing topics                     |
-| `PING`/`GOODBYE`             | client → server | Liveness / clean disconnect              |
-| `INIT_PRODUCER_ID`           | client → server | Request a u64 PID for idempotent produce |
-| `PRODUCE_IDEMPOTENT`         | client → server | Idempotent append: `(PID, seq, ...)`     |
-| `JOIN_GROUP`                 | client → server | Join a consumer group; get an assignment |
-| `LEAVE_GROUP`                | client → server | Depart a consumer group                  |
-| `GROUP_HEARTBEAT`            | client → server | Renew a group member's lease             |
-| `WELCOME` / `AUTH_OK`        | server → client | Handshake / auth acceptance              |
-| `PRODUCE_ACK`                | server → client | Partition + offset of an appended record |
-| `PRODUCER_ID`                | server → client | Assigned u64 PID                         |
+| Op                           | Direction       | Purpose                                   |
+| ---------------------------- | --------------- | ----------------------------------------- |
+| `HELLO`                      | client → server | Protocol-version handshake                |
+| `AUTH`                       | client → server | Username/password authentication          |
+| `PRODUCE`                    | client → server | Append a record to a topic                |
+| `FETCH`                      | client → server | Pull a batch of records (pull mode)       |
+| `SUBSCRIBE`                  | client → server | Stream records as they arrive (push)      |
+| `COMMIT`                     | client → server | Commit a consumer-group offset            |
+| `CREATE_TOPIC`               | client → server | Create a partitioned topic                |
+| `LIST_TOPICS`                | client → server | List existing topics                      |
+| `PING`/`GOODBYE`             | client → server | Liveness / clean disconnect               |
+| `INIT_PRODUCER_ID`           | client → server | Request a u64 PID for idempotent produce  |
+| `PRODUCE_IDEMPOTENT`         | client → server | Idempotent append: `(PID, seq, ...)`      |
+| `JOIN_GROUP`                 | client → server | Join a consumer group; get an assignment  |
+| `LEAVE_GROUP`                | client → server | Depart a consumer group                   |
+| `GROUP_HEARTBEAT`            | client → server | Renew a group member's lease              |
+| `WELCOME` / `AUTH_OK`        | server → client | Handshake / auth acceptance               |
+| `PRODUCE_ACK`                | server → client | Partition + offset of an appended record  |
+| `PRODUCER_ID`                | server → client | Assigned u64 PID                          |
 | `GROUP_ASSIGNMENT`           | server → client | Member id + assigned partitions per topic |
-| `RECORD`                     | server → client | A delivered record (fetch or push)       |
-| `TOPIC_LIST` / `PONG` / `OK` | server → client | Query results / acks                     |
-| `ERROR`                      | server → client | Numeric error code + message             |
+| `RECORD`                     | server → client | A delivered record (fetch or push)        |
+| `TOPIC_LIST` / `PONG` / `OK` | server → client | Query results / acks                      |
+| `ERROR`                      | server → client | Numeric error code + message              |
 
 A connection must `HELLO` then `AUTH` before any other request; only
 handshake opcodes are accepted pre-auth. A consumer connection is either
@@ -406,19 +504,21 @@ The `busted` binary at `/usr/local/bin/busted` is installed by `make deps` and i
 
 Current coverage:
 
-| Spec file                | Module under test                                          |
-| ------------------------ | ---------------------------------------------------------- |
-| `buffer_spec.lua`        | `src/core/buffer.lua` — accumulating byte buffer           |
-| `crc32_spec.lua`         | `src/core/crc32.lua` — IEEE 802.3 CRC-32                   |
-| `future_spec.lua`        | `src/core/future.lua` — one-shot coroutine future          |
-| `group_spec.lua`         | `src/client/groups.lua` — consumer-group lifecycle FSM     |
-| `group_protocol_spec.lua`| `src/server/protocol.lua` — JOIN/LEAVE/HEARTBEAT wire format|
-| `message_spec.lua`       | `src/record/message.lua` — message wire format             |
-| `offset_manager_spec.lua`| `src/storage/offset_manager.lua` — durable group offsets   |
-| `partition_spec.lua`     | `src/storage/partition.lua` — append, read, recovery       |
-| `time_spec.lua`          | `src/core/time.lua` — duration constants                   |
-| `topic_manager_spec.lua` | `src/storage/topic_manager.lua` — topic/partition creation |
-| `util_spec.lua`          | `src/core/util.lua` — topic-name validation                |
+| Spec file                 | Module under test                                            |
+| ------------------------- | ------------------------------------------------------------ |
+| `buffer_spec.lua`         | `src/core/buffer.lua` — accumulating byte buffer             |
+| `crc32_spec.lua`          | `src/core/crc32.lua` — IEEE 802.3 CRC-32                     |
+| `future_spec.lua`         | `src/core/future.lua` — one-shot coroutine future            |
+| `group_spec.lua`          | `src/client/groups.lua` — consumer-group lifecycle FSM       |
+| `group_protocol_spec.lua` | `src/server/protocol.lua` — JOIN/LEAVE/HEARTBEAT wire format |
+| `message_spec.lua`        | `src/record/message.lua` — message wire format               |
+| `offset_manager_spec.lua` | `src/storage/offset_manager.lua` — durable group offsets     |
+| `partition_spec.lua`      | `src/storage/partition.lua` — append, read, recovery         |
+| `sql_lexer_spec.lua`      | `src/repl/sql/lexer.lua` — MQL console tokenizer             |
+| `sql_parser_spec.lua`     | `src/repl/sql/parser.lua` — MQL statement grammar            |
+| `time_spec.lua`           | `src/core/time.lua` — duration constants                     |
+| `topic_manager_spec.lua`  | `src/storage/topic_manager.lua` — topic/partition creation   |
+| `util_spec.lua`           | `src/core/util.lua` — topic-name validation                  |
 
 Credit:
 
@@ -426,3 +526,4 @@ https://github.com/kyleconroy/lua-state-machine/tree/master
 https://github.com/travisjeffery/jocko/tree/master
 https://support.tools/post/building-kafka-clone-in-go/
 https://github.com/dpapavas/luaprompt
+https://github.com/giann/croissant/tree/master
