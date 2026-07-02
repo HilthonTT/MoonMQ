@@ -7,7 +7,7 @@ local DEFAULT_TIMEOUT = 30
 local Client = {}
 Client.__index = Client
 
-function Client.new(opts) 
+function Client.new(opts)
     opts = opts or {}
     local host = opts.host or "127.0.0.1"
     local port = opts.port or 9092
