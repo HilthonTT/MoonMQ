@@ -120,8 +120,10 @@ function Connection.new(server, sock, peer, ip)
         frames_sent = 0,
     }, Connection)
 
-    metrics.inc("moonmq_connections_accepted_total")
-    metrics.set("moonmq_connections_open", server.connections, nil)
+    -- NB: moonmq_connections_accepted_total / moonmq_connections_open are
+    -- bumped by Server:_handle right after Connection.new returns, where the
+    -- registered connection count is authoritative. Incrementing here too
+    -- double-counted every accept, so it's deliberately left to the server.
 
     return connection
 end

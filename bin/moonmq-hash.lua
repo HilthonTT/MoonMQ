@@ -6,10 +6,14 @@
 --     lua bin/moonmq-hash.lua <password> [iterations]
 --     make hash PASSWORD=<password> [ITER=<iterations>]
 --
--- `iterations` defaults to 10000 to match `DEFAULT_PBKDF2_ITERATIONS`
--- in src/server/auth.lua. Higher values slow auth verification
--- (acceptable on a typical login path) and proportionally raise the
--- cost of an offline brute-force.
+-- `iterations` defaults to auth.DEFAULT_PBKDF2_ITERATIONS (see
+-- src/server/auth.lua) so the tool and the broker never disagree. Higher
+-- values slow auth verification (which runs inline on the reactor — keep
+-- that in mind) and proportionally raise the cost of an offline brute-force.
+
+-- Reuse the broker's own hasher so the output is guaranteed to round-trip
+-- through src/server/auth.lua's parse_hash + _verify_password.
+local auth = require("src.server.auth")
 
 local password = arg[1]
 if not password or password == "" then
@@ -17,7 +21,7 @@ if not password or password == "" then
     os.exit(1)
 end
 
-local iterations = 10000
+local iterations = auth.DEFAULT_PBKDF2_ITERATIONS
 if arg[2] and arg[2] ~= "" then
     iterations = tonumber(arg[2])
     if not iterations or iterations < 1 or iterations ~= math.floor(iterations) then
@@ -27,7 +31,4 @@ if arg[2] and arg[2] ~= "" then
     end
 end
 
--- Reuse the broker's own hasher so the output is guaranteed to round-trip
--- through src/server/auth.lua's parse_hash + _verify_password.
-local auth = require("src.server.auth")
 print(auth.hash_password(password, { iterations = iterations }))

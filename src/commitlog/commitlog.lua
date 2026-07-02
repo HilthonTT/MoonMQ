@@ -17,8 +17,10 @@ local compact_cleaner = require("src.commitlog.compact_cleaner")
 local delete_cleaner  = require("src.commitlog.delete_cleaner")
 local segment_m       = require("src.commitlog.segment")
 local fs_m            = require("src.io.fs")
+local io_sync         = require("src.io.io_sync")
 local string_m        = require("src.core.string")
 local message_m       = require("src.record.message")
+local log             = require("src.log.logger").get("commitlog")
 
 local Segment = segment_m.Segment
 
@@ -130,6 +132,44 @@ function CommitLog:open()
     local files, ferr = fs_m.read_dir(self.path)
     if not files then
         return string.format("read dir failed: %s", tostring(ferr))
+    end
+
+    -- Recover from a crash mid-compaction. Segment:replace renames the
+    -- ".cleaned" twin over the canonical name, but on Windows that rename is
+    -- remove-then-rename (non-atomic). A crash in the gap can leave the
+    -- canonical ".log" gone with only "<base>.log.cleaned" — the fully-written,
+    -- fsync'd replacement — surviving. Promote such an orphan; if the canonical
+    -- ".log" still exists, compaction didn't complete and the twin is
+    -- discardable. ".index.cleaned" is always discardable (indexes rebuild from
+    -- the log). Re-read the directory afterward so the promoted names are seen.
+    local CLEANED = ".cleaned"
+    local repaired = false
+    for _, name in ipairs(files) do
+        if string_m.endswith(name, LogFileSuffix .. CLEANED) then
+            local canon      = string_m.trimsuffix(name, CLEANED)
+            local canon_full = fs_m.join_path(self.path, canon)
+            local clean_full = fs_m.join_path(self.path, name)
+            if not fs_m.exists(canon_full) then
+                local ok, rerr = io_sync.atomic_rename(clean_full, canon_full)
+                if not ok then
+                    return string.format("adopt orphan %s failed: %s",
+                                         name, tostring(rerr))
+                end
+                log:warn("recovered interrupted compaction: promoted %s", name)
+            else
+                os.remove(clean_full)
+            end
+            repaired = true
+        elseif string_m.endswith(name, IndexFileSuffix .. CLEANED) then
+            os.remove(fs_m.join_path(self.path, name))
+            repaired = true
+        end
+    end
+    if repaired then
+        files, ferr = fs_m.read_dir(self.path)
+        if not files then
+            return string.format("read dir failed: %s", tostring(ferr))
+        end
     end
 
     for _, name in ipairs(files) do

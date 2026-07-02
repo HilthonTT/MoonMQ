@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.4, LuaRocks, and zlib headers
+        run: |
+          sudo apt-get update
+          # zlib1g-dev: lua-zlib builds against it. liblua5.4-dev: rock C modules.
+          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks zlib1g-dev
+
+      - name: Install Lua dependencies
+        run: |
+          sudo luarocks install busted
+          sudo luarocks install luasocket
+          sudo luarocks install dkjson
+          sudo luarocks install lua-zlib
+          sudo luarocks install luaposix
+          sudo luarocks install luacheck
+
+      - name: Lint (luacheck)
+        run: luacheck src bin main.lua spec
+
+      - name: Unit + integration tests (busted)
+        run: busted --verbose
+
+      - name: Storage smoke test
+        # Deliberately outside busted (see the file header); run it explicitly
+        # so CI exercises the restart/recovery + segment-roll path too.
+        run: lua5.4 spec/storage_smoke.lua

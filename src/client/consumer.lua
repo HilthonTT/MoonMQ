@@ -28,6 +28,14 @@ function Consumer.new(broker, group_id)
     return setmetatable({
         broker      = broker,
         group_id    = group_id,
+        -- Partition ownership filter set by the group coordinator via
+        -- set_assignment. nil = "no restriction" (read every subscribed
+        -- partition — the raw FETCH-without-JOIN_GROUP path). When set, poll()
+        -- only reads partitions this member owns, which is what makes a
+        -- consumer group actually partition work instead of every member
+        -- reading every partition.
+        assignment     = nil,
+        assignment_src = nil,
         offsets     = {}, -- topic_name -> partition_id -> offset
         -- Topic-ref cache. Populated at subscribe time; consulted in
         -- poll() instead of going through broker:get_topic on every
@@ -73,6 +81,37 @@ function Consumer:subscribe(topic_name)
     return true, nil
 end
 
+-- set_assignment restricts poll() to the partitions the group coordinator
+-- assigned this member. `by_topic` is the coordinator's
+-- { [topic] = { partition_id, ... } } table (a GroupMember.partitions value);
+-- nil clears the restriction. A rebalance replaces that table wholesale, so we
+-- only rebuild the lookup set when a *different* table is handed in — making it
+-- cheap to call on every poll. Passing an empty table (member evicted /
+-- assigned nothing) means "own nothing": poll() then returns no records.
+function Consumer:set_assignment(by_topic)
+    if by_topic == self.assignment_src then return end
+    self.assignment_src = by_topic
+    if by_topic == nil then
+        self.assignment = nil
+        return
+    end
+    local set = {}
+    for topic_name, ids in pairs(by_topic) do
+        local owned = {}
+        for _, id in ipairs(ids) do owned[id] = true end
+        set[topic_name] = owned
+    end
+    self.assignment = set
+end
+
+-- owns reports whether this member may read (topic, partition_id) under the
+-- current assignment. No assignment set = owns everything.
+function Consumer:owns(topic_name, partition_id)
+    if self.assignment == nil then return true end
+    local owned = self.assignment[topic_name]
+    return owned ~= nil and owned[partition_id] == true
+end
+
 -- Poll reads at most one message PER partition across all subscribed topics.
 -- Returns (records, nil) on success, (nil, err) on failure.
 local function is_eof_error(read_err)
@@ -99,8 +138,10 @@ function Consumer:poll()
 
         for partition_id, offset in pairs(partition_offsets) do
             local partition = topic.partitions[partition_id]
-            -- Skip if partition vanished or we've consumed up to the tail.
-            if partition and offset < partition.offset then
+            -- Skip partitions this member doesn't own (group assignment), that
+            -- vanished, or that we've consumed up to the tail.
+            if self:owns(topic_name, partition_id)
+                and partition and offset < partition.offset then
                 local msg, next_offset, read_err = partition:read_message(offset)
                 if msg then
                     records[#records + 1] = ConsumerRecord.new(

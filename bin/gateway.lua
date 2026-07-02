@@ -88,7 +88,11 @@ local STATUS = {
 }
 
 local function read_http_request(reactor, sock)
-    sock:gettimeout(0)
+    -- Non-blocking: the loop below drives readiness through the reactor's
+    -- wait_readable on "timeout". settimeout(0), NOT gettimeout(0) — the
+    -- latter is a getter that ignores its argument and leaves the socket
+    -- blocking, so one slow client would stall the whole gateway.
+    sock:settimeout(0)
     local deadline = socket.gettime() + READ_DEADLINE
     local buf = ""
 
