@@ -185,6 +185,65 @@ describe("CommitLog", function()
         l:close()
     end)
 
+    it("each_message walks every survivor across compaction offset gaps", function()
+        -- Compaction renumbers each segment's survivors contiguously from its
+        -- base_offset, leaving GAPS between segments. An offset+1 read loop
+        -- faults at the first gap; each_message must walk the actual records.
+        local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
+        l:append_message(msg("a", "a-old", 1))
+        l:append_message(msg("b", "b-only", 2))
+        l:append_message(msg("a", "a-new", 3))   -- supersedes a-old
+        l:append_message(msg("c", "c-only", 4))  -- forces the compaction pass
+
+        local seen = {}
+        local n = 0
+        l:each_message(function(_, m) seen[m.key] = m.value; n = n + 1 end)
+        assert.are.equal("a-new", seen.a)
+        assert.are.equal("b-only", seen.b)
+        assert.are.equal("c-only", seen.c)
+        assert.are.equal(3, n)   -- exactly the survivors, no phantom reads
+
+        -- Confirm there really is an offset gap the old read-loop would trip on:
+        -- more offsets span [oldest, newest) than there are surviving records.
+        assert.is_true(l:newest_offset() - l:oldest_offset() > n,
+            "expected a renumbering gap between segments")
+        l:close()
+    end)
+
+    it("build_index truncates from an interior CRC-corrupt record", function()
+        -- All records land in one 64 MiB segment. Uniform 2-char key/value ->
+        -- each record is a fixed 32 bytes on disk (8 len + 12 hdr + 4 hdr_crc +
+        -- 4 payload + 4 payload_crc).
+        local l = new_log()
+        for i = 0, 4 do
+            l:append_message(msg("k" .. i, "v" .. i, i))
+        end
+        local seg_path = fs_m.join_path(BASE_DIR, "log",
+            string.format("%020d.log", 0))
+        l:close()
+
+        -- Flip a byte inside record #2's payload (record 2 starts at byte 64;
+        -- payload begins after 8+12+4 = 24 bytes -> offset 88). The length
+        -- prefix stays valid, so only the CRC check can catch this — the old
+        -- length-only framing would have indexed and served the corruption.
+        local f = assert(io.open(seg_path, "r+b"))
+        f:seek("set", 88)
+        local b = f:read(1):byte()
+        f:seek("set", 88)
+        f:write(string.char((b ~ 0xFF) & 0xFF))
+        f:close()
+
+        local l2 = new_log()
+        -- Records 0 and 1 survive; 2, 3, 4 are truncated at the corruption.
+        assert.are.equal(2, l2:newest_offset())
+        assert.are.equal("v0", l2:read_at(0).value)
+        assert.are.equal("v1", l2:read_at(1).value)
+        local got, _, err = l2:read_at(2)
+        assert.is_nil(got)
+        assert.is_not_nil(err)
+        l2:close()
+    end)
+
     it("compacts to the latest record per key", function()
         local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
         -- Same key written twice; only the newest value should survive.

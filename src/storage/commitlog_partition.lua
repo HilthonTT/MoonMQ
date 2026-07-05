@@ -122,6 +122,16 @@ function CommitLogPartition:offset_for_timestamp(ts)
     return nil
 end
 
+-- scan iterates every retained record in the partition in offset order, calling
+-- fn(offset, msg). Robust to the offset gaps compaction leaves between segments
+-- (see CommitLog:each_message), which the offset-arithmetic read_message loop is
+-- not. Used for full-log replay such as OffsetManager recovery.
+function CommitLogPartition:scan(fn)
+    assert(type(fn) == "function", "fn must be a function")
+    self.commitlog:each_message(fn)
+    return nil
+end
+
 -- sync issues an fsync on the active segment. (ok, err).
 function CommitLogPartition:sync()
     return self.commitlog:sync()

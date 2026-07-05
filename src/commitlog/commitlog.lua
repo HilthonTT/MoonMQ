@@ -19,6 +19,8 @@ local segment_m       = require("src.commitlog.segment")
 local fs_m            = require("src.io.fs")
 local string_m        = require("src.core.string")
 local message_m       = require("src.record.message")
+local io_sync         = require("src.io.io_sync")
+local log             = require("src.log.logger").get("commitlog")
 
 local Segment = segment_m.Segment
 
@@ -185,6 +187,15 @@ function CommitLog:split()
                                       self.options.max_segment_bytes)
     if not segment then return serr end
 
+    -- Persist the new segment's directory entry: on POSIX the freshly created
+    -- .log/.index files aren't crash-durable until the parent dir is fsynced.
+    -- Non-fatal — the empty segment is reconstructable, but fsyncing here means
+    -- a crash right after a roll can't lose the fact that the roll happened.
+    local dok, derr = io_sync.sync_dir(self.path)
+    if not dok then
+        log:warn("dir fsync after segment roll failed: %s", tostring(derr))
+    end
+
     local segments = {}
     for i = 1, #self.segments do segments[i] = self.segments[i] end
     segments[#segments + 1] = segment
@@ -278,6 +289,22 @@ function CommitLog:read_at(offset)
         return nil, nil, derr
     end
     return msg, offset + 1, nil
+end
+
+-- each_message iterates every retained record in offset order, calling
+-- fn(offset, msg). Unlike read_at(offset)+offset arithmetic, it walks each
+-- segment's records directly, so it is robust to the offset *gaps* compaction
+-- leaves between segments (a compacted segment renumbers its survivors
+-- contiguously from its base_offset, so offsets are not dense across the log).
+-- Each segment stops at its first torn/corrupt record. Used for full-log replay
+-- (e.g. OffsetManager recovery).
+function CommitLog:each_message(fn)
+    assert(type(fn) == "function", "fn must be a function")
+    for i = 1, #self.segments do
+        self.segments[i]:each(function(offset, msg)
+            fn(offset, msg)
+        end)
+    end
 end
 
 -- newest_offset is the offset the next appended record will receive (jocko's

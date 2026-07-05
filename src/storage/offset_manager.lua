@@ -29,10 +29,19 @@
 -- it round-trips the u64 verbatim.
 
 local msg_m = require("src.record.message")
-local log = require("src.log.logger")
+local log = require("src.log.logger").get("offset_manager")
 
 local OFFSETS_TOPIC = "__consumer_offsets"
 local DEFAULT_PARTITIONS = 16 -- Kafka defaults to 50; smaller suits a single broker
+
+-- The offsets topic MUST run on the commitlog backend: it is the only backend
+-- that actually key-compacts (the segmented backend ignores cleanup_policy and
+-- only does time/byte *retention*, which would eventually delete the latest
+-- commit for a quiet group — losing its offset — and never bounds a busy one).
+-- A modest segment size makes the log roll (and therefore compact) regularly
+-- instead of growing into one giant never-compacted segment.
+local OFFSETS_BACKEND          = "commitlog"
+local OFFSETS_MAX_SEGMENT_SIZE = 8 * 1024 * 1024  -- 8 MiB -> rolls & compacts often
 
 -- Key:   u16 group | u16 topic | u32 partition   (group/topic length-prefixed)
 -- Value: u64 offset
@@ -73,16 +82,26 @@ function OffsetManager.new(topic_manager, opts)
     local topic = topic_manager.topics[OFFSETS_TOPIC]
     if not topic then
         local created, err = topic_manager:create_topic(OFFSETS_TOPIC, nparts, {
-            -- Compaction keeps only the latest record per key — the natural
-            -- fit for an offsets log. Falls back to the default backend if the
-            -- cleaner isn't wired; correctness doesn't depend on it.
-            cleanup_policy = "compact",
+            -- Commitlog backend + compaction keeps only the latest record per
+            -- (group,topic,partition) key — the natural fit for an offsets log,
+            -- and the only backend that actually compacts. The backend is
+            -- persisted in the topic's sidecar, so a restart reopens it as a
+            -- commitlog rather than silently reverting to the default.
+            backend          = OFFSETS_BACKEND,
+            cleanup_policy   = "compact",
+            max_segment_size = OFFSETS_MAX_SEGMENT_SIZE,
         })
         if not created then
             return nil, string.format("failed to create %s: %s", OFFSETS_TOPIC, err)
         end
         topic = created
     end
+    -- NOTE: a topic that already exists on disk keeps whatever backend it was
+    -- created with (load_topics restores it from the sidecar). We do not migrate
+    -- an existing segmented offsets topic to commitlog — the two backends use
+    -- incomparable offset semantics, so an in-place backend swap would corrupt
+    -- stored offsets. Fresh data dirs get the commitlog backend; recover() below
+    -- reads either backend correctly via part:scan.
 
     local self = setmetatable({
         topic  = topic,
@@ -149,25 +168,25 @@ function OffsetManager:fetch(group, topic, partition)
     return t[partition]
 end
  
--- recover replays every internal partition front-to-back. Read errors at the
--- tail (torn final record from a crash mid-write) end that partition's scan
--- rather than aborting recovery — a half-written offset record just means the
--- previous committed value stands, which is safe.
+-- recover replays every internal partition front-to-back, rebuilding the map
+-- (last write per key wins). It walks records via part:scan, NOT by iterating
+-- read_message from offset 0. That old approach had two bugs this fixes:
+--   * it hardcoded a start offset of 0, so once a partition's oldest offset
+--     advanced past 0 (retention delete, or the commitlog backend after a
+--     compaction) the very first read_message(0) failed with EOF, the loop
+--     broke immediately, and EVERY committed offset for that partition was
+--     silently dropped — consumers then reset to the beginning.
+--   * commitlog compaction renumbers surviving records contiguously per
+--     segment, leaving offset GAPS between segments; an offset+1 walk faults
+--     at the first gap.
+-- part:scan sidesteps both: it iterates each segment's actual records in order
+-- and stops each segment at its first torn/corrupt record, so a half-written
+-- tail just means the previous committed value stands (safe at-least-once).
 function OffsetManager:recover()
     local restored = 0
 
     for _, part in ipairs(self.topic.partitions) do
-        local offset = 0
-        local tail   = part.offset
-
-        while offset < tail do
-            local msg, next_offset, rerr = part:read_message(offset)
-            if not msg then
-                log:warn("%s/partition-%d: stopping replay at offset %d: %s",
-                    OFFSETS_TOPIC, part.id, offset, rerr or "unknown")
-                break
-            end
-
+        local serr = part:scan(function(_offset, msg)
             local ok, group, topic, partition = pcall(string.unpack, KEY_FMT, msg.key)
             local vok, stored = pcall(string.unpack, VALUE_FMT, msg.value)
             if ok and vok then
@@ -176,11 +195,13 @@ function OffsetManager:recover()
             else
                 -- A record whose key/value we can't decode isn't ours to
                 -- interpret; skip it rather than poison the whole replay.
-                log:warn("%s/partition-%d: undecodable offset record at %d",
-                    OFFSETS_TOPIC, part.id, offset)
+                log:warn("%s/partition-%d: skipping undecodable offset record",
+                    OFFSETS_TOPIC, part.id)
             end
-
-            offset = next_offset
+        end)
+        if serr then
+            log:warn("%s/partition-%d: replay stopped early: %s",
+                OFFSETS_TOPIC, part.id, serr)
         end
     end
 

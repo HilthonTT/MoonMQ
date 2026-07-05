@@ -1,6 +1,7 @@
 local brk_m    = require("src.storage.broker")
 local offmgr_m = require("src.storage.offset_manager")
 local consumer_m = require("src.client.consumer")
+local clp_m    = require("src.storage.commitlog_partition")
 local os_utils = require("src.core.os")
 
 local BASE_DIR = os_utils.IS_WINDOWS and "C:\\Temp\\moonmq_offset_test"
@@ -23,6 +24,26 @@ describe("durable consumer offsets", function()
         assert.is_not_nil(broker.topic_manager.topics[offmgr_m.OFFSETS_TOPIC])
         for _, name in ipairs(broker:list_topics()) do
             assert.are_not.equal(offmgr_m.OFFSETS_TOPIC, name)
+        end
+    end)
+
+    it("backs __consumer_offsets with the compacting commitlog engine", function()
+        -- The segmented backend ignores cleanup_policy and only does time/byte
+        -- *retention*, which would eventually delete a quiet group's latest
+        -- commit (losing its offset) and never bound a busy one. The offsets
+        -- topic must therefore run on the commitlog backend, which compacts.
+        local broker = assert(brk_m.Broker.new(BASE_DIR))
+        local topic  = broker.topic_manager.topics[offmgr_m.OFFSETS_TOPIC]
+        for _, p in ipairs(topic.partitions) do
+            assert.are.equal(clp_m, getmetatable(p),
+                "offsets partition must be a CommitLogPartition")
+        end
+        -- And the backend is persisted, so a restart restores it rather than
+        -- silently reverting to the default segmented engine.
+        local broker2 = assert(brk_m.Broker.new(BASE_DIR))
+        local topic2  = broker2.topic_manager.topics[offmgr_m.OFFSETS_TOPIC]
+        for _, p in ipairs(topic2.partitions) do
+            assert.are.equal(clp_m, getmetatable(p))
         end
     end)
 

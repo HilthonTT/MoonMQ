@@ -365,6 +365,28 @@ local function ensure_consumer(conn, broker, group_id)
     return conn.consumer
 end
 
+-- Sync a connection's consumer with its live group assignment so a grouped
+-- FETCH/SUBSCRIBE reads only the partitions this member owns. Called right
+-- before each poll: a rebalance (another member joining/leaving, or a reap)
+-- mutates member.partitions in place, and re-reading here honours it on the
+-- next poll without having to push a new assignment frame to the client.
+--   * not a joined member          -> filter cleared, reads all partitions
+--     (the standalone / assign-style consumer, unchanged behaviour).
+--   * joined member with an assignment -> reads only its owned partitions.
+--   * joined but reaped (member gone)  -> empty assignment, reads NOTHING
+--     until the client re-joins; falling back to "read all" here would
+--     resurrect the duplicate-delivery bug this fix closes.
+function Server:_refresh_assignment(conn)
+    if not conn.consumer then return end
+    if not (conn.group_id and conn.member_id) then
+        conn.consumer:set_assignment(nil)
+        return
+    end
+    local group  = self.groups[conn.group_id]
+    local member = group and group.members[conn.member_id]
+    conn.consumer:set_assignment(member and member.partitions or {})
+end
+
 -- INIT_PRODUCER_ID: assign a u64 producer ID to this connection. Repeated
 -- calls on the same connection are tolerated but reset all per-PID seq
 -- state (a client that asks for a fresh PID has lost track of its
@@ -494,6 +516,7 @@ end
 
 function Server:_subscriber_loop(conn)
     while conn.state ~= Connection.STATE_CLOSED do
+        self:_refresh_assignment(conn)
         local records, err = conn.consumer:poll()
         if err then
             push_log:error("conn=%s poll: %s", conn.id_short, err)
@@ -541,6 +564,7 @@ function Server:_handle_fetch(conn, correl, payload)
     end
     conn.mode = "pull"
 
+    self:_refresh_assignment(conn)
     local records, perr = consumer:poll()
     if perr then
         conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, perr))

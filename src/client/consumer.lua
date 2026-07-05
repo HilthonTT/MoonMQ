@@ -37,7 +37,47 @@ function Consumer.new(broker, group_id)
         -- is dropped (not currently supported) we'd invalidate here.
         topics      = {},
         auto_commit = true,
+        -- Optional partition-assignment filter: topic_name -> { [pid]=true }.
+        -- nil means "no restriction" — read every partition of every subscribed
+        -- topic (the standalone / non-group-member case). When set (a joined
+        -- group member), poll() reads ONLY the partitions this member owns, so
+        -- two members of the same group never both consume a partition
+        -- (duplicate delivery) nor both commit the same (group,topic,partition)
+        -- offset key (clobbering). See Consumer:set_assignment.
+        assignment  = nil,
     }, Consumer)
+end
+
+-- set_assignment restricts which partitions poll() will read to those this
+-- consumer owns. `assignment` is a group member's { topic -> { pid, ... } } map,
+-- or nil to lift the restriction entirely. The list form is normalised into a
+-- lookup set. The server calls this before every poll from the live group
+-- state, so a rebalance is honoured on the very next poll without pushing a new
+-- assignment to the client.
+function Consumer:set_assignment(assignment)
+    if assignment == nil then
+        self.assignment = nil
+        return
+    end
+    local set = {}
+    for topic_name, pids in pairs(assignment) do
+        local s = {}
+        for _, pid in ipairs(pids) do s[pid] = true end
+        set[topic_name] = s
+    end
+    self.assignment = set
+end
+
+-- _partition_allowed reports whether poll() may read (topic, partition) under
+-- the current assignment. With no assignment set, everything is allowed. With
+-- an assignment set, a topic absent from it (e.g. a member subscribed but
+-- assigned no partitions, or a reaped member with an empty assignment) yields
+-- nothing.
+function Consumer:_partition_allowed(topic_name, partition_id)
+    if self.assignment == nil then return true end
+    local s = self.assignment[topic_name]
+    if not s then return false end
+    return s[partition_id] == true
 end
 
 -- Subscribe subscribes the consumer to a topic and initializes its offsets.
@@ -99,8 +139,10 @@ function Consumer:poll()
 
         for partition_id, offset in pairs(partition_offsets) do
             local partition = topic.partitions[partition_id]
-            -- Skip if partition vanished or we've consumed up to the tail.
-            if partition and offset < partition.offset then
+            -- Skip partitions this consumer isn't assigned (group member),
+            -- partitions that vanished, or ones we've consumed up to the tail.
+            if self:_partition_allowed(topic_name, partition_id)
+               and partition and offset < partition.offset then
                 local msg, next_offset, read_err = partition:read_message(offset)
                 if msg then
                     records[#records + 1] = ConsumerRecord.new(

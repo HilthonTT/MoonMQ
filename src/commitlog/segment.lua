@@ -13,6 +13,7 @@ local fs_m      = require("src.io.fs")
 local io_sync   = require("src.io.io_sync")
 local message_m = require("src.record.message")
 local index_m   = require("src.commitlog.index")
+local log       = require("src.log.logger").get("commitlog.segment")
 
 local LogFileSuffix   = ".log"
 local IndexFileSuffix = ".index"
@@ -88,37 +89,42 @@ function Segment:build_index()
     local terr = self.index:truncate_entries(0)
     if terr then return terr end
 
+    local file_end = self.file:seek("end") or 0
     self.file:seek("set", 0)
 
     local next_offset = self.base_offset
     local position    = 0
 
-    while true do
-        -- Frame by the length prefix alone (no CRC here): a CRC failure mid-
-        -- log is treated like a torn tail so recovery can still proceed, and
-        -- read_at re-validates CRCs on the way out anyway.
-        local size_bytes = self.file:read(8)
-        if not size_bytes or #size_bytes < 8 then
-            break
-        end
-        local total_size = string.unpack(">I8", size_bytes)
-
-        local body = self.file:read(total_size)
-        if not body or #body < total_size then
-            break  -- torn tail
+    while position < file_end do
+        -- Validate framing AND both CRCs for every record, via the same
+        -- deserialize_record the read path uses. Framing by the length prefix
+        -- alone (the old behaviour) was unsafe: a corrupt interior length
+        -- prefix yields a bogus size, the read comes up short, and every valid
+        -- record after it was silently discarded as a "torn tail" — while a
+        -- record with an intact length but corrupt payload was indexed and
+        -- served until read_at happened to re-check it. Stopping at the first
+        -- record that fails to decode (torn tail OR interior corruption) and
+        -- truncating from there is the only safe reframe: the log is
+        -- self-framed, so once a length prefix is corrupt the next record
+        -- boundary is unrecoverable anyway.
+        local msg, framed = message_m.deserialize_record(self.file)
+        if not msg then
+            break  -- torn tail or corruption at `position`
         end
 
         local werr = self.index:write_entry(next_offset, position)
         if werr then return werr end
 
-        position    = position + 8 + total_size
+        position    = position + framed
         next_offset = next_offset + 1
     end
 
     -- Drop any bytes past the last whole record (a half-written tail from a
-    -- crash). Without this, the next append would sit after the garbage.
-    local file_end = self.file:seek("end") or 0
+    -- crash, or everything after an interior corruption). Without this, the
+    -- next append would sit after the garbage.
     if position < file_end then
+        log:warn("segment %020d: trimming %d byte(s) past last valid record at %d",
+            self.base_offset, file_end - position, position)
         local ok, trerr = io_sync.truncate(self.file, position)
         if not ok then
             return string.format("failed to trim torn tail: %s", tostring(trerr))
@@ -205,7 +211,11 @@ end
 
 function Segment:close()
     if self.file then
-        self.file:flush()
+        -- fsync, not just flush: flush only pushes the CRT buffer down to the
+        -- OS page cache, so a "clean shutdown" of a commitlog-backed partition
+        -- would still lose acks=0 writes on a power/OS crash. This matches
+        -- SegmentedPartition:close(), which already fsyncs on close.
+        io_sync.sync(self.file)
         self.file:close()
         self.file = nil
     end
@@ -254,6 +264,16 @@ function Segment:replace(old)
     if not ok then
         return string.format("rename %s -> %s failed: %s",
                              clean_idx, canon_idx, tostring(err))
+    end
+
+    -- Persist the directory entries: on POSIX the two renames above aren't
+    -- crash-durable until the containing directory is fsynced, or a power loss
+    -- could leave the canonical name pointing at a partially-linked file.
+    -- Non-fatal: the rename already succeeded in the page cache.
+    local dok, derr = io_sync.sync_dir(self.dir)
+    if not dok then
+        log:warn("segment %020d: dir fsync after compaction replace failed: %s",
+            self.base_offset, tostring(derr))
     end
 
     self.suffix = ""

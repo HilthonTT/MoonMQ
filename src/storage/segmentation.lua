@@ -235,6 +235,12 @@ function SegmentedPartition:create_new_segment(base_offset)
     -- defeat retention entirely.
     write_meta(segment:meta_path(self.dir), now)
 
+    -- Persist the new .log/.timeindex/.meta directory entries. On POSIX the
+    -- files aren't crash-durable until the parent dir is fsynced. Non-fatal:
+    -- an empty just-created segment is reconstructable, but this keeps a roll
+    -- from being lost by a crash immediately after.
+    io_sync.sync_dir(self.dir)
+
     return nil
 end
 
@@ -416,9 +422,15 @@ function SegmentedPartition:_write_checkpoint(value)
     local f, ferr = io.open(tmp, "wb")
     if not f then return false, ferr end
     f:write(tostring(value))
-    f:flush()
+    io_sync.sync(f)          -- the temp file's bytes must land before the rename
     f:close()
-    return io_sync.atomic_rename(tmp, cp_path)
+    local ok, rerr = io_sync.atomic_rename(tmp, cp_path)
+    if not ok then return false, rerr end
+    -- Persist the rename itself: the dir entry isn't crash-durable until the
+    -- directory is fsynced. Non-fatal — a lost checkpoint just makes the next
+    -- boot re-scan more of the log.
+    io_sync.sync_dir(self.dir)
+    return true, nil
 end
 
 -- Internal: append a single (ts, file_pos) entry to the active segment's
@@ -821,6 +833,26 @@ function SegmentedPartition:read_message(offset)
     local next_offset = offset + 8 + total_size
 
     return m, next_offset, nil
+end
+
+-- scan iterates every record in the partition in offset order, calling
+-- fn(offset, msg). Byte offsets are dense and contiguous across segments here
+-- (no compaction renumbering, unlike the commitlog backend), so this is mostly
+-- for a uniform replay interface across backends. Each segment stops at its
+-- first torn/corrupt record. Returns nil (no fatal error path today).
+function SegmentedPartition:scan(fn)
+    assert(type(fn) == "function", "fn must be a function")
+    for _, seg in ipairs(self.segments) do
+        seg.file:seek("set", 0)
+        local pos = 0
+        while true do
+            local msg, framed = msg_m.deserialize_record(seg.file)
+            if not msg then break end   -- EOF or torn/corrupt tail
+            fn(seg.base_offset + pos, msg)
+            pos = pos + framed
+        end
+    end
+    return nil
 end
 
 -- Internal helpers for offset_for_timestamp. Index files are short

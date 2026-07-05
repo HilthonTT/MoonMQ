@@ -33,6 +33,7 @@ end
 if not os_utils.IS_WINDOWS then
     local stdio   = require("posix.stdio")
     local unistd  = require("posix.unistd")
+    local fcntl   = require("posix.fcntl")
 
     local function sync(luafile)
         if not luafile then return false, "no file" end
@@ -41,6 +42,20 @@ if not os_utils.IS_WINDOWS then
         if not fd then return false, "fileno failed" end
         local ok, err = unistd.fsync(fd)
         if not ok then return false, "fsync failed: " .. tostring(err) end
+        return true, nil
+    end
+
+    -- sync_dir fsyncs a *directory* so a newly created/renamed file inside it
+    -- is durably linked after a crash. On POSIX, fsync(file) does NOT persist
+    -- the directory entry — you must fsync the parent dir too, or a power loss
+    -- can leave a segment/checkpoint that was written but never fully linked.
+    local function sync_dir(path)
+        if type(path) ~= "string" then return false, "path must be a string" end
+        local fd, oerr = fcntl.open(path, fcntl.O_RDONLY)
+        if not fd then return false, "open dir failed: " .. tostring(oerr) end
+        local ok, ferr = unistd.fsync(fd)
+        unistd.close(fd)
+        if not ok then return false, "fsync dir failed: " .. tostring(ferr) end
         return true, nil
     end
 
@@ -57,6 +72,7 @@ if not os_utils.IS_WINDOWS then
 
     return {
         sync          = sync,
+        sync_dir      = sync_dir,
         truncate      = truncate,
         atomic_rename = atomic_rename,
     }
@@ -115,8 +131,17 @@ local function truncate(luafile, length)
     return true, nil
 end
 
+-- Directory fsync is a no-op on Windows: NTFS commits directory metadata as
+-- part of the file's own FlushFileBuffers, and the CRT gives us no FILE* for a
+-- directory to reach it through. Callers treat dir-fsync failure as non-fatal,
+-- so reporting success here keeps the POSIX/Windows contract uniform.
+local function sync_dir(_path)
+    return true, nil
+end
+
 return {
     sync          = sync,
+    sync_dir      = sync_dir,
     truncate      = truncate,
     atomic_rename = atomic_rename,
 }
