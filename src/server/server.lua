@@ -32,6 +32,7 @@ local groups_m    = require("src.client.groups")
 local msg_m       = require("src.record.message")
 local metrics     = require("src.server.metrics")
 local MetricsHttp = require("src.server.metrics_http")
+local version_m   = require("src.core.version")
 local log         = require("src.log.logger").get("server")
 local push_log    = require("src.log.logger").get("push")
 
@@ -84,6 +85,12 @@ local DEFAULT_GROUP_COMMIT_MAX_WAITERS = 64
 -- dead member within ~10s of the deadline, which is plenty responsive for
 -- a rebalance without spinning the reactor.
 local DEFAULT_GROUP_REAPER_INTERVAL_S  = 10
+-- Ceiling on distinct live consumer groups (see max_groups).
+local DEFAULT_MAX_GROUPS = 1024
+-- How often the broker pumps partition cleaners. tick_cleaner is a cheap
+-- no-op until a partition's cleaner is actually due, so a tight-ish interval
+-- just keeps retention responsive without meaningful cost.
+local DEFAULT_CLEANER_TICK_INTERVAL_S = 5
 
 local Server = {}
 Server.__index = Server
@@ -101,6 +108,19 @@ function Server.new(opts)
     -- is meaningful immediately after restart, before any CREATE_TOPIC
     -- runs to bump it.
     metrics.set("moonmq_topic_count", #broker:list_topics())
+
+    -- Register HELP/TYPE for the metric families and expose a build-info gauge
+    -- (Prometheus convention: a constant 1 carrying version/commit as labels,
+    -- so dashboards can join runtime series against the build that produced
+    -- them). Describing families gives scrapers proper # HELP/# TYPE headers.
+    local vinfo = version_m.GetVersionInfo()
+    metrics.describe("moonmq_build_info", "gauge", "Build metadata; value is always 1.")
+    metrics.set("moonmq_build_info", 1,
+        { version = vinfo.version, commit = vinfo.git_commit })
+    metrics.describe("moonmq_topic_count", "gauge", "Number of user topics.")
+    metrics.describe("moonmq_connections_open", "gauge", "Currently open connections.")
+    metrics.describe("moonmq_produce_records_total", "counter", "Records produced.")
+    metrics.describe("moonmq_fetch_records_total", "counter", "Records delivered to consumers.")
 
     local producer = prd_m.Producer.new(broker, prd_m.AckMode.AckLeader)
 
@@ -155,6 +175,17 @@ function Server.new(opts)
         groups                = {},
         group_reaper_interval = opts.group_reaper_interval
                                 or DEFAULT_GROUP_REAPER_INTERVAL_S,
+        -- Cap on distinct consumer groups, mirroring max_topics. Without it an
+        -- authenticated client could JOIN_GROUP with unbounded distinct group
+        -- ids and grow self.groups without limit. The reaper also drops emptied
+        -- groups so this is a ceiling on *live* groups, not a lifetime total.
+        max_groups            = opts.max_groups or DEFAULT_MAX_GROUPS,
+        -- How often to pump partition retention/compaction cleaners. The
+        -- SegmentedPartition cleaner only advances when tick_cleaner is called,
+        -- so without this loop time-based retention never runs and disk grows
+        -- unbounded on the default backend.
+        cleaner_tick_interval = opts.cleaner_tick_interval
+                                or DEFAULT_CLEANER_TICK_INTERVAL_S,
         running               = false,
     }, Server)
 end
@@ -366,27 +397,6 @@ local function ensure_consumer(conn, broker, group_id)
 end
 
 -- Sync a connection's consumer with its live group assignment so a grouped
--- FETCH/SUBSCRIBE reads only the partitions this member owns. Called right
--- before each poll: a rebalance (another member joining/leaving, or a reap)
--- mutates member.partitions in place, and re-reading here honours it on the
--- next poll without having to push a new assignment frame to the client.
---   * not a joined member          -> filter cleared, reads all partitions
---     (the standalone / assign-style consumer, unchanged behaviour).
---   * joined member with an assignment -> reads only its owned partitions.
---   * joined but reaped (member gone)  -> empty assignment, reads NOTHING
---     until the client re-joins; falling back to "read all" here would
---     resurrect the duplicate-delivery bug this fix closes.
-function Server:_refresh_assignment(conn)
-    if not conn.consumer then return end
-    if not (conn.group_id and conn.member_id) then
-        conn.consumer:set_assignment(nil)
-        return
-    end
-    local group  = self.groups[conn.group_id]
-    local member = group and group.members[conn.member_id]
-    conn.consumer:set_assignment(member and member.partitions or {})
-end
-
 -- INIT_PRODUCER_ID: assign a u64 producer ID to this connection. Repeated
 -- calls on the same connection are tolerated but reset all per-PID seq
 -- state (a client that asks for a fresh PID has lost track of its
@@ -505,6 +515,10 @@ function Server:_handle_subscribe(conn, correl, payload)
     end
     conn.subscriptions[s.topic] = true
     conn.mode = "push"
+    -- Push mode commits AFTER a record is handed to the send layer (see
+    -- _subscriber_loop), not inside poll(). Turn off poll()'s auto-commit so a
+    -- record isn't marked consumed before we've even tried to deliver it.
+    consumer.auto_commit = false
     conn:send(proto.encode_ok(correl))
 
     if not conn.subscriber_co then
@@ -516,7 +530,9 @@ end
 
 function Server:_subscriber_loop(conn)
     while conn.state ~= Connection.STATE_CLOSED do
-        self:_refresh_assignment(conn)
+        -- Re-scope to the current assignment each pass so a rebalance (another
+        -- member joining/leaving) takes effect on the next poll.
+        self:_apply_group_assignment(conn)
         local records, err = conn.consumer:poll()
         if err then
             push_log:error("conn=%s poll: %s", conn.id_short, err)
@@ -530,6 +546,24 @@ function Server:_subscriber_loop(conn)
                     r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
                 if not conn:send(frame) then return end
                 metrics.inc("moonmq_fetch_records_total", 1, { topic = r.topic })
+                -- Commit only after the record is accepted by the send layer.
+                -- poll() already advanced the in-memory cursor to the next
+                -- offset for this partition; persist that. If conn:send had
+                -- failed we'd have returned above without committing, so the
+                -- record is redelivered rather than silently lost — at-least-
+                -- once on the push path. (send() enqueues; a peer that dies
+                -- after enqueue but before transmit still redelivers on
+                -- reconnect since the offset wasn't committed until here.)
+                local adv = conn.consumer.offsets[r.topic]
+                    and conn.consumer.offsets[r.topic][r.partition]
+                if adv then
+                    local cok, cerr =
+                        conn.consumer:commit_offset(r.topic, r.partition, adv)
+                    if not cok then
+                        push_log:error("conn=%s commit: %s", conn.id_short, cerr)
+                        return
+                    end
+                end
             end
         else
             self.reactor:sleep(self.push_interval)
@@ -564,7 +598,9 @@ function Server:_handle_fetch(conn, correl, payload)
     end
     conn.mode = "pull"
 
-    self:_refresh_assignment(conn)
+    -- Restrict to this member's assigned partitions (no-op unless joined).
+    self:_apply_group_assignment(conn)
+
     local records, perr = consumer:poll()
     if perr then
         conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, perr))
@@ -611,6 +647,19 @@ function Server:_handle_commit(conn, correl, payload)
             string.format("partition %d out of range (1..%d)",
                 c.partition, #topic.partitions)))
         return
+    end
+    -- Fence commits from a connection whose group membership has lapsed. A
+    -- member the coordinator evicted (heartbeat timeout) or that left still
+    -- holds a live socket; without this it could keep committing and clobber
+    -- the offset the partition's new owner is advancing. Non-group commits
+    -- (conn.group_id unset) are unaffected.
+    if conn.group_id then
+        local group = self.groups[conn.group_id]
+        if not group or not group.members[conn.member_id] then
+            conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
+                "group membership lapsed; rejoin before committing"))
+            return
+        end
     end
     local ok, cerr = conn.consumer:commit_offset(c.topic, c.partition, c.offset)
     if not ok then
@@ -668,14 +717,47 @@ function Server:_handle_list_topics(conn, correl, _payload)
 end
 
 -- Lazily fetch (or create) the coordinator for a group. Shared across all
--- connections whose members belong to the group.
+-- connections whose members belong to the group. Returns (group, nil) or
+-- (nil, err) when creating a new group would exceed max_groups.
 function Server:_get_or_create_group(group_id)
     local group = self.groups[group_id]
     if not group then
+        -- Count live groups; the reaper drops emptied ones so this is a
+        -- ceiling on concurrent groups, not a lifetime total.
+        local n = 0
+        for _ in pairs(self.groups) do n = n + 1 end
+        if n >= self.max_groups then
+            return nil, string.format("group limit reached (%d)", self.max_groups)
+        end
         group = groups_m.ConsumerGroup.new(self.broker, group_id)
         self.groups[group_id] = group
     end
     return group
+end
+
+-- Sync the connection's Consumer to the partitions the coordinator has
+-- assigned this member, so poll()/FETCH only touch owned partitions. This is
+-- what makes a consumer group actually divide work — the coordinator computed
+-- assignments before, but the read path ignored them and every member read
+-- every partition. Called before each poll and right after JOIN_GROUP.
+--
+-- No-op unless the connection has a Consumer. A member the coordinator has
+-- since evicted (present group, absent member) is pinned to "own nothing" so a
+-- zombie can't keep draining partitions until it notices its heartbeat was
+-- rejected. A connection that isn't a joined member -- standalone, or one that
+-- just left/was removed from a group -- has its filter cleared so it reverts to
+-- reading every subscribed partition; returning early there instead would leave
+-- a stale assignment pinned after LEAVE_GROUP, so the consumer would keep
+-- reading only its former partitions.
+function Server:_apply_group_assignment(conn)
+    if not conn.consumer then return end
+    if not (conn.group_id and conn.member_id) then
+        conn.consumer:set_assignment(nil)
+        return
+    end
+    local group  = self.groups[conn.group_id]
+    local member = group and group.members[conn.member_id]
+    conn.consumer:set_assignment(member and member.partitions or {})
 end
 
 -- JOIN_GROUP: register this connection as a member of a group subscribing
@@ -706,7 +788,11 @@ function Server:_handle_join_group(conn, correl, payload)
         member_id = conn.member_id or conn.id_short
     end
 
-    local group = self:_get_or_create_group(j.group_id)
+    local group, gerr = self:_get_or_create_group(j.group_id)
+    if not group then
+        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED, gerr))
+        return
+    end
     local assignment, jerr = group:join(member_id, j.topics)
     if not assignment then
         -- join() fails when a subscribed topic doesn't exist, or the group
@@ -719,6 +805,10 @@ function Server:_handle_join_group(conn, correl, payload)
 
     conn.group_id  = j.group_id
     conn.member_id = member_id
+    -- If a Consumer already exists on this connection (a prior FETCH/SUBSCRIBE
+    -- created one before the client joined), scope it to the new assignment now
+    -- rather than waiting for the next poll.
+    self:_apply_group_assignment(conn)
     log:info("conn=%s joined group=%s member=%s state=%s",
         conn.id_short, j.group_id, member_id, group:state())
     conn:send(proto.encode_group_assignment(correl, member_id, assignment))
@@ -779,8 +869,31 @@ function Server:_run_group_reaper()
     while self.running do
         self.reactor:sleep(self.group_reaper_interval)
         if not self.running then return end
-        for _, group in pairs(self.groups) do
+        for gid, group in pairs(self.groups) do
             group:check_heartbeats()
+            -- Drop coordinators with no members so an idle broker doesn't
+            -- accumulate empty groups forever (and so max_groups counts only
+            -- live groups). Safe to delete the current key during pairs().
+            -- A stale connection still holding this group_id will get
+            -- GROUP_MEMBER_UNKNOWN on its next heartbeat/commit and rejoin.
+            if next(group.members) == nil then
+                self.groups[gid] = nil
+            end
+        end
+    end
+end
+
+-- Periodically pump every partition's retention/compaction cleaner. Without
+-- this the SegmentedPartition cleaner (a manually-driven coroutine) never
+-- advances, so time-based retention silently never runs and disk grows
+-- unbounded on the default backend.
+function Server:_run_cleaner_tick()
+    while self.running do
+        self.reactor:sleep(self.cleaner_tick_interval)
+        if not self.running then return end
+        local ok, ran = pcall(self.broker.tick_cleaners, self.broker)
+        if not ok then
+            log:error("cleaner tick: %s", tostring(ran))
         end
     end
 end
@@ -835,6 +948,7 @@ function Server:start()
     -- cleanly when the reactor stops (set false after :run() returns).
     self.running = true
     self.reactor:spawn(function() self:_run_group_reaper() end)
+    self.reactor:spawn(function() self:_run_cleaner_tick() end)
 
     log:info("listening on %s:%d (proto v%d, %s/%s)",
         self.host, self.port, proto.PROTOCOL_VERSION,

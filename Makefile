@@ -8,6 +8,7 @@ deps:
 	$(LUAROCKS) install luasocket
 	$(LUAROCKS) install dkjson
 	$(LUAROCKS) install lua-zlib
+	$(LUAROCKS) install luacheck
 	$(LUAROCKS) install sirocco
 	$(LUAROCKS) install hump
 	$(LUAROCKS) install lpeg
@@ -17,6 +18,16 @@ deps:
 
 test:
 	busted
+
+# The smoke test bypasses busted (see its header) and isn't picked up by
+# `make test`; run it explicitly. `check` is the full gate CI runs.
+smoke:
+	$(LUA) spec/storage_smoke.lua
+
+lint:
+	luacheck src bin main.lua spec
+
+check: lint test smoke
 
 run server:
 	$(LUA) main.lua
@@ -31,4 +42,4 @@ hash:
 	@test -n "$(PASSWORD)" || (echo "usage: make hash PASSWORD=mypass [ITER=10000]" && exit 1)
 	@$(LUA) bin/moonmq-hash.lua "$(PASSWORD)" $(ITER)
 
-.PHONY: deps test run server gateway example hash
+.PHONY: deps test smoke lint check run server gateway example hash

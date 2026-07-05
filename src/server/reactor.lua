@@ -150,9 +150,9 @@ function Reactor:listen(host, port, on_accept)
                 log:error("accept: %s", aerr)
                 self:sleep(0.1)
             else
-                local ip, port = client:getpeername()
+                local ip, peer_port = client:getpeername()
                 ip = ip or "?"
-                local peer = string.format("%s:%s", ip, port or "?")
+                local peer = string.format("%s:%s", ip, peer_port or "?")
                 self:spawn(function() on_accept(client, peer, ip) end)
             end
         end

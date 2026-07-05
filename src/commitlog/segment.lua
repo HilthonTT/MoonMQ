@@ -89,27 +89,36 @@ function Segment:build_index()
     local terr = self.index:truncate_entries(0)
     if terr then return terr end
 
+    -- File size up front so a corrupt length prefix can't drive a huge
+    -- allocation via file:read(total_size) — we bound each record against the
+    -- bytes actually remaining before trusting its length.
     local file_end = self.file:seek("end") or 0
     self.file:seek("set", 0)
 
     local next_offset = self.base_offset
     local position    = 0
 
-    while position < file_end do
-        -- Validate framing AND both CRCs for every record, via the same
-        -- deserialize_record the read path uses. Framing by the length prefix
-        -- alone (the old behaviour) was unsafe: a corrupt interior length
-        -- prefix yields a bogus size, the read comes up short, and every valid
-        -- record after it was silently discarded as a "torn tail" — while a
-        -- record with an intact length but corrupt payload was indexed and
-        -- served until read_at happened to re-check it. Stopping at the first
-        -- record that fails to decode (torn tail OR interior corruption) and
-        -- truncating from there is the only safe reframe: the log is
-        -- self-framed, so once a length prefix is corrupt the next record
-        -- boundary is unrecoverable anyway.
+    while true do
+        -- Peek the 8-byte length prefix, bound it against the file, then rewind
+        -- and decode the whole record through deserialize_record so the CRCs
+        -- are validated here — the same way segment_verify does for the
+        -- segmented backend. A short read, an out-of-range length, or a CRC
+        -- mismatch is treated as a torn tail: stop and truncate below. (The
+        -- old fast-path framed by length alone and skipped CRC entirely, so a
+        -- mid-log bit-flip was silently indexed and only faulted at read_at.)
+        local size_bytes = self.file:read(8)
+        if not size_bytes or #size_bytes < 8 then
+            break
+        end
+        local total_size = string.unpack(">I8", size_bytes)
+        if total_size < 0 or position + 8 + total_size > file_end then
+            break  -- length runs past EOF: torn/corrupt tail
+        end
+
+        self.file:seek("set", position)  -- rewind to the record start
         local msg, framed = message_m.deserialize_record(self.file)
         if not msg then
-            break  -- torn tail or corruption at `position`
+            break  -- short read or CRC mismatch: torn/corrupt tail
         end
 
         local werr = self.index:write_entry(next_offset, position)
@@ -121,7 +130,8 @@ function Segment:build_index()
 
     -- Drop any bytes past the last whole record (a half-written tail from a
     -- crash, or everything after an interior corruption). Without this, the
-    -- next append would sit after the garbage.
+    -- next append would sit after the garbage. file_end was computed up front
+    -- and the scan is read-only, so it still reflects the on-disk size.
     if position < file_end then
         log:warn("segment %020d: trimming %d byte(s) past last valid record at %d",
             self.base_offset, file_end - position, position)
@@ -245,6 +255,15 @@ end
 -- is reopened suffix-less and its index rebuilt. Returns nil on success, err
 -- otherwise. Mirrors jocko's Segment.Replace, used by compaction.
 function Segment:replace(old)
+    -- Make the cleaned replacement durable BEFORE the rename. On Windows
+    -- atomic_rename is remove-then-rename (non-atomic), so a crash can leave
+    -- only the ".cleaned" file as the surviving copy — CommitLog:open adopts
+    -- it on recovery, but only if its bytes actually reached disk.
+    local sok, serr = self:sync()
+    if not sok then
+        return string.format("sync cleaned segment failed: %s", tostring(serr))
+    end
+
     old:close()
     self:close()
 
