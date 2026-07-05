@@ -373,11 +373,11 @@ function SegmentedPartition:load_segments()
             while last_valid_entries > 0 do
                 local pos = (last_valid_entries - 1) * INDEX_ENTRY_SIZE
                 index_file:seek("set", pos)
-                local entry = index_file:read(INDEX_ENTRY_SIZE)
-                if not entry or #entry < INDEX_ENTRY_SIZE then
+                local raw_entry = index_file:read(INDEX_ENTRY_SIZE)
+                if not raw_entry or #raw_entry < INDEX_ENTRY_SIZE then
                     last_valid_entries = last_valid_entries - 1
                 else
-                    local _, file_pos = string.unpack(">I8I4", entry)
+                    local _, file_pos = string.unpack(">I8I4", raw_entry)
                     if file_pos < post_verify_size then
                         last_indexed_at = file_pos
                         break

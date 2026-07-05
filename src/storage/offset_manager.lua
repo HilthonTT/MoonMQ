@@ -29,6 +29,10 @@
 -- it round-trips the u64 verbatim.
 
 local msg_m = require("src.record.message")
+-- .get(component) returns a logger with :info/:warn/:debug/:error. Requiring
+-- the module directly (without .get) left `log` as the module table, whose
+-- log:info/log:warn calls are nil — crashing recover() on any restart that
+-- replays offsets. See offset_manager_spec "survives a broker restart".
 local log = require("src.log.logger").get("offset_manager")
 
 local OFFSETS_TOPIC = "__consumer_offsets"
@@ -154,6 +158,19 @@ function OffsetManager:commit(group, topic, partition, offset)
     local _, werr = part:write_message(rec)
     if werr then
         return nil, string.format("offset commit write failed: %s", werr)
+    end
+
+    -- Durability: write_message on the segmented backend only flushes the C
+    -- runtime buffer, so without this a crash after commit() returned true
+    -- would silently lose the offset. request_sync forces an fsync (batched
+    -- via the group committer when one is attached — the offsets topic gets a
+    -- committer like every other partition — so this coalesces under load
+    -- rather than one syscall per consumed message).
+    if part.request_sync then
+        local ok, serr = part:request_sync()
+        if not ok then
+            return nil, string.format("offset commit sync failed: %s", tostring(serr))
+        end
     end
 
     set_in_map(self.map, group, topic, partition, offset)

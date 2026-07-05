@@ -167,6 +167,35 @@ function Broker:detach_committers()
     end
 end
 
+-- tick_cleaners pumps every partition's retention/compaction cleaner one
+-- step. SegmentedPartition runs its cleaner as a manually-driven coroutine
+-- (tick_cleaner is a cheap no-op until the cleaner is due), so nothing ages
+-- out segments unless something calls this on a loop — the Server does, from
+-- a periodic reactor coroutine. Backends without a cleaner (CommitLogPartition
+-- cleans synchronously on roll) expose a no-op tick_cleaner, so this is
+-- uniform across backends. Returns the number of partitions that actually ran
+-- a cleanup pass on this tick (for logging/metrics).
+function Broker:tick_cleaners()
+    local ran = 0
+    for name, topic in pairs(self.topic_manager.topics) do
+        -- Skip internal topics (e.g. __consumer_offsets). They are
+        -- compaction-oriented (one live record per key), but the segmented
+        -- backend only does *time-based* retention — so ticking their cleaner
+        -- would delete old offset segments and an idle group could lose its
+        -- last committed offset on restart. Leaving them untouched keeps the
+        -- pre-existing safe behaviour (bounded only by real compaction, which
+        -- is tracked separately) rather than trading a leak for data loss.
+        if name:sub(1, 2) ~= "__" then
+            for _, p in ipairs(topic.partitions) do
+                if p.tick_cleaner and p:tick_cleaner() then
+                    ran = ran + 1
+                end
+            end
+        end
+    end
+    return ran
+end
+
 function Broker:get_topic(name)
     assert(type(name) == "string", "name must be a string")
 

@@ -7,11 +7,11 @@ local repl = require("src.repl.repl")
 
 local log = Log.get("main")
 
-local function is_main(_arg, ...)
-    local n_arg = _arg and #_arg or 0
+local function is_main(argv, ...)
+    local n_arg = argv and #argv or 0
     if n_arg == select("#", ...) then
         for i = 1, n_arg do
-            if _arg[i] ~= select(i, ...) then return false end
+            if argv[i] ~= select(i, ...) then return false end
         end
         return true
     end

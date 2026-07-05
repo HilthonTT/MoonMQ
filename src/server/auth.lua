@@ -18,6 +18,16 @@ local DEFAULT_PBKDF2_ITERATIONS = 600000
 local DEFAULT_SALT_BYTES        = 16
 local DEFAULT_HASH_BYTES        = 32
 
+-- Exported so the hash CLI (bin/moonmq-hash.lua) and any other caller pick
+-- up the same default instead of hard-coding a copy that silently drifts.
+-- NOTE: verification cost scales linearly with this count, and PBKDF2 here
+-- is pure-Lua running inline on the single reactor thread (see Auth:verify
+-- -> pbkdf2_hmac_sha256). At 600k a single AUTH stalls the whole event
+-- loop for a noticeable time; moving hashing off the reactor is the real
+-- fix (tracked separately) — this constant is deliberately kept high for
+-- offline-brute-force resistance, not because the reactor cost is solved.
+M.DEFAULT_PBKDF2_ITERATIONS = DEFAULT_PBKDF2_ITERATIONS
+
 local function xor_strings(a, b)
     assert(#a == #b, "xor_strings: length mismatch")
     local out = {}
