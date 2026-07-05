@@ -314,10 +314,15 @@ client should `join_group` again to get a fresh assignment. Joining a
 second, different group on one connection is rejected with
 `GROUP_CONFLICT`.
 
-> Note: `JOIN_GROUP` hands back the partitions a member owns, but `FETCH` /
-> `SUBSCRIBE` still consume every partition of a subscribed topic — honoring
-> the assignment (each member reading only its partitions) is the natural
-> next step and isn't wired yet.
+`JOIN_GROUP` hands back the partitions a member owns, and `FETCH` /
+`SUBSCRIBE` **honor that assignment**: each member reads only its assigned
+partitions, so a topic's partitions are divided across the group instead of
+every member draining every one. The broker re-derives the live assignment
+before each poll (`Server:_apply_group_assignment` → `Consumer:set_assignment`),
+so a rebalance — a member joining, leaving, or being reaped — takes effect on
+the member's next fetch without pushing a new assignment frame. A member the
+coordinator has evicted is pinned to "own nothing" until it re-joins, and a
+consumer that leaves its group reverts to reading every subscribed partition.
 
 ## Interactive console (MQL)
 
@@ -504,21 +509,27 @@ The `busted` binary at `/usr/local/bin/busted` is installed by `make deps` and i
 
 Current coverage:
 
-| Spec file                 | Module under test                                            |
-| ------------------------- | ------------------------------------------------------------ |
-| `buffer_spec.lua`         | `src/core/buffer.lua` — accumulating byte buffer             |
-| `crc32_spec.lua`          | `src/core/crc32.lua` — IEEE 802.3 CRC-32                     |
-| `future_spec.lua`         | `src/core/future.lua` — one-shot coroutine future            |
-| `group_spec.lua`          | `src/client/groups.lua` — consumer-group lifecycle FSM       |
-| `group_protocol_spec.lua` | `src/server/protocol.lua` — JOIN/LEAVE/HEARTBEAT wire format |
-| `message_spec.lua`        | `src/record/message.lua` — message wire format               |
-| `offset_manager_spec.lua` | `src/storage/offset_manager.lua` — durable group offsets     |
-| `partition_spec.lua`      | `src/storage/partition.lua` — append, read, recovery         |
-| `sql_lexer_spec.lua`      | `src/repl/sql/lexer.lua` — MQL console tokenizer             |
-| `sql_parser_spec.lua`     | `src/repl/sql/parser.lua` — MQL statement grammar            |
-| `time_spec.lua`           | `src/core/time.lua` — duration constants                     |
-| `topic_manager_spec.lua`  | `src/storage/topic_manager.lua` — topic/partition creation   |
-| `util_spec.lua`           | `src/core/util.lua` — topic-name validation                  |
+| Spec file                     | Module under test                                                    |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `buffer_spec.lua`             | `src/core/buffer.lua` — accumulating byte buffer                     |
+| `chaos_spec.lua`              | fault-injection resilience (`ChaosProducer` over Broker/Producer)    |
+| `commitlog_spec.lua`          | `src/commitlog/commitlog.lua` — append, recovery, compaction         |
+| `commitlog_backend_spec.lua`  | commitlog storage backend, end-to-end via Broker/Producer/Consumer   |
+| `consumer_assignment_spec.lua`| `src/client/consumer.lua` — `set_assignment` / `owns` filtering       |
+| `crc32_spec.lua`              | `src/core/crc32.lua` — IEEE 802.3 CRC-32                             |
+| `future_spec.lua`             | `src/core/future.lua` — one-shot coroutine future                    |
+| `group_spec.lua`              | `src/client/groups.lua` — consumer-group lifecycle FSM               |
+| `group_assignment_spec.lua`   | end-to-end proof a member polls only its assigned partitions         |
+| `group_protocol_spec.lua`     | `src/server/protocol.lua` — JOIN/LEAVE/HEARTBEAT wire format         |
+| `message_spec.lua`            | `src/record/message.lua` — message wire format                       |
+| `offset_manager_spec.lua`     | `src/storage/offset_manager.lua` — durable group offsets             |
+| `partition_spec.lua`          | `src/storage/partition.lua` — append, read, recovery                 |
+| `segmentation_spec.lua`       | `src/storage/segmentation.lua` — `SegmentedPartition` roll & lookup  |
+| `sql_lexer_spec.lua`          | `src/repl/sql/lexer.lua` — MQL console tokenizer                     |
+| `sql_parser_spec.lua`         | `src/repl/sql/parser.lua` — MQL statement grammar                    |
+| `time_spec.lua`               | `src/core/time.lua` — duration constants                             |
+| `topic_manager_spec.lua`      | `src/storage/topic_manager.lua` — topic/partition creation           |
+| `util_spec.lua`               | `src/core/util.lua` — topic-name validation                          |
 
 Credit:
 
