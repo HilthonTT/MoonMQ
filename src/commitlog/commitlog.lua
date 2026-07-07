@@ -86,6 +86,20 @@ function CommitLog.new(options)
     if options.max_log_bytes == 0 then
         options.max_log_bytes = RETAIN_ALL
     end
+
+    -- The index stores each record's byte position as a big-endian u32
+    -- (src/commitlog/index.lua). If a segment is allowed to grow past 4 GiB, a
+    -- record positioned beyond 2^32-1 makes string.pack(">I4", position) raise
+    -- an uncaught error inside the append path and crash the writer. Reject the
+    -- misconfiguration up front rather than failing on a future append. A
+    -- segment can slightly overshoot its cap before rolling, so bound with a
+    -- margin below the u32 ceiling.
+    local MAX_SEGMENT_BYTES_LIMIT = 0xFFFFFFFF - (64 * 1024 * 1024)
+    if options.max_segment_bytes > MAX_SEGMENT_BYTES_LIMIT then
+        return nil, string.format(
+            "max_segment_bytes %d exceeds limit %d (index positions are u32)",
+            options.max_segment_bytes, MAX_SEGMENT_BYTES_LIMIT)
+    end
     if options.cleanup_policy == "" then
         options.cleanup_policy = CleanupPolicy.Delete
     end
@@ -301,6 +315,29 @@ function CommitLog:segment_for_offset(offset)
         local s = self.segments[i]
         if offset >= s.base_offset and offset < s.next_offset then
             return s
+        end
+    end
+    return nil
+end
+
+-- next_readable_offset returns the smallest offset >= `offset` that a segment
+-- actually owns, or nil if `offset` is at/after the tail. Compaction renumbers
+-- each segment's survivors contiguously from its base_offset, leaving GAPS
+-- between segments; a consumer whose cursor lands in such a gap gets an
+-- "out of range" error from read_at forever. This lets the caller skip the gap
+-- to the next real record instead. Within a segment offsets are dense, so a gap
+-- only ever sits before some segment's base_offset.
+function CommitLog:next_readable_offset(offset)
+    for i = 1, #self.segments do
+        local s = self.segments[i]
+        if offset < s.next_offset then
+            -- This is the first segment ending after `offset`. Either it owns
+            -- `offset` (offset >= base_offset) or `offset` sits in the gap just
+            -- before it; the next readable record is at max(offset, base_offset).
+            if offset >= s.base_offset then
+                return offset
+            end
+            return s.base_offset
         end
     end
     return nil

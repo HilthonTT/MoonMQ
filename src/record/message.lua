@@ -86,13 +86,26 @@ local function deserialize_record(file)
     end
     local total_size = string.unpack(">I8", size_bytes)
 
+    -- Bound total_size BEFORE allocating the read. The length prefix is not
+    -- covered by either CRC, so a torn write or at-rest/on-the-wire corruption
+    -- can turn it into any u64. Reading it blindly lets a single flipped byte
+    -- request a multi-gigabyte string (OOM/crash); when the high bit is set the
+    -- value unpacks to a negative Lua integer that io.read casts to a huge
+    -- size_t. The lower-bound check (moved up from below) also rejects the
+    -- negative case since any negative is < HEADER_LEN + 4 + 4.
+    if total_size < HEADER_LEN + 4 + 4 then
+        return nil, nil, "corrupt header: total_size too small"
+    end
+    local cur  = file:seek()          -- position just past the 8-byte prefix
+    local endp = file:seek("end")
+    if cur then file:seek("set", cur) end
+    if not cur or not endp or total_size > endp - cur then
+        return nil, nil, "corrupt length prefix: exceeds remaining file bytes"
+    end
+
     local body = file:read(total_size)
     if not body or #body < total_size then
         return nil, nil, "failed to read message body: unexpected EOF"
-    end
-
-    if total_size < HEADER_LEN + 4 + 4 then
-        return nil, nil, "corrupt header: total_size too small"
     end
 
     local header_bytes       = body:sub(1, HEADER_LEN)

@@ -29,6 +29,14 @@ if arg[2] and arg[2] ~= "" then
             "iterations must be a positive integer (got: %q)\n", tostring(arg[2])))
         os.exit(1)
     end
+    -- Mirror auth.parse_hash's ceiling so this tool can't emit a hash the
+    -- broker will reject at boot ("iterations exceeds maximum").
+    if iterations > auth.MAX_PBKDF2_ITERATIONS then
+        io.stderr:write(string.format(
+            "iterations must be at most %d (got: %d)\n",
+            auth.MAX_PBKDF2_ITERATIONS, iterations))
+        os.exit(1)
+    end
 end
 
 print(auth.hash_password(password, { iterations = iterations }))

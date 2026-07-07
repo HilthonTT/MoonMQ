@@ -353,6 +353,14 @@ local MAX_GROUP_ID      = 256
 local MAX_MEMBER_ID     = 256
 local MAX_CLIENT_NAME   = 128
 local MAX_CLIENT_VERSION = 64
+-- Credential caps. The password is the PBKDF2/HMAC *key*, and HMAC re-derives
+-- its block key from the full key on every one of the (600k) iterations, so
+-- verify cost is O(iterations * password_length). Left at the 64 KiB default
+-- string cap, a single AUTH frame with a 64 KiB password stalls the entire
+-- single-threaded reactor for seconds. Cap both fields tightly — no legitimate
+-- username/password approaches 1 KiB.
+local MAX_USERNAME      = 256
+local MAX_PASSWORD      = 1024
 -- Cap topics-per-join so a single JOIN_GROUP frame can't ask us to
 -- decode an attacker-chosen number of length-prefixed strings. 256 is
 -- far above any realistic subscription set.
@@ -368,9 +376,9 @@ function M.decode_hello(payload)
 end
 
 function M.decode_auth(payload)
-    local user, p, err = decode_string(payload, 1)
+    local user, p, err = decode_string(payload, 1, MAX_USERNAME)
     if not user then return nil, err end
-    local pass, _, perr = decode_string(payload, p)
+    local pass, _, perr = decode_string(payload, p, MAX_PASSWORD)
     if not pass then return nil, perr end
     return { username = user, password = pass }, nil
 end

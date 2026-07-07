@@ -24,7 +24,8 @@ end
 function BatchWriter:add(msg)
     assert(getmetatable(msg) == msg_m.Message, "msg must be a Message instance")
 
-    local msg_bytes = msg_m.serialize_message(msg)
+    local msg_bytes, serr = msg_m.serialize_message(msg)
+    if not msg_bytes then return nil, serr end
 
     -- Flush BEFORE adding when adding would push us over either cap;
     -- this preserves the requested cap as a hard upper bound on batch
@@ -52,15 +53,22 @@ function BatchWriter:flush()
     local ok, err = self.partition:write(data)
     if not ok then return nil, err end
 
+    -- Once write() succeeds the bytes are appended to the segment and the
+    -- partition's offset has advanced — they are committed. Clear the buffer
+    -- NOW, before the sync attempt. Otherwise a sync failure returns an error
+    -- with the batch still buffered, and a caller that retries flush() (or adds
+    -- more and flushes) appends the same bytes a second time — duplicate,
+    -- individually-CRC-valid records that recovery cannot distinguish. The sync
+    -- error is still surfaced; it just no longer re-buffers already-written data.
+    self.buffer = {}
+    self.buffer_size = 0
+    self.count = 0
+
     -- Push userspace + OS buffers to disk. Without this, BatchWriter
     -- claims to have committed N messages while they linger in the
     -- C runtime buffer until the next process exit.
     local sok, serr = self.partition:sync()
     if not sok then return nil, serr end
-
-    self.buffer = {}
-    self.buffer_size = 0
-    self.count = 0
 
     return true, nil
 end

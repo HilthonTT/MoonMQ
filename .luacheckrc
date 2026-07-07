@@ -22,6 +22,7 @@ ignore = {
     "621",  -- inconsistent indentation (mixed tabs in the vendored FSM port)
     "611",  -- line contains only whitespace
     "612",  -- line contains trailing whitespace
+    "613",  -- trailing whitespace in a string (help.lua reference text)
     "614",  -- trailing whitespace in comment
     "631",  -- line too long
 }

@@ -68,6 +68,10 @@ function Partition:write(data)
     assert(type(data) == "string", "data must be a string")
     if not self.file then return false, "no file open" end
 
+    -- Reposition to EOF before writing: read_message seeks+reads this same "a+b"
+    -- handle, and C stdio (enforced by Windows UCRT) rejects a write directly
+    -- after a read on an update stream without an intervening positioning call.
+    self.file:seek("end")
     local ok, err = self.file:write(data)
     if not ok then return false, err end
 
@@ -115,6 +119,10 @@ function Partition:write_message(msg)
                 .. payload
                 .. string.pack(">I4", payload_crc)
 
+    -- Reposition to EOF before writing (see Partition:write): a read on this
+    -- "a+b" handle leaves it in read state, and a write directly after is stdio
+    -- UB that Windows UCRT rejects.
+    self.file:seek("end")
     local ok, err = self.file:write(record)
     if not ok then
         return -1, string.format("failed to write message: %s", err)
@@ -146,16 +154,24 @@ function Partition:read_message(offset)
     end
     local total_size = string.unpack(">I8", size_bytes)
 
+    -- Bound total_size against the bytes actually left in the file BEFORE
+    -- allocating the read. offset is a caller-supplied FETCH cursor, so it can
+    -- land mid-record where the 8 bytes decode to an arbitrary (or negative,
+    -- via the u64 high bit) length; reading that blindly is a memory-exhaustion
+    -- DoS. self.offset is the in-memory write tail, so no extra syscall.
+    local HEADER_LEN = 12
+    if total_size < HEADER_LEN + 4 + 4 then
+        return nil, offset, "corrupt header: total_size too small"
+    end
+    if total_size > self.offset - (offset + 8) then
+        return nil, offset, "corrupt length prefix: exceeds remaining file bytes"
+    end
+
     -- Pull the whole record body in one read; slicing strings is much
     -- cheaper than four seeks/reads, and we need the bytes anyway to CRC.
     local body = self.file:read(total_size)
     if not body or #body < total_size then
         return nil, offset, "failed to read message body: unexpected EOF"
-    end
-
-    local HEADER_LEN = 12
-    if total_size < HEADER_LEN + 4 + 4 then
-        return nil, offset, "corrupt header: total_size too small"
     end
 
     local header_bytes       = body:sub(1, HEADER_LEN)

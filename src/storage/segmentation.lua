@@ -282,6 +282,20 @@ function SegmentedPartition:load_segments()
     end
     table.sort(decorated, function(a, b) return a.n < b.n end)
 
+    -- Any error return below aborts the load, and SegmentedPartition.new
+    -- discards the half-built object. Without this the file/index handles of
+    -- every segment already pushed into self.segments would leak until GC —
+    -- which compounds under create_topic's partial-failure retry loop. Route
+    -- all error returns through fail() so those handles are closed first.
+    local function fail(msg)
+        for _, s in ipairs(self.segments) do
+            pcall(function() s.file:close() end)
+            if s.index_file then pcall(function() s.index_file:close() end) end
+        end
+        self.segments = {}
+        return msg
+    end
+
     local now = socket.gettime()
     for i, entry in ipairs(decorated) do
         local path        = entry.path
@@ -289,7 +303,7 @@ function SegmentedPartition:load_segments()
         local is_active   = (i == #decorated)
 
         local sf = io.open(path, "rb")
-        if not sf then return string.format("cannot open %s", path) end
+        if not sf then return fail(string.format("cannot open %s", path)) end
         local on_disk_size = sf:seek("end") or 0
         sf:close()
         local seg_end_virtual = base_offset + on_disk_size
@@ -317,7 +331,7 @@ function SegmentedPartition:load_segments()
             end
             local last_good, verr = verify_file(path, start_at)
             if verr then
-                return string.format("verify %s: %s", path, verr)
+                return fail(string.format("verify %s: %s", path, verr))
             end
             -- verify_file truncates at the first bad frame and returns the
             -- post-truncate byte position. Use it as authoritative size.
@@ -326,8 +340,8 @@ function SegmentedPartition:load_segments()
 
         local file, ferr = io.open(path, "a+b")
         if not file then
-            return string.format("failed to open segment file %s: %s",
-                                 path, ferr)
+            return fail(string.format("failed to open segment file %s: %s",
+                                 path, ferr))
         end
 
         -- start_time: prefer the .meta sidecar (written at create time),
@@ -358,8 +372,8 @@ function SegmentedPartition:load_segments()
         local index_file, ierr = io.open(index_path, "a+b")
         if not index_file then
             pcall(function() file:close() end)
-            return string.format("failed to open timeindex %s: %s",
-                                 index_path, ierr)
+            return fail(string.format("failed to open timeindex %s: %s",
+                                 index_path, ierr))
         end
 
         local index_size = index_file:seek("end") or 0
@@ -392,9 +406,9 @@ function SegmentedPartition:load_segments()
                 if not tok then
                     pcall(function() file:close() end)
                     pcall(function() index_file:close() end)
-                    return string.format(
+                    return fail(string.format(
                         "failed to truncate stale timeindex %s: %s",
-                        index_path, terr)
+                        index_path, terr))
                 end
             end
         end
@@ -451,6 +465,11 @@ function SegmentedPartition:_maybe_index(segment, ts, file_pos)
     end
 
     local entry = string.pack(">I8I4", ts, file_pos)
+    -- Reposition to EOF before writing: offset_for_timestamp reads this "a+b"
+    -- index handle, and a write directly after a read is stdio UB that Windows
+    -- UCRT rejects — which would silently stop all further time-indexing for
+    -- this segment (the failure is only warn-logged).
+    segment.index_file:seek("end")
     local ok, err = segment.index_file:write(entry)
     if not ok then
         log:warn("timeindex write segment=%020d: %s",
@@ -536,6 +555,12 @@ function SegmentedPartition:write_message(msg)
     local file_pos_in_segment = self.active_segment.bytes_written
     local global_offset = self.active_segment.base_offset + file_pos_in_segment
 
+    -- Reposition to EOF before writing: read_message seeks+reads on this same
+    -- "a+b" handle, and C stdio (enforced by Windows UCRT) rejects a write
+    -- directly after a read on an update stream without an intervening
+    -- positioning call. Without this, a consumer reading a non-tail record
+    -- poisons the handle and the next produce fails.
+    self.active_segment.file:seek("end")
     local ok, werr = self.active_segment.file:write(bytes)
     if not ok then
         return nil, string.format("failed to write message: %s", werr)
@@ -569,6 +594,10 @@ function SegmentedPartition:write(data)
     local rerr = self:_roll_if_full(#data)
     if rerr then return false, rerr end
 
+    -- Reposition to EOF before writing (see write_message): reads on this "a+b"
+    -- handle leave it in read state, and a write directly after is stdio UB that
+    -- Windows UCRT rejects.
+    self.active_segment.file:seek("end")
     local ok, werr = self.active_segment.file:write(data)
     if not ok then return false, werr end
 
@@ -797,14 +826,22 @@ function SegmentedPartition:read_message(offset)
     end
     local total_size = string.unpack(">I8", size_bytes)
 
-    local body = seg.file:read(total_size)
-    if not body or #body < total_size then
-        return nil, offset, "failed to read message body: unexpected EOF"
-    end
-
+    -- Bound total_size against the bytes remaining in this segment BEFORE
+    -- allocating the read. offset is a caller-supplied FETCH cursor; if it
+    -- lands mid-record the 8 bytes decode to an arbitrary (or negative, via the
+    -- u64 high bit) length, and reading it blindly is a memory-exhaustion DoS.
+    -- seg.bytes_written is the in-memory segment size, so no extra syscall.
     local HEADER_LEN = 12
     if total_size < HEADER_LEN + 4 + 4 then
         return nil, offset, "corrupt header: total_size too small"
+    end
+    if total_size > seg.bytes_written - (local_pos + 8) then
+        return nil, offset, "corrupt length prefix: exceeds remaining segment bytes"
+    end
+
+    local body = seg.file:read(total_size)
+    if not body or #body < total_size then
+        return nil, offset, "failed to read message body: unexpected EOF"
     end
 
     local header_bytes       = body:sub(1, HEADER_LEN)

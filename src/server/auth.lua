@@ -28,6 +28,13 @@ local DEFAULT_HASH_BYTES        = 32
 -- offline-brute-force resistance, not because the reactor cost is solved.
 M.DEFAULT_PBKDF2_ITERATIONS = DEFAULT_PBKDF2_ITERATIONS
 
+-- Upper bound on the iteration count parse_hash will accept. A corrupted or
+-- typo'd config shouldn't be able to wedge auth in a 2^31-iter PBKDF2 loop.
+-- Exported so the hash CLI (bin/moonmq-hash.lua) rejects the same ceiling and
+-- can't emit a hash the broker then refuses to load at boot.
+local MAX_PBKDF2_ITERATIONS = 1000000
+M.MAX_PBKDF2_ITERATIONS = MAX_PBKDF2_ITERATIONS
+
 local function xor_strings(a, b)
     assert(#a == #b, "xor_strings: length mismatch")
     local out = {}
@@ -119,8 +126,8 @@ local function parse_hash(stored)
     -- Sanity cap. Stored hashes are server-controlled so this isn't a
     -- DoS vector in practice, but a corrupted/typo'd config shouldn't
     -- be able to wedge auth in a 2^31-iter PBKDF2 loop.
-    if iterations > 1000000 then
-        return nil, "iterations exceeds maximum (1000000)"
+    if iterations > MAX_PBKDF2_ITERATIONS then
+        return nil, string.format("iterations exceeds maximum (%d)", MAX_PBKDF2_ITERATIONS)
     end
 
     local ok_s, salt = pcall(sha2.hex_to_bin, salt_hex)

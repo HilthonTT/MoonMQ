@@ -144,6 +144,25 @@ function Consumer:poll()
                 and partition and offset < partition.offset then
                 local msg, next_offset, read_err = partition:read_message(offset)
                 if msg then
+                    -- Commit BEFORE advancing the in-memory offset. If we bumped
+                    -- self.offsets first and the commit then failed, a caller that
+                    -- treats the error as "poll produced nothing" would resume from
+                    -- the already-advanced offset on the next poll and silently skip
+                    -- this record — data loss stronger than auto_commit's
+                    -- at-least-once contract. On failure we leave the offset where it
+                    -- was and return the records already collected (and durably
+                    -- committed) this poll rather than discarding the whole batch.
+                    if self.auto_commit then
+                        local cok, cerr = self:commit_offset(topic_name, partition_id, next_offset)
+                        if not cok then
+                            if #records > 0 then
+                                return records, nil
+                            end
+                            return nil, cerr
+                        end
+                    end
+
+                    self.offsets[topic_name][partition_id] = next_offset
                     records[#records + 1] = ConsumerRecord.new(
                         topic_name,
                         partition_id,
@@ -152,14 +171,6 @@ function Consumer:poll()
                         msg.value,
                         msg.timestamp
                     )
-                    self.offsets[topic_name][partition_id] = next_offset
-
-                    if self.auto_commit then
-                        local cok, cerr = self:commit_offset(topic_name, partition_id, next_offset)
-                        if not cok then
-                            return nil, cerr
-                        end
-                    end
                 else
                     -- Skip past a torn / corrupted tail; otherwise surface.
                     if is_eof_error(read_err) then

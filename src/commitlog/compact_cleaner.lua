@@ -51,6 +51,15 @@ function CompactCleaner:clean(segments)
     -- Pass 2: rewrite each segment, keeping only latest-per-key records.
     local cleaned = {}
     for _, seg in ipairs(segments) do
+        -- Start the ".cleaned" twin from empty. Segment.new opens "a+b" and its
+        -- build_index adopts whatever is already in the file, so a leftover twin
+        -- from a compaction that failed mid-run (without a process restart, so
+        -- open()'s startup recovery never ran) would have its stale — possibly
+        -- superseded — records scanned in and then re-appended, resurrecting
+        -- values compaction was meant to drop. Remove both twin files first.
+        os.remove(segment_m.log_path(seg.dir, seg.base_offset, ".cleaned"))
+        os.remove(segment_m.index_path(seg.dir, seg.base_offset, ".cleaned"))
+
         local cs, err = Segment.new(seg.dir, seg.base_offset, seg.max_bytes, ".cleaned")
         if not cs then return nil, err end
 

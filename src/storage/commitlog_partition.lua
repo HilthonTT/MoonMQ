@@ -100,6 +100,19 @@ function CommitLogPartition:read_message(offset)
                 string.format("offset %d below oldest retained: unexpected EOF",
                               offset)
         end
+        -- The offset may have landed in a compaction gap (oldest <= offset <
+        -- newest, but owned by no segment because compaction renumbered
+        -- survivors and left holes between segments). read_at returns a fatal
+        -- "out of range" error there, which the consumer would hit on every
+        -- poll forever. Skip the gap to the next real record instead.
+        local nxt = self.commitlog:next_readable_offset(offset)
+        if nxt and nxt > offset then
+            local gmsg, gnext, gerr = self.commitlog:read_at(nxt)
+            if gmsg then
+                return gmsg, gnext, nil
+            end
+            err = gerr
+        end
         return nil, offset, err
     end
     return msg, next_offset, nil

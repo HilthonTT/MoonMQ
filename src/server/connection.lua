@@ -157,8 +157,11 @@ function Connection:can_handle(op)
         return op == proto.OP_IDENTIFY_CLIENT
             or op == proto.OP_AUTH
     elseif self.state == Connection.STATE_AUTHENTICATED then
-        -- HELLO is one-shot; re-issuing it post-handshake is malformed.
-        return op ~= proto.OP_HELLO
+        -- HELLO is one-shot; re-issuing it post-handshake is malformed. AUTH is
+        -- likewise one-shot: re-authenticating on an already-authenticated
+        -- connection would re-run the expensive inline PBKDF2 (a reactor-stall
+        -- amplifier) and let a session silently swap its username mid-stream.
+        return op ~= proto.OP_HELLO and op ~= proto.OP_AUTH
     end
 
     return false

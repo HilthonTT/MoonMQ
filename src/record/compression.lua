@@ -44,7 +44,14 @@ local function decompress_gzip(data)
 end
 
 local function decompress_snappy(data)
-    local decompressed, err = snappy.uncompress(data)
+    -- pcall for parity with the gzip path: snappy.uncompress already returns
+    -- (nil, err) for malformed input, but the underlying FFI can still raise
+    -- (e.g. libsnappy not loadable), and an uncaught error here would crash the
+    -- caller instead of surfacing as a decode failure.
+    local ok, decompressed, err = pcall(snappy.uncompress, data)
+    if not ok then
+        return nil, string.format("failed to decompress with snappy: %s", tostring(decompressed))
+    end
     if not decompressed then
         return nil, string.format("failed to decompress with snappy: %s", err)
     end

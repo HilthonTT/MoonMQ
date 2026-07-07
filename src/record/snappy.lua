@@ -37,6 +37,15 @@ local SNAPPY_OK              = 0
 local SNAPPY_INVALID_INPUT   = 1
 local SNAPPY_BUFFER_TOO_SMALL = 2
 
+-- Upper bound on a single decompressed frame. snappy_uncompressed_length only
+-- parses the varint length prefix at the front of the frame — it does NOT
+-- validate the body — so a tiny (~5-byte) malformed input can declare a ~4 GiB
+-- output and force that allocation before snappy_uncompress ever runs (a
+-- memory-amplification bomb). 256 MiB is far above any real message while still
+-- refusing an obviously bogus declared length. Callers that legitimately need
+-- larger frames can raise this.
+local MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+
 local function status_name(code)
     code = tonumber(code)
     if     code == SNAPPY_OK              then return "OK"
@@ -75,13 +84,35 @@ local function uncompress(data)
         return nil, string.format("snappy_uncompressed_length: %s", status_name(status))
     end
 
-    local out = ffi.new("char[?]", out_len[0])
-    status = lib.snappy_uncompress(data, in_len, out, out_len)
-    if status ~= SNAPPY_OK then
-        return nil, string.format("snappy_uncompress: %s", status_name(status))
+    -- Reject an attacker-declared length before allocating for it. Without this
+    -- a malformed frame declaring a huge length triggers a giant allocation
+    -- (bomb), and ffi.new itself RAISES on allocation failure rather than
+    -- returning nil — so the allocation + uncompress is pcall-wrapped to turn
+    -- any such failure into a clean (nil, err) instead of an uncaught crash.
+    local declared = tonumber(out_len[0])
+    if declared > MAX_UNCOMPRESSED_BYTES then
+        return nil, string.format(
+            "snappy_uncompress: declared length %d exceeds max %d",
+            declared, MAX_UNCOMPRESSED_BYTES)
     end
 
-    return ffi.string(out, out_len[0]), nil
+    local ok, result, err = pcall(function()
+        local out = ffi.new("char[?]", out_len[0])
+        local st  = lib.snappy_uncompress(data, in_len, out, out_len)
+        if st ~= SNAPPY_OK then
+            return nil, string.format("snappy_uncompress: %s", status_name(st))
+        end
+        return ffi.string(out, out_len[0]), nil
+    end)
+    if not ok then
+        -- pcall caught a raised error (e.g. ffi.new allocation failure); `result`
+        -- holds the error object here.
+        return nil, string.format("snappy_uncompress: %s", tostring(result))
+    end
+    if result == nil then
+        return nil, err
+    end
+    return result, nil
 end
 
 return {

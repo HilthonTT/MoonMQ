@@ -227,6 +227,11 @@ function Server:_unregister_conn(conn)
     else
         self.conn_by_ip[conn.ip] = n
     end
+
+    -- Re-emit the live gauge on close. It was only ever set on accept, so
+    -- without this it reports cumulative accepts and never reflects closes —
+    -- climbing monotonically and reading as "at capacity" when it isn't.
+    metrics.set("moonmq_connections_open", self.connections)
 end
 
 function Server:_handle(sock, peer, ip)
@@ -250,7 +255,19 @@ function Server:_handle(sock, peer, ip)
         return
     end
 
-    local conn = Connection.new(self, sock, peer, ip)
+    -- Connection.new must be inside a pcall too: _register_conn already claimed
+    -- a capacity slot (and a per-IP slot), and if construction throws before the
+    -- connection is tracked in connections_by_id, _unregister_conn's guard makes
+    -- it a no-op — permanently leaking those slots. On failure, release them.
+    local made_ok, conn = pcall(Connection.new, self, sock, peer, ip)
+    if not made_ok then
+        log:error("Connection.new failed for %s: %s", ip, tostring(conn))
+        if self.connections > 0 then self.connections = self.connections - 1 end
+        local n = (self.conn_by_ip[ip] or 1) - 1
+        self.conn_by_ip[ip] = n > 0 and n or nil
+        pcall(function() sock:close() end)
+        return
+    end
     self.connections_by_id[conn.id] = conn
 
     metrics.inc("moonmq_connections_accepted_total")

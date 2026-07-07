@@ -163,6 +163,15 @@ end
 function Segment:write(record)
     assert(type(record) == "string", "record must be a string")
 
+    -- Reposition to EOF before writing. The log handle is opened "a+b" (an
+    -- update stream) and read_at/each seek+read from it; C stdio forbids a write
+    -- directly after a read on an update stream without an intervening
+    -- positioning call, and Windows UCRT enforces it — the write returns nil and
+    -- the append fails. A lagging consumer reading a non-tail record would
+    -- otherwise poison this handle so the next produce fails. seek("end") is the
+    -- required reposition (append mode already targets EOF, so it's a no-op to
+    -- the byte position).
+    self.file:seek("end")
     local ok, werr = self.file:write(record)
     if not ok then
         return false, string.format("log write failed: %s", tostring(werr))
