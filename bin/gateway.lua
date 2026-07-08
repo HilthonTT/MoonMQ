@@ -105,6 +105,11 @@ local function read_http_request(reactor, sock)
         elseif partial and #partial > 0 then
             buf = buf .. partial
         end
+        -- Check the terminator BEFORE parking on wait_readable: a request
+        -- shorter than the receive window arrives as `partial` + "timeout",
+        -- and the peer sends nothing further until it gets a response —
+        -- waiting first would park this coroutine until the peer gives up.
+        if buf:find("\r\n\r\n", 1, true) then break end
         if err == "timeout" then
             if socket.gettime() > deadline then return nil, "read deadline" end
             reactor:wait_readable(sock)
@@ -141,6 +146,9 @@ local function read_http_request(reactor, sock)
         elseif partial and #partial > 0 then
             body = body .. partial
         end
+        -- Same as the header loop: if the partial completed the body, don't
+        -- park on a socket that will never become readable again.
+        if #body >= cl then break end
         if err == "timeout" then
             if socket.gettime() > deadline then return nil, "body read deadline" end
             reactor:wait_readable(sock)

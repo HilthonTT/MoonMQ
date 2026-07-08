@@ -1,9 +1,9 @@
 -- Integration test: a topic backed by the commitlog storage backend, exercised
 -- through the same Broker / Producer / Consumer path the server uses.
 
-local broker_m = require("src.storage.broker")
-local prd_m    = require("src.client.producer")
-local cons_m   = require("src.client.consumer")
+local broker_m = require("src.broker")
+local prd_m    = require("src.broker.producer")
+local cons_m   = require("src.broker.consumer")
 local message  = require("src.record.message")
 local os_utils = require("src.core.os")
 local fs_m     = require("src.io.fs")

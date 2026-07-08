@@ -75,8 +75,6 @@ local default = {
         builtin    = { "bright", "underscore", "green" }
     },
 
-    help = "src.repl.help",
-
     dump = {
         depthLimit = 5,
         itemsLimit = 30

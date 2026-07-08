@@ -1,5 +1,5 @@
-local proto = require("src.server.protocol")
-local uuid  = require("src.server.uuid")
+local proto = require("src.wire.protocol")
+local uuid  = require("src.core.uuid")
 
 -- Strip the u32 length prefix an encode_* frame carries and hand the body
 -- to parse_frame, the same way the reader coroutine does on the wire.

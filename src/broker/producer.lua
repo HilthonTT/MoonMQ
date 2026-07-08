@@ -1,6 +1,6 @@
 local message = require("src.record.message")
 local socket  = require("socket")
-local brk     = require("src.storage.broker")
+local brk     = require("src.broker")
 local Future  = require("src.core.future")
 local util    = require("src.core.util")
 local log     = require("src.log.logger").get("producer")

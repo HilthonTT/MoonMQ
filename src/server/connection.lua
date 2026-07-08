@@ -25,10 +25,10 @@
 -- state==closed on their next wakeup and exit.
 
 local socket          = require("socket")
-local uuid     = require("src.server.uuid")
+local uuid     = require("src.core.uuid")
 local framer   = require("src.server.framer")
-local proto    = require("src.server.protocol")
-local metrics  = require("src.server.metrics")
+local proto    = require("src.wire.protocol")
+local metrics  = require("src.metrics")
 local log      = require("src.log.logger").get("server")
 
 local Connection = {}

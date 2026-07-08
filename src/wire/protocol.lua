@@ -5,7 +5,7 @@
 -- │ FrameLen(4B) │ Op(1B) │ CorrelID(16B)  │ Payload(var) │
 -- └──────────────┴────────┴────────────────┴──────────────┘
 --
--- CorrelID is a 16-byte UUID (see src/server/uuid.lua), matching the
+-- CorrelID is a 16-byte UUID (see src/core/uuid.lua), matching the
 -- connection identifiers used throughout the server.
 --
 -- FrameLen covers everything after itself (op + correl_id + payload).

@@ -3,11 +3,13 @@
 --   - capacity accounting (max_connections, max_connections_per_ip)
 --   - ban enforcement at accept time
 --   - opcode dispatch on authenticated connections
+--   - background loops (group reaper, partition cleaner tick)
 --
--- Per-connection lifecycle (reader/sender/heartbeat coroutines, send
--- queue, state machine, close-reason logging) is delegated to
--- src/server/connection.lua so this file stays focused on the
--- application-level command handlers.
+-- The pieces it delegates:
+--   - per-connection lifecycle (reader/sender/heartbeat coroutines, send
+--     queue, state machine, close-reason logging) → src/server/connection.lua
+--   - application-level command handlers, one per opcode → src/server/handlers.lua
+--   - consumer-group registry/assignment/reaping → src/server/group_coordinator.lua
 --
 -- Patterns lifted from KurrentDB's TCP transport:
 --   - 16-byte UUID connection IDs (logged on accept & on close)
@@ -20,21 +22,18 @@
 --   - Pending-send cap reinterpreted as a per-write deadline
 --   - Pre-auth opcode whitelist (only HELLO/AUTH/IDENTIFY/HEARTBEAT allowed)
 
-local socket      = require("socket")
-local Reactor     = require("src.server.reactor")
-local proto       = require("src.server.protocol")
-local Connection  = require("src.server.connection")
-local uuid        = require("src.server.uuid")
-local brk_m       = require("src.storage.broker")
-local prd_m       = require("src.client.producer")
-local consumer_m  = require("src.client.consumer")
-local groups_m    = require("src.client.groups")
-local msg_m       = require("src.record.message")
-local metrics     = require("src.server.metrics")
-local MetricsHttp = require("src.server.metrics_http")
-local version_m   = require("src.core.version")
-local log         = require("src.log.logger").get("server")
-local push_log    = require("src.log.logger").get("push")
+local Reactor          = require("src.server.reactor")
+local proto            = require("src.wire.protocol")
+local Connection       = require("src.server.connection")
+local handlers         = require("src.server.handlers")
+local GroupCoordinator = require("src.server.group_coordinator")
+local uuid             = require("src.core.uuid")
+local brk_m            = require("src.broker")
+local prd_m            = require("src.broker.producer")
+local metrics          = require("src.metrics")
+local MetricsHttp      = require("src.server.metrics_http")
+local version_m        = require("src.core.version")
+local log              = require("src.log.logger").get("server")
 
 -- Tightened from a hypothetical 16 MiB to 1 MiB. A 1 MiB cap is still
 -- generous for a message queue and bounds worst-case memory under
@@ -81,7 +80,7 @@ local DEFAULT_GROUP_COMMIT_LINGER_S    = 0.002
 local DEFAULT_GROUP_COMMIT_MAX_WAITERS = 64
 -- How often the coordinator ticks ConsumerGroup:check_heartbeats to evict
 -- members that stopped sending GROUP_HEARTBEAT. The group's own session
--- deadline is 30s (src/client/groups.lua); polling every 10s detects a
+-- deadline is 30s (src/broker/groups.lua); polling every 10s detects a
 -- dead member within ~10s of the deadline, which is plenty responsive for
 -- a rebalance without spinning the reactor.
 local DEFAULT_GROUP_REAPER_INTERVAL_S  = 10
@@ -125,11 +124,14 @@ function Server.new(opts)
     local producer = prd_m.Producer.new(broker, prd_m.AckMode.AckLeader)
 
     return setmetatable({
-        broker   = broker,
-        producer = producer,
-        reactor  = Reactor.new(),
-        host     = opts.host or "0.0.0.0",
-        port     = opts.port or 9092,
+        broker      = broker,
+        producer    = producer,
+        reactor     = Reactor.new(),
+        coordinator = GroupCoordinator.new(broker, {
+            max_groups = opts.max_groups or DEFAULT_MAX_GROUPS,
+        }),
+        host        = opts.host or "0.0.0.0",
+        port        = opts.port or 9092,
 
         -- Idempotent producer state. next_pid is a monotonic counter
         -- assigned by INIT_PRODUCER_ID; the value lives only for this
@@ -168,18 +170,8 @@ function Server.new(opts)
         group_commit_max_waiters = opts.group_commit_max_waiters
                                    or DEFAULT_GROUP_COMMIT_MAX_WAITERS,
 
-        -- Consumer-group coordinators, keyed by group_id. Shared across
-        -- connections (each connection is one member), created lazily on
-        -- the first JOIN_GROUP for a group. The reaper loop in :start()
-        -- ages out members that stop heartbeating.
-        groups                = {},
         group_reaper_interval = opts.group_reaper_interval
                                 or DEFAULT_GROUP_REAPER_INTERVAL_S,
-        -- Cap on distinct consumer groups, mirroring max_topics. Without it an
-        -- authenticated client could JOIN_GROUP with unbounded distinct group
-        -- ids and grow self.groups without limit. The reaper also drops emptied
-        -- groups so this is a ceiling on *live* groups, not a lifetime total.
-        max_groups            = opts.max_groups or DEFAULT_MAX_GROUPS,
         -- How often to pump partition retention/compaction cleaners. The
         -- SegmentedPartition cleaner only advances when tick_cleaner is called,
         -- so without this loop time-based retention never runs and disk grows
@@ -208,15 +200,9 @@ function Server:_unregister_conn(conn)
     if self.connections_by_id[conn.id] == nil then return end
     self.connections_by_id[conn.id] = nil
 
-    -- A member's connection dropping is an implicit LEAVE_GROUP — depart
-    -- now and rebalance survivors rather than waiting out the heartbeat
-    -- deadline. Guarded by connections_by_id above so it runs exactly once.
-    if conn.group_id then
-        local group = self.groups[conn.group_id]
-        if group then group:leave(conn.member_id) end
-        conn.group_id = nil
-        conn.member_id = nil
-    end
+    -- Implicit LEAVE_GROUP on socket drop. Guarded by connections_by_id
+    -- above so it runs exactly once.
+    self.coordinator:handle_disconnect(conn)
 
     if self.connections > 0 then
         self.connections = self.connections - 1
@@ -286,24 +272,12 @@ end
 
 function Server:dispatch(conn, op, correl, payload)
     local stop = metrics.timer(
-        "moonmq_dispatch_duration_seconds", 
+        "moonmq_dispatch_duration_seconds",
         { op = string.format("0x%02x", op) })
 
-    if     op == proto.OP_HELLO              then self:_handle_hello(conn, correl, payload)
-    elseif op == proto.OP_AUTH               then self:_handle_auth(conn, correl, payload)
-    elseif op == proto.OP_IDENTIFY_CLIENT    then self:_handle_identify_client(conn, correl, payload)
-    elseif op == proto.OP_PRODUCE            then self:_handle_produce(conn, correl, payload)
-    elseif op == proto.OP_INIT_PRODUCER_ID   then self:_handle_init_producer_id(conn, correl, payload)
-    elseif op == proto.OP_PRODUCE_IDEMPOTENT then self:_handle_produce_idempotent(conn, correl, payload)
-    elseif op == proto.OP_SUBSCRIBE          then self:_handle_subscribe(conn, correl, payload)
-    elseif op == proto.OP_FETCH              then self:_handle_fetch(conn, correl, payload)
-    elseif op == proto.OP_COMMIT             then self:_handle_commit(conn, correl, payload)
-    elseif op == proto.OP_CREATE_TOPIC       then self:_handle_create_topic(conn, correl, payload)
-    elseif op == proto.OP_LIST_TOPICS        then self:_handle_list_topics(conn, correl, payload)
-    elseif op == proto.OP_JOIN_GROUP         then self:_handle_join_group(conn, correl, payload)
-    elseif op == proto.OP_LEAVE_GROUP        then self:_handle_leave_group(conn, correl, payload)
-    elseif op == proto.OP_GROUP_HEARTBEAT    then self:_handle_group_heartbeat(conn, correl, payload)
-    elseif op == proto.OP_GOODBYE            then conn:close(Connection.REASON_CLIENT_GOODBYE)
+    local handler = handlers.BY_OP[op]
+    if handler then
+        handler(self, conn, correl, payload)
     else
         conn:send(proto.encode_error(correl, proto.ERR_UNKNOWN_OP,
             string.format("op 0x%02X", op)))
@@ -312,591 +286,14 @@ function Server:dispatch(conn, op, correl, payload)
     stop()
 end
 
-function Server:_handle_hello(conn, correl, payload)
-    local h, err = proto.decode_hello(payload)
-    if not h then
-        conn:close(Connection.REASON_BAD_FRAME, proto.ERR_BAD_FRAME, err)
-        return
-    end
-    if h.version ~= proto.PROTOCOL_VERSION then
-        conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL,
-            string.format("expected v%d got v%d", proto.PROTOCOL_VERSION, h.version))
-        return
-    end
-    conn:transition_to(Connection.STATE_GREETED)
-    conn:send(proto.encode_welcome(correl, proto.PROTOCOL_VERSION))
-end
-
-function Server:_handle_identify_client(conn, correl, payload)
-    local i, err = proto.decode_identify_client(payload)
-    if not i then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    if #i.name > 128 or #i.version > 64 then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
-            "name (max 128) or version (max 64) too long"))
-        return
-    end
-    conn.client_name    = i.name
-    conn.client_version = i.version
-    log:info("conn=%s identified client=%s/%s",
-        conn.id_short, conn.client_name, conn.client_version)
-    conn:send(proto.encode_identify_ack(correl,
-        proto.SERVER_NAME, proto.SERVER_VERSION))
-end
-
-function Server:_handle_auth(conn, correl, payload)
-    local a, err = proto.decode_auth(payload)
-    if not a then
-        conn:close(Connection.REASON_BAD_FRAME, proto.ERR_BAD_FRAME, err)
-        return
-    end
-
-    if not self.authenticator then
-        log:warn("no authenticator configured, allowing")
-        conn.username = a.username
-        conn:transition_to(Connection.STATE_AUTHENTICATED)
-        conn:send(proto.encode_auth_ok(correl))
-        return
-    end
-
-    local ok, auth_err = self.authenticator:verify(a.username, a.password, conn.ip)
-    if not ok then
-        -- Don't log the supplied username — it's attacker-controlled.
-        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
-            auth_err or "auth failed")
-        return
-    end
-
-    conn.username = a.username
-    conn:transition_to(Connection.STATE_AUTHENTICATED)
-    conn:send(proto.encode_auth_ok(correl))
-end
-
-function Server:_handle_produce(conn, correl, payload)
-    if conn.rate_limiter and not conn.rate_limiter:take(1) then
-        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
-            "produce rate exceeded"))
-        return
-    end
-
-    local p, err = proto.decode_produce(payload)
-    if not p then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-
-    local msg = msg_m.Message.new(p.key, p.value, 0)
-    local part_id, offset, werr = self.producer:produce(p.topic, msg)
-    if werr then
-        local code = werr:find("does not exist", 1, true)
-            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
-        conn:send(proto.encode_error(correl, code, werr))
-        return
-    end
-
-    metrics.inc("moonmq_produce_records_total", 1, { topic = p.topic })
-
-    conn:send(proto.encode_produce_ack(correl, part_id, offset))
-end
-
-local function ensure_consumer(conn, broker, group_id)
-    if conn.consumer then
-        if conn.consumer.group_id ~= group_id then
-            return nil, string.format("group_id mismatch (already in group %s)",
-                conn.consumer.group_id)
-        end
-        return conn.consumer
-    end
-    conn.consumer = consumer_m.Consumer.new(broker, group_id)
-    return conn.consumer
-end
-
--- Sync a connection's consumer with its live group assignment so a grouped
--- INIT_PRODUCER_ID: assign a u64 producer ID to this connection. Repeated
--- calls on the same connection are tolerated but reset all per-PID seq
--- state (a client that asks for a fresh PID has lost track of its
--- sequences). PIDs are not durable.
-function Server:_handle_init_producer_id(conn, correl, _payload)
-    local pid = self.next_pid
-    self.next_pid = self.next_pid + 1
-    conn.pid = pid
-    conn.seq_state = {}
-    log:info("conn=%s assigned producer_id=%d", conn.id_short, pid)
-    conn:send(proto.encode_producer_id(correl, pid))
-end
-
--- PRODUCE_IDEMPOTENT: like PRODUCE, but checks (PID, topic, seq) for
--- monotonicity. Dedup contract per (PID, topic):
---   * seq == last_seq + 1  → append, return offset, update memo.
---   * seq == last_seq      → idempotent retry. DON'T append; return the
---     original offset+partition. Without this the retry would duplicate.
---   * seq <  last_seq      → ERR_OUT_OF_ORDER_SEQUENCE (stale).
---   * seq >  last_seq + 1  → ERR_OUT_OF_ORDER_SEQUENCE (gap).
--- First record's seq must be 0 (last_seq starts at -1 implicitly).
---
--- Why per-(PID, topic) and not per-(PID, topic, partition)? Two reasons:
--- (1) it lets the client track ONE seq counter per topic without
--- needing to know the broker's partition count or hash function, and
--- (2) TCP guarantees per-connection in-order delivery, so a single
--- monotonic counter across partitions is consistent. The full
--- Kafka-style per-partition seq becomes necessary only when producers
--- batch across partitions in parallel, which we don't.
-function Server:_handle_produce_idempotent(conn, correl, payload)
-    if conn.rate_limiter and not conn.rate_limiter:take(1) then
-        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
-            "produce rate exceeded"))
-        return
-    end
-
-    if not conn.pid then
-        conn:send(proto.encode_error(correl, proto.ERR_NO_PRODUCER_ID,
-            "INIT_PRODUCER_ID required before PRODUCE_IDEMPOTENT"))
-        return
-    end
-
-    local p, err = proto.decode_produce_idempotent(payload)
-    if not p then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-
-    if p.pid ~= conn.pid then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
-            string.format("pid mismatch: frame=%d conn=%d",
-                p.pid, conn.pid)))
-        return
-    end
-
-    local slot = conn.seq_state[p.topic]
-    local last_seq = slot and slot.last_seq or -1
-
-    if p.seq == last_seq and slot then
-        -- Idempotent retry: replay the original ack.
-        conn:send(proto.encode_produce_ack(correl,
-            slot.last_partition, slot.last_offset))
-        return
-    elseif p.seq < last_seq or p.seq > last_seq + 1 then
-        conn:send(proto.encode_error(correl, proto.ERR_OUT_OF_ORDER_SEQUENCE,
-            string.format("expected seq %d, got %d (pid=%d %s)",
-                last_seq + 1, p.seq, conn.pid, p.topic)))
-        return
-    end
-
-    -- seq == last_seq + 1: fresh record. Route through the normal
-    -- producer so partitioning + group-commit fsync behave identically
-    -- to the non-idempotent path. The (partition, offset) we get back
-    -- is what we memo so a retry can replay the same ack.
-    local msg = msg_m.Message.new(p.key, p.value, 0)
-    local partition_id, offset, werr = self.producer:produce(p.topic, msg)
-    if werr then
-        local code = werr:find("does not exist", 1, true)
-            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
-        conn:send(proto.encode_error(correl, code, werr))
-        return
-    end
-
-    conn.seq_state[p.topic] = {
-        last_seq       = p.seq,
-        last_offset    = offset,
-        last_partition = partition_id,
-    }
-    metrics.inc("moonmq_produce_records_total", 1, { topic = p.topic })
-    metrics.inc("moonmq_idempotent_produce_total", 1, { topic = p.topic })
-
-    conn:send(proto.encode_produce_ack(correl, partition_id, offset))
-end
-
-function Server:_handle_subscribe(conn, correl, payload)
-    local s, err = proto.decode_subscribe(payload)
-    if not s then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    if conn.mode == "pull" then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
-            "connection already in pull mode (used FETCH)"))
-        return
-    end
-    local consumer, cerr = ensure_consumer(conn, self.broker, s.group_id)
-    if not consumer then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
-        return
-    end
-    local sok, serr = consumer:subscribe(s.topic)
-    if not sok then
-        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
-            serr or "subscribe failed"))
-        return
-    end
-    conn.subscriptions[s.topic] = true
-    conn.mode = "push"
-    -- Push mode commits AFTER a record is handed to the send layer (see
-    -- _subscriber_loop), not inside poll(). Turn off poll()'s auto-commit so a
-    -- record isn't marked consumed before we've even tried to deliver it.
-    consumer.auto_commit = false
-    conn:send(proto.encode_ok(correl))
-
-    if not conn.subscriber_co then
-        conn.subscriber_co = self.reactor:spawn(function()
-            self:_subscriber_loop(conn)
-        end)
-    end
-end
-
-function Server:_subscriber_loop(conn)
-    while conn.state ~= Connection.STATE_CLOSED do
-        -- Re-scope to the current assignment each pass so a rebalance (another
-        -- member joining/leaving) takes effect on the next poll.
-        self:_apply_group_assignment(conn)
-        local records, err = conn.consumer:poll()
-        if err then
-            push_log:error("conn=%s poll: %s", conn.id_short, err)
-            return
-        end
-        if records and #records > 0 then
-            for i = 1, #records do
-                if conn.state == Connection.STATE_CLOSED then return end
-                local r = records[i]
-                local frame = proto.encode_record(uuid.ZERO,
-                    r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
-                if not conn:send(frame) then return end
-                metrics.inc("moonmq_fetch_records_total", 1, { topic = r.topic })
-                -- Commit only after the record is accepted by the send layer.
-                -- poll() already advanced the in-memory cursor to the next
-                -- offset for this partition; persist that. If conn:send had
-                -- failed we'd have returned above without committing, so the
-                -- record is redelivered rather than silently lost — at-least-
-                -- once on the push path. (send() enqueues; a peer that dies
-                -- after enqueue but before transmit still redelivers on
-                -- reconnect since the offset wasn't committed until here.)
-                local adv = conn.consumer.offsets[r.topic]
-                    and conn.consumer.offsets[r.topic][r.partition]
-                if adv then
-                    local cok, cerr =
-                        conn.consumer:commit_offset(r.topic, r.partition, adv)
-                    if not cok then
-                        push_log:error("conn=%s commit: %s", conn.id_short, cerr)
-                        return
-                    end
-                end
-            end
-        else
-            self.reactor:sleep(self.push_interval)
-        end
-    end
-end
-
-function Server:_handle_fetch(conn, correl, payload)
-    local f, err = proto.decode_fetch(payload)
-    if not f then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    if conn.mode == "push" then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
-            "connection already in push mode (used SUBSCRIBE)"))
-        return
-    end
-    local consumer, cerr = ensure_consumer(conn, self.broker, f.group_id)
-    if not consumer then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
-        return
-    end
-    if not conn.subscriptions[f.topic] then
-        local sok, sberr = consumer:subscribe(f.topic)
-        if not sok then
-            conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
-                sberr or "subscribe failed"))
-            return
-        end
-        conn.subscriptions[f.topic] = true
-    end
-    conn.mode = "pull"
-
-    -- Restrict to this member's assigned partitions (no-op unless joined).
-    self:_apply_group_assignment(conn)
-
-    local records, perr = consumer:poll()
-    if perr then
-        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, perr))
-        return
-    end
-    if records then
-        local limit = math.min(#records, f.max_records or #records)
-        for i = 1, limit do
-            local r = records[i]
-            local frame = proto.encode_record(correl,
-                r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
-            if not conn:send(frame) then return end
-        end
-        if limit > 0 then
-            metrics.inc("moonmq_fetch_records_total", limit, { topic = f.topic })
-        end
-    end
-    conn:send(proto.encode_ok(correl))
-end
-
-function Server:_handle_commit(conn, correl, payload)
-    local c, err = proto.decode_commit(payload)
-    if not c then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    if not conn.consumer then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
-            "commit requires prior subscribe/fetch"))
-        return
-    end
-    -- Bounds-check the partition against the topic before forwarding to
-    -- the consumer. Without this, a client could commit to any u32
-    -- partition id — currently the consumer stub silently accepts it,
-    -- but that's a future foot-gun once offset persistence lands.
-    local topic, terr = self.broker:get_topic(c.topic)
-    if not topic then
-        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
-            terr or "topic missing"))
-        return
-    end
-    if c.partition < 1 or c.partition > #topic.partitions then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
-            string.format("partition %d out of range (1..%d)",
-                c.partition, #topic.partitions)))
-        return
-    end
-    -- Fence commits from a connection whose group membership has lapsed. A
-    -- member the coordinator evicted (heartbeat timeout) or that left still
-    -- holds a live socket; without this it could keep committing and clobber
-    -- the offset the partition's new owner is advancing. Non-group commits
-    -- (conn.group_id unset) are unaffected.
-    if conn.group_id then
-        local group = self.groups[conn.group_id]
-        if not group or not group.members[conn.member_id] then
-            conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
-                "group membership lapsed; rejoin before committing"))
-            return
-        end
-    end
-    local ok, cerr = conn.consumer:commit_offset(c.topic, c.partition, c.offset)
-    if not ok then
-        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL,
-            cerr or "commit failed"))
-        return
-    end
-    conn:send(proto.encode_ok(correl))
-end
-
-function Server:_handle_create_topic(conn, correl, payload)
-    local c, err = proto.decode_create_topic(payload)
-    if not c then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    if c.num_partitions < 1 or c.num_partitions > 1024 then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
-            "num_partitions out of range (1..1024)"))
-        return
-    end
-    -- Topic-count cap. Without this a client (authenticated or not,
-    -- depending on the auth config) can CREATE_TOPIC in a loop and
-    -- exhaust the broker's in-memory topic table + descriptors. We
-    -- check the current count against max_topics before allocating
-    -- anything on disk.
-    local current = #self.broker:list_topics()
-    if current >= self.max_topics then
-        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
-            string.format("topic limit reached (%d)", self.max_topics)))
-        return
-    end
-    local _, terr = self.broker:create_topic(c.name, c.num_partitions)
-    if terr then
-        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, terr))
-        return
-    end
-    metrics.set("moonmq_topic_count", current + 1)
-    conn:send(proto.encode_ok(correl))
-end
-
-function Server:_handle_list_topics(conn, correl, _payload)
-    -- Bound response size. Sorting by name first so the truncation is
-    -- deterministic across calls (rather than depending on table-pair
-    -- iteration order). For the common case the bound is irrelevant —
-    -- it only kicks in if max_topics has been raised past max_list_topics.
-    local all = self.broker:list_topics()
-    table.sort(all)
-    if #all > self.max_list_topics then
-        local truncated = {}
-        for i = 1, self.max_list_topics do truncated[i] = all[i] end
-        all = truncated
-    end
-    conn:send(proto.encode_topic_list(correl, all))
-end
-
--- Lazily fetch (or create) the coordinator for a group. Shared across all
--- connections whose members belong to the group. Returns (group, nil) or
--- (nil, err) when creating a new group would exceed max_groups.
-function Server:_get_or_create_group(group_id)
-    local group = self.groups[group_id]
-    if not group then
-        -- Count live groups; the reaper drops emptied ones so this is a
-        -- ceiling on concurrent groups, not a lifetime total.
-        local n = 0
-        for _ in pairs(self.groups) do n = n + 1 end
-        if n >= self.max_groups then
-            return nil, string.format("group limit reached (%d)", self.max_groups)
-        end
-        group = groups_m.ConsumerGroup.new(self.broker, group_id)
-        self.groups[group_id] = group
-    end
-    return group
-end
-
--- Sync the connection's Consumer to the partitions the coordinator has
--- assigned this member, so poll()/FETCH only touch owned partitions. This is
--- what makes a consumer group actually divide work — the coordinator computed
--- assignments before, but the read path ignored them and every member read
--- every partition. Called before each poll and right after JOIN_GROUP.
---
--- No-op unless the connection has a Consumer. A member the coordinator has
--- since evicted (present group, absent member) is pinned to "own nothing" so a
--- zombie can't keep draining partitions until it notices its heartbeat was
--- rejected. A connection that isn't a joined member -- standalone, or one that
--- just left/was removed from a group -- has its filter cleared so it reverts to
--- reading every subscribed partition; returning early there instead would leave
--- a stale assignment pinned after LEAVE_GROUP, so the consumer would keep
--- reading only its former partitions.
-function Server:_apply_group_assignment(conn)
-    if not conn.consumer then return end
-    if not (conn.group_id and conn.member_id) then
-        conn.consumer:set_assignment(nil)
-        return
-    end
-    local group  = self.groups[conn.group_id]
-    local member = group and group.members[conn.member_id]
-    conn.consumer:set_assignment(member and member.partitions or {})
-end
-
--- JOIN_GROUP: register this connection as a member of a group subscribing
--- to one or more topics, and reply with the partitions assigned to it.
--- An empty member_id means "first join, assign me one" — we use the
--- connection's short id so it's stable for this connection's lifetime.
-function Server:_handle_join_group(conn, correl, payload)
-    local j, err = proto.decode_join_group(payload)
-    if not j then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    if #j.topics == 0 then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
-            "join_group requires at least one topic"))
-        return
-    end
-    -- One group membership per connection: a connection already bound to a
-    -- different group must LEAVE_GROUP (or reconnect) before joining another.
-    if conn.group_id and conn.group_id ~= j.group_id then
-        conn:send(proto.encode_error(correl, proto.ERR_GROUP_CONFLICT,
-            string.format("connection already in group %s", conn.group_id)))
-        return
-    end
-
-    local member_id = j.member_id
-    if member_id == "" then
-        member_id = conn.member_id or conn.id_short
-    end
-
-    local group, gerr = self:_get_or_create_group(j.group_id)
-    if not group then
-        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED, gerr))
-        return
-    end
-    local assignment, jerr = group:join(member_id, j.topics)
-    if not assignment then
-        -- join() fails when a subscribed topic doesn't exist, or the group
-        -- has been closed. Map the missing-topic case to a precise code.
-        local code = (jerr and jerr:find("get topic", 1, true))
-            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
-        conn:send(proto.encode_error(correl, code, jerr or "join failed"))
-        return
-    end
-
-    conn.group_id  = j.group_id
-    conn.member_id = member_id
-    -- If a Consumer already exists on this connection (a prior FETCH/SUBSCRIBE
-    -- created one before the client joined), scope it to the new assignment now
-    -- rather than waiting for the next poll.
-    self:_apply_group_assignment(conn)
-    log:info("conn=%s joined group=%s member=%s state=%s",
-        conn.id_short, j.group_id, member_id, group:state())
-    conn:send(proto.encode_group_assignment(correl, member_id, assignment))
-end
-
--- LEAVE_GROUP: voluntary departure. Survivors rebalance; an emptied group
--- collapses back to its empty state (handled inside ConsumerGroup:leave).
-function Server:_handle_leave_group(conn, correl, payload)
-    local l, err = proto.decode_leave_group(payload)
-    if not l then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    local group = self.groups[l.group_id]
-    if not group or conn.group_id ~= l.group_id then
-        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
-            "not a member of this group"))
-        return
-    end
-
-    group:leave(conn.member_id)
-    log:info("conn=%s left group=%s member=%s state=%s",
-        conn.id_short, l.group_id, conn.member_id, group:state())
-    conn.group_id  = nil
-    conn.member_id = nil
-    conn:send(proto.encode_ok(correl))
-end
-
--- GROUP_HEARTBEAT: renew the member's lease so the reaper doesn't evict it.
--- A heartbeat for a member the coordinator has already reaped (or never
--- saw) returns GROUP_MEMBER_UNKNOWN, signalling the client to re-JOIN_GROUP.
-function Server:_handle_group_heartbeat(conn, correl, payload)
-    local h, err = proto.decode_group_heartbeat(payload)
-    if not h then
-        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
-        return
-    end
-    local group = self.groups[h.group_id]
-    if not group or conn.group_id ~= h.group_id then
-        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
-            "not a member of this group"))
-        return
-    end
-
-    local ok, herr = group:heartbeat(conn.member_id)
-    if not ok then
-        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
-            herr or "unknown member"))
-        return
-    end
-    conn:send(proto.encode_ok(correl))
-end
-
 -- Periodically age out group members that stopped heartbeating. Runs for
--- the lifetime of the reactor; ConsumerGroup:check_heartbeats evicts stale
--- members and rebalances survivors (or collapses an emptied group).
+-- the lifetime of the reactor; each pass evicts stale members, rebalances
+-- survivors, and drops emptied groups (see GroupCoordinator:reap).
 function Server:_run_group_reaper()
     while self.running do
         self.reactor:sleep(self.group_reaper_interval)
         if not self.running then return end
-        for gid, group in pairs(self.groups) do
-            group:check_heartbeats()
-            -- Drop coordinators with no members so an idle broker doesn't
-            -- accumulate empty groups forever (and so max_groups counts only
-            -- live groups). Safe to delete the current key during pairs().
-            -- A stale connection still holding this group_id will get
-            -- GROUP_MEMBER_UNKNOWN on its next heartbeat/commit and rejoin.
-            if next(group.members) == nil then
-                self.groups[gid] = nil
-            end
-        end
+        self.coordinator:reap()
     end
 end
 
@@ -1054,23 +451,23 @@ function Server:snapshot()
 
     return {
         server = {
-            name           = proto.SERVER_NAME,
-            version        = proto.SERVER_VERSION,
-            protocol      = proto.PROTOCOL_VERSION,
-            host                   = self.host,
-            port                   = self.port,
+            name     = proto.SERVER_NAME,
+            version  = proto.SERVER_VERSION,
+            protocol = proto.PROTOCOL_VERSION,
+            host     = self.host,
+            port     = self.port,
         },
         connections = {
-            open                  = self.connections,
-            max                   = self.max_connections,
-            max_per_ip            = self.max_connections_per_ip,
+            open       = self.connections,
+            max        = self.max_connections,
+            max_per_ip = self.max_connections_per_ip,
         },
         topics = {
-            count                 = #self.broker:list_topics(),
-            max                            = self.max_topics,
-            listed                = #topic_summaries,
-            listed_truncated      = truncated,
-            top_by_bytes            = top_n,
+            count            = #self.broker:list_topics(),
+            max              = self.max_topics,
+            listed           = #topic_summaries,
+            listed_truncated = truncated,
+            top_by_bytes     = top_n,
         },
     }
 end

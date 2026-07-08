@@ -1,5 +1,5 @@
-local brk_m   = require("src.storage.broker")
-local group_m = require("src.client.groups")
+local brk_m   = require("src.broker")
+local group_m = require("src.broker.groups")
 local os_utils = require("src.core.os")
 
 local STATES = group_m.STATES

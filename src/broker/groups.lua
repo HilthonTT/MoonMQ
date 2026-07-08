@@ -1,4 +1,4 @@
-local broker_m = require("src.storage.broker")
+local broker_m = require("src.broker")
 local Machine  = require("src.fsm.state_machine")
 local socket   = require("socket")
 local log      = require("src.log.logger").get("group")

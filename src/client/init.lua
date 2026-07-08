@@ -1,6 +1,6 @@
 local socket = require("socket")
-local proto = require("src.server.protocol")
-local uuid = require("src.server.uuid")
+local proto = require("src.wire.protocol")
+local uuid = require("src.core.uuid")
 
 local DEFAULT_TIMEOUT = 30
 
@@ -120,23 +120,40 @@ function Client.new(opts)
     return c
 end
 
+-- Mark the client dead when the peer closed the socket, so pool users
+-- (bin/gateway.lua's Pool checks `closed` on acquire/release) cull it
+-- instead of handing out a connection that can never recover. Without
+-- this, a broker restart left pooled clients dead-but-reusable forever.
+function Client:_mark_closed_on(err)
+    if err == "closed" then self.closed = true end
+end
+
 function Client:_write(data)
     if self.closed then return nil, "closed" end
 
     if self.reactor then
-        return self.reactor:send_all(self.sock, data, nil)
+        local ok, err = self.reactor:send_all(self.sock, data, nil)
+        if not ok then self:_mark_closed_on(err) end
+        return ok, err
     end
     local sent, err = self.sock:send(data)
-    if err then return nil, err end
+    if err then
+        self:_mark_closed_on(err)
+        return nil, err
+    end
     return sent == #data, nil
 end
 
 function Client:_read_bytes(n)
     if self.closed then return nil, "closed" end
+    local data, err
     if self.reactor then
-        return self.reactor:read_exact(self.sock, n, nil)
+        data, err = self.reactor:read_exact(self.sock, n, nil)
+    else
+        data, err = self.sock:receive(n)
     end
-    return self.sock:receive(n)
+    if not data then self:_mark_closed_on(err) end
+    return data, err
 end
 
 function Client:_read_frame()

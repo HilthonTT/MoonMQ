@@ -16,7 +16,7 @@ local SegmentedPartition = seg_m.SegmentedPartition
 local message           = require("src.record.message")
 local topic_config      = require("src.storage.topic_config")
 local TopicManager      = require("src.storage.topic_manager")
-local broker_m          = require("src.storage.broker")
+local broker_m          = require("src.broker")
 local os_utils          = require("src.core.os")
 
 local BASE = os_utils.IS_WINDOWS

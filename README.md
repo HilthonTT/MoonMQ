@@ -17,7 +17,7 @@ partitioned append-only logs with CRC-checked on-disk records.
 - luaposix (Linux only — used for real `fsync`/`ftruncate` so `acks=1` actually flushes to disk)
 
 SHA-256/HMAC for authentication is provided by a vendored pure-Lua
-`sha2.lua` at the repo root — no installation needed.
+`src/vendor/sha2.lua` — no installation needed.
 
 On Debian/Ubuntu:
 
@@ -225,7 +225,7 @@ records. `ERR_NO_PRODUCER_ID` (code `10`) fires if the client sends
 ### Consumer groups
 
 A topic's partitions can be shared across a group of consumers so each
-partition is owned by exactly one member. `src/client/groups.lua` provides
+partition is owned by exactly one member. `src/broker/groups.lua` provides
 the server-side coordinator (`ConsumerGroup`) that tracks membership,
 assigns partitions with a Kafka-style **range** strategy, and ages out
 members that stop heartbeating. Durable per-group offsets are kept
@@ -318,11 +318,49 @@ second, different group on one connection is rejected with
 `SUBSCRIBE` **honor that assignment**: each member reads only its assigned
 partitions, so a topic's partitions are divided across the group instead of
 every member draining every one. The broker re-derives the live assignment
-before each poll (`Server:_apply_group_assignment` → `Consumer:set_assignment`),
+before each poll (`GroupCoordinator:apply_assignment` → `Consumer:set_assignment`),
 so a rebalance — a member joining, leaving, or being reaped — takes effect on
 the member's next fetch without pushing a new assignment frame. A member the
 coordinator has evicted is pinned to "own nothing" until it re-joins, and a
 consumer that leaves its group reverts to reading every subscribed partition.
+
+## Code layout
+
+Layers, from the wire down to the disk. Each directory depends only on the
+ones below it (plus the cross-cutting `core`/`log`/`metrics`/`io` utilities);
+nothing in `storage`/`commitlog` reaches up into `server`.
+
+```
+main.lua           CLI entrypoint: config, logging, auth wiring, server boot
+bin/               operational tools (HTTP gateway, password hasher)
+src/
+  server/          TCP front-end: reactor event loop, framing, connection
+                   lifecycle, opcode handlers (handlers.lua), consumer-group
+                   coordination (group_coordinator.lua), auth, metrics HTTP
+  client/          network client (speaks the wire protocol over TCP)
+  wire/            binary protocol codec, shared by server and client
+  broker/          broker domain layer: Broker (topics + offsets facade),
+                   in-process Producer/Consumer, ConsumerGroup coordinator FSM
+  storage/         topic/partition management and the default "segmented"
+                   backend (segment files, time index, group-commit fsync
+                   batching, retention, crash recovery)
+  commitlog/       alternative "commitlog" backend (jocko-style: dense offset
+                   index, byte-budget retention, key compaction)
+  record/          on-disk record codec (CRC-framed key/value messages);
+                   compression helpers (not yet wired into the write path)
+  io/              filesystem helpers and durability primitives (fsync,
+                   ftruncate, atomic rename — POSIX and Windows)
+  metrics/         Prometheus-style metrics registry
+  log/             leveled logger
+  core/            small pure utilities (crc32, uuid, rng, futures, time,
+                   string helpers, topic-name validation, version info)
+  fsm/             vendored finite-state-machine library (used by broker/groups)
+  repl/            interactive MQL console (sql/ lexer→parser→executor)
+  chaos/           fault-injecting producer wrapper (test support)
+  vendor/          vendored third-party code (sha2)
+  examples/        runnable client examples
+spec/              busted test suite + standalone storage smoke test
+```
 
 ## Interactive console (MQL)
 
@@ -425,7 +463,7 @@ mq> CREATE GROUP analytics
 ## Wire protocol
 
 Clients and the broker speak a compact binary protocol over TCP
-(`src/server/protocol.lua`). All integers are big-endian; strings are
+(`src/wire/protocol.lua`). All integers are big-endian; strings are
 length-prefixed (`u32`) UTF-8. Every frame is length-prefixed:
 
 ```
@@ -478,7 +516,7 @@ accounting, and ban enforcement, then delegates each connection to
 reader, a sender (bounded send queue), and a heartbeat probe — driven by an
 explicit `new → greeted → authenticated → closed` state machine. Framing is
 isolated in `src/server/framer.lua`, and 16-byte connection/correlation IDs
-come from `src/server/uuid.lua`. A handshake watchdog drops connections that
+come from `src/core/uuid.lua`. A handshake watchdog drops connections that
 fail to authenticate within `HandshakeDeadline`.
 
 ## Testing
@@ -511,19 +549,18 @@ Current coverage:
 
 | Spec file                     | Module under test                                                    |
 | ----------------------------- | -------------------------------------------------------------------- |
-| `buffer_spec.lua`             | `src/core/buffer.lua` — accumulating byte buffer                     |
 | `chaos_spec.lua`              | fault-injection resilience (`ChaosProducer` over Broker/Producer)    |
 | `commitlog_spec.lua`          | `src/commitlog/commitlog.lua` — append, recovery, compaction         |
 | `commitlog_backend_spec.lua`  | commitlog storage backend, end-to-end via Broker/Producer/Consumer   |
-| `consumer_assignment_spec.lua`| `src/client/consumer.lua` — `set_assignment` / `owns` filtering       |
+| `consumer_assignment_spec.lua`| `src/broker/consumer.lua` — `set_assignment` / `owns` filtering       |
 | `crc32_spec.lua`              | `src/core/crc32.lua` — IEEE 802.3 CRC-32                             |
 | `future_spec.lua`             | `src/core/future.lua` — one-shot coroutine future                    |
-| `group_spec.lua`              | `src/client/groups.lua` — consumer-group lifecycle FSM               |
+| `group_spec.lua`              | `src/broker/groups.lua` — consumer-group lifecycle FSM               |
 | `group_assignment_spec.lua`   | end-to-end proof a member polls only its assigned partitions         |
-| `group_protocol_spec.lua`     | `src/server/protocol.lua` — JOIN/LEAVE/HEARTBEAT wire format         |
+| `group_protocol_spec.lua`     | `src/wire/protocol.lua` — JOIN/LEAVE/HEARTBEAT wire format         |
 | `message_spec.lua`            | `src/record/message.lua` — message wire format                       |
 | `offset_manager_spec.lua`     | `src/storage/offset_manager.lua` — durable group offsets             |
-| `partition_spec.lua`          | `src/storage/partition.lua` — append, read, recovery                 |
+| `partition_spec.lua`          | `src/storage/topic_manager.lua` — partition append, read, recovery via TopicManager |
 | `segmentation_spec.lua`       | `src/storage/segmentation.lua` — `SegmentedPartition` roll & lookup  |
 | `sql_lexer_spec.lua`          | `src/repl/sql/lexer.lua` — MQL console tokenizer                     |
 | `sql_parser_spec.lua`         | `src/repl/sql/parser.lua` — MQL statement grammar                    |

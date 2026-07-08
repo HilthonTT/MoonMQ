@@ -6,18 +6,20 @@ local crc32 = require("src.core.crc32")
 local socket = require("socket")
 local io_sync = require("src.io.io_sync")
 local verify_file = require("src.storage.segment_verify")
+local time_index = require("src.storage.time_index")
+local GroupCommitter = require("src.storage.group_committer")
 local log = require("src.log.logger").get("segmentation")
--- Metrics. Loaded lazily-tolerant: if the server metrics module isn't on
--- the path (e.g. unit tests run segmentation in isolation), fall back to
--- a no-op shim so the production path stays instrumented without
--- forcing test scaffolds to mock anything out.
-local ok_m, metrics = pcall(require, "src.server.metrics")
+-- Metrics. Loaded lazily-tolerant: src.metrics needs luasocket, which a
+-- pure-storage embedding may not have; fall back to a no-op shim so the
+-- production path stays instrumented without forcing test scaffolds to
+-- mock anything out.
+local ok_m, metrics = pcall(require, "src.metrics")
 if not ok_m then
     metrics = {
-        inc     = function() end,
-        set     = function() end,
-        observe = function() end,
-        timer   = function() return function() end end,
+        inc     = function(...) end,
+        set     = function(...) end,
+        observe = function(...) end,
+        timer   = function(...) return function() end end,
     }
 end
 
@@ -102,11 +104,6 @@ local DEFAULT_CLEANER_INTERVAL = 1 * time_m.HOUR
 -- larger = bigger linear-scan window in offset_for_timestamp. 4 KiB is
 -- the Kafka-tradition default for time index sparseness.
 local DEFAULT_INDEX_INTERVAL_BYTES = 4096
-
--- Each entry: (timestamp:i8, file_pos_within_segment:i4) big-endian.
--- file_pos is u32 so segments larger than 4 GiB would overflow — that's
--- well past our 1 GiB default max_segment_size, but worth flagging.
-local INDEX_ENTRY_SIZE = 12
 
 -- Anchored Lua pattern (NOT a shell glob). fs_m.glob takes a Lua pattern.
 local LOG_FILE_PATTERN = "^%d+%.log$"
@@ -376,41 +373,13 @@ function SegmentedPartition:load_segments()
                                  index_path, ierr))
         end
 
-        local index_size = index_file:seek("end") or 0
-        local last_indexed_at = nil
-        if index_size > 0 then
-            local entry_count = math.floor(index_size / INDEX_ENTRY_SIZE)
-            local last_valid_entries = entry_count
-            -- Walk backwards to find the last entry whose file_pos is
-            -- still inside the post-verify log. Cheap — most loads
-            -- truncate zero entries.
-            while last_valid_entries > 0 do
-                local pos = (last_valid_entries - 1) * INDEX_ENTRY_SIZE
-                index_file:seek("set", pos)
-                local raw_entry = index_file:read(INDEX_ENTRY_SIZE)
-                if not raw_entry or #raw_entry < INDEX_ENTRY_SIZE then
-                    last_valid_entries = last_valid_entries - 1
-                else
-                    local _, file_pos = string.unpack(">I8I4", raw_entry)
-                    if file_pos < post_verify_size then
-                        last_indexed_at = file_pos
-                        break
-                    end
-                    last_valid_entries = last_valid_entries - 1
-                end
-            end
-
-            local truncate_to = last_valid_entries * INDEX_ENTRY_SIZE
-            if truncate_to < index_size then
-                local tok, terr = io_sync.truncate(index_file, truncate_to)
-                if not tok then
-                    pcall(function() file:close() end)
-                    pcall(function() index_file:close() end)
-                    return fail(string.format(
-                        "failed to truncate stale timeindex %s: %s",
-                        index_path, terr))
-                end
-            end
+        local last_indexed_at, tierr = time_index.recover(index_file, post_verify_size)
+        if tierr then
+            pcall(function() file:close() end)
+            pcall(function() index_file:close() end)
+            return fail(string.format(
+                "failed to truncate stale timeindex %s: %s",
+                index_path, tierr))
         end
 
         table.insert(self.segments,
@@ -445,43 +414,6 @@ function SegmentedPartition:_write_checkpoint(value)
     -- boot re-scan more of the log.
     io_sync.sync_dir(self.dir)
     return true, nil
-end
-
--- Internal: append a single (ts, file_pos) entry to the active segment's
--- timeindex if either (a) this is the segment's first message or (b) we
--- have written index_interval_bytes of log since the previous entry.
---
--- Errors are non-fatal — the index is advisory, and a transient write
--- failure shouldn't fail the produce. We do log it so persistent index
--- breakage is visible. Failed writes leave last_indexed_at unchanged, so
--- the next call will try again.
-function SegmentedPartition:_maybe_index(segment, ts, file_pos)
-    if not segment.index_file then return end
-    if type(ts) ~= "number" then return end
-
-    local last = segment.last_indexed_at
-    if last ~= nil and (file_pos - last) < self.index_interval_bytes then
-        return
-    end
-
-    local entry = string.pack(">I8I4", ts, file_pos)
-    -- Reposition to EOF before writing: offset_for_timestamp reads this "a+b"
-    -- index handle, and a write directly after a read is stdio UB that Windows
-    -- UCRT rejects — which would silently stop all further time-indexing for
-    -- this segment (the failure is only warn-logged).
-    segment.index_file:seek("end")
-    local ok, err = segment.index_file:write(entry)
-    if not ok then
-        log:warn("timeindex write segment=%020d: %s",
-            segment.base_offset, tostring(err))
-        return
-    end
-    -- Flush so a separate reader (recovery on next boot, or a
-    -- cross-process tail) sees the entry. Lua's userspace buffer
-    -- otherwise holds 12-byte writes for a long time. Sync waits for
-    -- the roll/close fsync; we don't pay that cost per entry.
-    segment.index_file:flush()
-    segment.last_indexed_at = file_pos
 end
 
 -- Internal: roll the active segment once it's full. Flushes + fsyncs the
@@ -573,7 +505,8 @@ function SegmentedPartition:write_message(msg)
     -- Index this message if it crosses the interval (or is the segment's
     -- first). Done after the log write so we never index a record that
     -- failed to land on disk.
-    self:_maybe_index(self.active_segment, msg.timestamp, file_pos_in_segment)
+    time_index.maybe_append(self.active_segment, msg.timestamp,
+        file_pos_in_segment, self.index_interval_bytes)
 
     -- log_bytes gauge: total bytes on disk across all segments. Cheap
     -- to maintain incrementally; the alternative is a full segments
@@ -630,133 +563,27 @@ end
 -- acks=1 producers can coalesce their fsyncs into one. Without it,
 -- request_sync() falls back to an immediate per-call fsync (the
 -- original behaviour, kept for unit tests and the synchronous BatchWriter
--- path).
---
--- scheduler is duck-typed; it must provide:
---   :spawn(fn)     — start fn in a new coroutine, return the coroutine
---   :sleep(s)      — yield the current coroutine for s seconds
---   :schedule(co)  — re-queue a parked coroutine for resumption (no args)
---
--- The Reactor in src/server/reactor.lua satisfies this interface as-is.
---
--- opts (optional):
---   linger_s     max wait before fsync if batch isn't full (default 0.002)
---   max_waiters  size cap — batch is committed immediately when reached
---                regardless of linger (default 64)
+-- path). The batching/linger machinery itself lives in
+-- src/storage/group_committer.lua; see there for the scheduler contract
+-- and opts (linger_s, max_waiters).
 function SegmentedPartition:attach_committer(scheduler, opts)
-    assert(scheduler ~= nil, "scheduler required")
-    opts = opts or {}
-    self.committer = {
-        scheduler   = scheduler,
-        linger_s    = opts.linger_s    or 0.002,
-        max_waiters = opts.max_waiters or 64,
-        waiters     = {},
-        linger_co   = nil,
-        -- Generation counter: every commit bumps it. A stale linger
-        -- coroutine that wakes after its batch was force-committed sees
-        -- the mismatch and exits silently. Without this, a force-commit
-        -- followed by a no-op committer wake would issue an extra fsync.
-        generation  = 0,
-    }
+    self.committer = GroupCommitter.new(self, scheduler, opts)
 end
 
 function SegmentedPartition:detach_committer()
     local c = self.committer
     if not c then return end
-    -- Drain any in-flight waiters synchronously. Their parked coroutines
-    -- will be rescheduled with their result cell populated — even if the
-    -- reactor is shutting down and never resumes them, the data is on
-    -- disk so we haven't lost durability, only the ACK.
-    if #c.waiters > 0 then
-        self:_commit_now()
-    end
+    c:drain()
     self.committer = nil
 end
 
--- Internal: do one fsync, populate every parked waiter's result cell,
--- and reschedule every waiter EXCEPT skip_co (single-threaded reactor →
--- no lock needed; nothing else can interleave between c.waiters and the
--- fsync).
---
--- skip_co exists for the request_sync fast path: when a caller's own
--- arrival fills the batch, it calls _commit_now inline without yielding.
--- Its coroutine is in c.waiters (so it gets ok/err set) but must NOT be
--- rescheduled — it never parked, and resume() on a still-running or
--- already-returned coroutine errors with "cannot resume dead coroutine".
-function SegmentedPartition:_commit_now(skip_co)
-    local c = self.committer
-    if not c then return self:sync() end
-
-    local waiters = c.waiters
-    c.waiters = {}
-    c.linger_co = nil
-    c.generation = c.generation + 1
-
-    local ok, err = self:sync()
-
-    for i = 1, #waiters do
-        local w = waiters[i]
-        -- Per-waiter result cells. Sharing a single c.last_ok/c.last_err
-        -- would race: a waker that yields after reading the shared value
-        -- could see a NEXT batch's result by the time it resumes.
-        w.ok, w.err = ok, err
-        if w.co ~= skip_co then
-            c.scheduler:schedule(w.co)
-        end
-    end
-    return ok, err
-end
-
 -- request_sync is the group-commit-aware entrypoint used by the producer
--- when acks=1. Behaviour:
---   * No committer attached OR called from the main thread → immediate
---     fsync (same as :sync()). Keeps the sync test paths working.
---   * Inside a coroutine with a committer → register as a waiter; the
---     first waiter spawns a "linger" coroutine that fsyncs after
---     linger_s. Hitting max_waiters short-circuits the linger and fsyncs
---     immediately. The caller yields and is resumed with (ok, err) of
---     that batch's fsync.
+-- when acks=1. No committer attached → immediate fsync (same as :sync()),
+-- keeping the sync test paths working.
 function SegmentedPartition:request_sync()
     local c = self.committer
     if not c then return self:sync() end
-
-    local co, is_main = coroutine.running()
-    if is_main or not co then
-        return self:sync()
-    end
-
-    local w = { co = co, ok = nil, err = nil }
-    c.waiters[#c.waiters + 1] = w
-
-    -- Fast path: if this waiter just filled the batch, commit
-    -- synchronously. The current coroutine is mid-execution and is in
-    -- the waiter list; _commit_now will populate w.ok/w.err before
-    -- returning, so we don't need to yield.
-    if #c.waiters >= c.max_waiters then
-        self:_commit_now(co)
-        return w.ok, w.err
-    end
-
-    -- First waiter arms the linger. Subsequent waiters in the same
-    -- window just join the list — a single linger fires for all of them.
-    if not c.linger_co then
-        local my_gen = c.generation
-        local sched = c.scheduler
-        local self_ref = self
-        c.linger_co = sched:spawn(function()
-            sched:sleep(c.linger_s)
-            -- Skip stale wake-ups:
-            --   * generation advanced  → batch already committed via the
-            --     max_waiters fast path.
-            --   * committer detached   → shutdown raced us.
-            if self_ref.committer ~= c then return end
-            if c.generation ~= my_gen then return end
-            self_ref:_commit_now()
-        end)
-    end
-
-    coroutine.yield()
-    return w.ok, w.err
+    return c:request_sync()
 end
 
 -- Locate the segment that owns `offset` (base_offset <= offset < base_offset
@@ -892,40 +719,6 @@ function SegmentedPartition:scan(fn)
     return nil
 end
 
--- Internal helpers for offset_for_timestamp. Index files are short
--- arrays of fixed-size entries — seek + read is fine even mid-append
--- (POSIX a+b semantics: writes go to EOF, reads honour the seek).
-local function index_count(index_file)
-    local size = index_file:seek("end") or 0
-    return math.floor(size / INDEX_ENTRY_SIZE)
-end
-
-local function read_index_entry(index_file, idx)
-    index_file:seek("set", idx * INDEX_ENTRY_SIZE)
-    local b = index_file:read(INDEX_ENTRY_SIZE)
-    if not b or #b < INDEX_ENTRY_SIZE then return nil end
-    return string.unpack(">I8I4", b)  -- ts, file_pos
-end
-
--- Binary-search for the greatest entry index whose timestamp <= target.
--- Returns the entry's file_pos, or nil if no entry qualifies.
-local function index_floor_pos(index_file, n, target)
-    local lo, hi = 0, n - 1
-    local result_pos
-    while lo <= hi do
-        local mid = (lo + hi) // 2
-        local ts, pos = read_index_entry(index_file, mid)
-        if not ts then break end
-        if ts <= target then
-            result_pos = pos
-            lo = mid + 1
-        else
-            hi = mid - 1
-        end
-    end
-    return result_pos
-end
-
 -- offset_for_timestamp returns the global offset of the EARLIEST message
 -- whose timestamp is >= ts, mirroring Kafka's offsetForTimes semantics.
 -- Returns nil when the partition is empty or no message satisfies (i.e.
@@ -950,12 +743,12 @@ function SegmentedPartition:offset_for_timestamp(ts)
     for i = #self.segments, 1, -1 do
         local s = self.segments[i]
         if s.index_file then
-            local n = index_count(s.index_file)
+            local n = time_index.count(s.index_file)
             if n > 0 then
-                local first_ts = read_index_entry(s.index_file, 0)
+                local first_ts = time_index.read_entry(s.index_file, 0)
                 if first_ts and first_ts <= ts then
                     start_seg = s
-                    start_file_pos = index_floor_pos(s.index_file, n, ts) or 0
+                    start_file_pos = time_index.floor_pos(s.index_file, n, ts) or 0
                     break
                 end
             end

@@ -1,6 +1,6 @@
-local brk_m    = require("src.storage.broker")
+local brk_m    = require("src.broker")
 local offmgr_m = require("src.storage.offset_manager")
-local consumer_m = require("src.client.consumer")
+local consumer_m = require("src.broker.consumer")
 local clp_m    = require("src.storage.commitlog_partition")
 local os_utils = require("src.core.os")
 

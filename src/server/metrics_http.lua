@@ -18,7 +18,7 @@
 -- isn't on a trusted network.
 
 local socket  = require("socket")
-local metrics = require("src.server.metrics")
+local metrics = require("src.metrics")
 local json    = require("dkjson")
 local log     = require("src.log.logger").get("metrics")
  

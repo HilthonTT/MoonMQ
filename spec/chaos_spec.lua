@@ -10,8 +10,8 @@
 --   * BackpressureResilience     -> BehaviorNetworkDelay   (queue/latency stress)
 --   * NetworkPartitionResilience -> BehaviorServiceRestart (transient outage)
 
-local broker_m   = require("src.storage.broker")
-local producer_m = require("src.client.producer")
+local broker_m   = require("src.broker")
+local producer_m = require("src.broker.producer")
 local message_m  = require("src.record.message")
 local chaos_m    = require("src.chaos.chaos")
 local socket     = require("socket")

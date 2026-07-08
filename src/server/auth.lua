@@ -3,9 +3,9 @@
 --
 -- Stored hash format: pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
 
-local sha2   = require("sha2")
+local sha2   = require("src.vendor.sha2")
 local socket = require("socket")
-local rng    = require("src.server.rng")
+local rng    = require("src.core.rng")
 local log    = require("src.log.logger").get("auth")
 
 local M = {}

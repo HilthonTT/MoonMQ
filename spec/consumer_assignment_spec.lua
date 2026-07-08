@@ -1,5 +1,5 @@
-local brk_m      = require("src.storage.broker")
-local consumer_m = require("src.client.consumer")
+local brk_m      = require("src.broker")
+local consumer_m = require("src.broker.consumer")
 local message    = require("src.record.message")
 local os_utils   = require("src.core.os")
 

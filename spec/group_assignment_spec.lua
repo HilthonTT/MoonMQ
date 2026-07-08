@@ -4,9 +4,9 @@
 -- member read every partition (the group guarantee was decorative). See
 -- Consumer:set_assignment / Consumer:owns and Server:_apply_group_assignment.
 
-local brk_m      = require("src.storage.broker")
-local group_m    = require("src.client.groups")
-local consumer_m = require("src.client.consumer")
+local brk_m      = require("src.broker")
+local group_m    = require("src.broker.groups")
+local consumer_m = require("src.broker.consumer")
 local msg_m      = require("src.record.message")
 local os_utils   = require("src.core.os")
 

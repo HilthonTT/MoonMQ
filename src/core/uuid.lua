@@ -3,7 +3,7 @@
 -- correlation IDs (so the heartbeat coroutine can match responses to
 -- specific requests).
 
-local rng = require("src.server.rng")
+local rng = require("src.core.rng")
 
 local M = {}
 

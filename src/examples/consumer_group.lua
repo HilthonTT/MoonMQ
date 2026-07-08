@@ -15,8 +15,8 @@
 --
 -- Run from the project root:  lua5.4 src/examples/consumer_group.lua
 
-local brk_m   = require("src.storage.broker")
-local group_m = require("src.client.groups")
+local brk_m   = require("src.broker")
+local group_m = require("src.broker.groups")
 
 local function die(fmt, ...)
     io.stderr:write(string.format("consumer_group: " .. fmt .. "\n", ...))
