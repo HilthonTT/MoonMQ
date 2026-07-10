@@ -1,135 +1,126 @@
-local msg_m = require("src.record.message")
-local snappy = require("src.record.snappy")
-local zlib = require("zlib")
+-- Compression codecs for stored record values. Both codecs are OPTIONAL and
+-- loaded lazily so a broker missing lua-zlib and/or libsnappy still boots and
+-- only rejects produce requests that ask for the unavailable codec.
+--
+--   * gzip   — via lua-zlib (pure C rock).
+--   * snappy — via src/record/snappy.lua (LuaJIT FFI + libsnappy).
+--
+-- Codec ids are the same integers stored in the record's `attrs` byte (see
+-- src/record/message.lua): 0 none, 1 gzip, 2 snappy. This module is the single
+-- place that turns a codec id + bytes into compressed/decompressed bytes; the
+-- broker produce/deliver paths call M.compress / M.decompress and never touch
+-- the underlying libraries directly.
 
--- CompressionType defines the compression algorithm used
+local msg_m = require("src.record.message")
+
 local CompressionType = {
-    -- CompressionNone means no compression is used
-    CompressionNone     = 0,
-    -- CompressionGzip uses gzip compression
-    CompressionGzip     = 1,
-    -- CompressionSnappy uses snappy compression
-    CompressionSnappy   = 2,
+    CompressionNone   = msg_m.CODEC_NONE,
+    CompressionGzip   = msg_m.CODEC_GZIP,
+    CompressionSnappy = msg_m.CODEC_SNAPPY,
 }
 
-local function compress_gzip(data)
+-- Lazy zlib handle. nil = not yet probed, false = probed & unavailable,
+-- table = the loaded module. Deferred so `require`ing this module never fails
+-- on a host without lua-zlib.
+local zlib_state = nil
+local function get_zlib()
+    if zlib_state == nil then
+        local ok, z = pcall(require, "zlib")
+        zlib_state = (ok and z) or false
+    end
+    return zlib_state or nil
+end
+
+local snappy = require("src.record.snappy")  -- load-safe; self-reports availability
+
+-- available reports whether `codec_id` can be used on this host right now.
+-- CompressionNone is always available.
+local function available(codec_id)
+    if codec_id == msg_m.CODEC_NONE   then return true end
+    if codec_id == msg_m.CODEC_GZIP   then return get_zlib() ~= nil end
+    if codec_id == msg_m.CODEC_SNAPPY then return snappy.available end
+    return false
+end
+
+-- codec_id maps a human name ("none"/"gzip"/"snappy") to its integer id, or
+-- returns (nil, err) for an unknown name. Case-insensitive.
+local NAME_TO_ID = {
+    none   = msg_m.CODEC_NONE,
+    gzip   = msg_m.CODEC_GZIP,
+    snappy = msg_m.CODEC_SNAPPY,
+}
+local function codec_id(name)
+    local id = NAME_TO_ID[tostring(name):lower()]
+    if id == nil then
+        return nil, string.format("unknown compression codec %q", tostring(name))
+    end
+    return id
+end
+
+local function codec_name(id)
+    if id == msg_m.CODEC_NONE   then return "none" end
+    if id == msg_m.CODEC_GZIP   then return "gzip" end
+    if id == msg_m.CODEC_SNAPPY then return "snappy" end
+    return string.format("unknown(%s)", tostring(id))
+end
+
+local function gzip_compress(data)
+    local zlib = get_zlib()
+    if not zlib then return nil, "gzip unavailable (lua-zlib not installed)" end
     -- window_size = 31 selects the gzip wrapper (15 base + 16 gzip flag).
-    -- The default of 15 produces raw zlib output, which gunzip can't read.
     -- pcall'd because lua-zlib raises on bad input rather than returning err.
     local stream = zlib.deflate(zlib.BEST_COMPRESSION, 31)
-    local ok, compressed = pcall(stream, data, "finish")
+    local ok, out = pcall(stream, data, "finish")
     if not ok then
-        return nil, string.format("failed to compress with gzip: %s", compressed)
+        return nil, string.format("failed to compress with gzip: %s", out)
     end
-    return compressed, nil
+    return out, nil
 end
 
-local function compress_snappy(data)
-    local compressed, err = snappy.compress(data)
-    if not compressed then
-        return nil, string.format("failed to compress with snappy: %s", err)
-    end
-    return compressed, nil
-end
-
-local function decompress_gzip(data)
-    -- windowBits = 31 = gzip-only inflate, matching our compress side. Use
-    -- 47 (= 15 + 32) if you want zlib-or-gzip auto-detection.
+local function gzip_decompress(data)
+    local zlib = get_zlib()
+    if not zlib then return nil, "gzip unavailable (lua-zlib not installed)" end
+    -- windowBits = 31 = gzip-only inflate, matching our compress side.
     local stream = zlib.inflate(31)
-    local ok, decompressed = pcall(stream, data, "finish")
+    local ok, out = pcall(stream, data, "finish")
     if not ok then
-        return nil, string.format("failed to decompress with gzip: %s", decompressed)
+        return nil, string.format("failed to decompress with gzip: %s", out)
     end
-    return decompressed, nil
+    return out, nil
 end
 
-local function decompress_snappy(data)
-    -- pcall for parity with the gzip path: snappy.uncompress already returns
-    -- (nil, err) for malformed input, but the underlying FFI can still raise
-    -- (e.g. libsnappy not loadable), and an uncaught error here would crash the
-    -- caller instead of surfacing as a decode failure.
-    local ok, decompressed, err = pcall(snappy.uncompress, data)
-    if not ok then
-        return nil, string.format("failed to decompress with snappy: %s", tostring(decompressed))
+-- compress returns (bytes, nil) or (nil, err). CompressionNone is a pass-through
+-- so callers can hand any codec id through uniformly.
+local function compress(codec_id_, data)
+    assert(type(data) == "string", "data must be a string")
+    if codec_id_ == msg_m.CODEC_NONE then
+        return data, nil
+    elseif codec_id_ == msg_m.CODEC_GZIP then
+        return gzip_compress(data)
+    elseif codec_id_ == msg_m.CODEC_SNAPPY then
+        return snappy.compress(data)
     end
-    if not decompressed then
-        return nil, string.format("failed to decompress with snappy: %s", err)
-    end
-    return decompressed, nil
+    return nil, string.format("unknown compression codec id %s", tostring(codec_id_))
 end
 
-local CompressedMessage = {}
-CompressedMessage.__index = CompressedMessage
-
-function CompressedMessage.new(msg, compression_type)
-    assert(getmetatable(msg) == msg_m.Message, "msg must be a Message instance")
-    assert(type(compression_type) == "number", "compression_type must be a number")
-    
-    local value, err
-    if compression_type == CompressionType.CompressionNone then
-        value = msg.value
-    elseif compression_type == CompressionType.CompressionGzip then
-        value, err = compress_gzip(msg.value)
-    elseif compression_type == CompressionType.CompressionSnappy then
-        value, err = compress_snappy(msg.value)
-    else
-        return nil, string.format("unknown compression type: %d", compression_type)
+-- decompress is the inverse of compress. (bytes, nil) or (nil, err).
+local function decompress(codec_id_, data)
+    assert(type(data) == "string", "data must be a string")
+    if codec_id_ == msg_m.CODEC_NONE then
+        return data, nil
+    elseif codec_id_ == msg_m.CODEC_GZIP then
+        return gzip_decompress(data)
+    elseif codec_id_ == msg_m.CODEC_SNAPPY then
+        return snappy.uncompress(data)
     end
-
-    if err then
-        return nil, err
-    end
-
-    return setmetatable({
-        key              = msg.key,
-        timestamp        = msg.timestamp,
-        value            = value,
-        compression_type = compression_type,
-    }, CompressedMessage), nil
-end
-
--- to_message returns a plain Message reconstructed from this compressed
--- record. The returned Message's value is still the compressed bytes —
--- decompress separately if you need the original payload.
-function CompressedMessage:to_message()
-    return msg_m.Message.new(self.key, self.value, self.timestamp)
-end
-
--- decompress reconstructs the original Message from a CompressedMessage.
--- Inverse of CompressedMessage.new. Returns (Message, nil) on success or
--- (nil, err) on failure.
-local function decompress(comp_msg)
-    assert(getmetatable(comp_msg) == CompressedMessage,
-           "comp_msg must be a CompressedMessage instance")
-
-    local value, err
-    local ct = comp_msg.compression_type
-
-    if ct == CompressionType.CompressionNone then
-        value = comp_msg.value
-    elseif ct == CompressionType.CompressionGzip then
-        value, err = decompress_gzip(comp_msg.value)
-    elseif ct == CompressionType.CompressionSnappy then
-        value, err = decompress_snappy(comp_msg.value)
-    else
-        return nil, string.format("unknown compression type: %d", ct)
-    end
-
-    if err then
-        return nil, err
-    end
-
-    return msg_m.Message.new(comp_msg.key, value, comp_msg.timestamp), nil
-end
-
--- Method form for ergonomics: `comp_msg:decompress()` is identical to
--- the free `decompress(comp_msg)` above.
-function CompressedMessage:decompress()
-    return decompress(self)
+    return nil, string.format("unknown compression codec id %s", tostring(codec_id_))
 end
 
 return {
     CompressionType = CompressionType,
-    CompressedMessage = CompressedMessage,
-    decompress = decompress,
+    available   = available,
+    codec_id    = codec_id,
+    codec_name  = codec_name,
+    compress    = compress,
+    decompress  = decompress,
 }

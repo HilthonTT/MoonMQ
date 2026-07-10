@@ -32,8 +32,39 @@ local brk_m            = require("src.broker")
 local prd_m            = require("src.broker.producer")
 local metrics          = require("src.metrics")
 local MetricsHttp      = require("src.server.metrics_http")
+local Replicator       = require("src.server.replicator")
+local ReplicaServer    = require("src.server.replica_server")
+local replica_m        = require("src.server.replica")
 local version_m        = require("src.core.version")
 local log              = require("src.log.logger").get("server")
+
+-- acks mode names accepted from config (Server.Acks).
+local ACKS_BY_NAME = {
+    none   = prd_m.AckMode.AckNone,
+    leader = prd_m.AckMode.AckLeader,
+    all    = prd_m.AckMode.AckAll,
+}
+
+-- Build a leader-side Replicator from the replication config, or nil when
+-- replication is off / this node isn't a leader / no peers are configured. A
+-- pure "follower" role serves /replicate but doesn't replicate outward.
+local function build_replicator(reactor, rc)
+    if not rc or not rc.enabled then return nil end
+    local role = rc.role or "leader"
+    if role ~= "leader" and role ~= "both" then return nil end
+    local followers = {}
+    for _, peer in ipairs(rc.peers or {}) do
+        followers[#followers + 1] = {
+            id     = peer.id,
+            client = replica_m.ReplicaClient.new(peer.address, rc.ack_timeout),
+        }
+    end
+    if #followers == 0 then return nil end
+    return Replicator.new(reactor, rc.replica_id or 1, followers, {
+        lag_max     = rc.lag_max,
+        ack_timeout = rc.ack_timeout,
+    })
+end
 
 -- Tightened from a hypothetical 16 MiB to 1 MiB. A 1 MiB cap is still
 -- generous for a message queue and bounds worst-case memory under
@@ -121,24 +152,35 @@ function Server.new(opts)
     metrics.describe("moonmq_produce_records_total", "counter", "Records produced.")
     metrics.describe("moonmq_fetch_records_total", "counter", "Records delivered to consumers.")
 
-    local producer = prd_m.Producer.new(broker, prd_m.AckMode.AckLeader)
+    local reactor = Reactor.new()
+
+    -- Replication (single-leader, static config). On a leader, the Replicator
+    -- ships every produced record to the configured followers; acks=all blocks
+    -- on it. nil when replication is off or this node has no followers.
+    local replicator = build_replicator(reactor, opts.replication)
+
+    -- Ack mode: config may pass a name ("none"/"leader"/"all") or a number.
+    local acks = opts.acks
+    if type(acks) == "string" then acks = ACKS_BY_NAME[acks:lower()] end
+    if acks == nil then acks = prd_m.AckMode.AckLeader end
+    local producer = prd_m.Producer.new(broker, acks, { replicator = replicator })
 
     return setmetatable({
         broker      = broker,
         producer    = producer,
-        reactor     = Reactor.new(),
+        reactor     = reactor,
+        replicator  = replicator,
+        replication = opts.replication,
         coordinator = GroupCoordinator.new(broker, {
             max_groups = opts.max_groups or DEFAULT_MAX_GROUPS,
         }),
         host        = opts.host or "0.0.0.0",
         port        = opts.port or 9092,
 
-        -- Idempotent producer state. next_pid is a monotonic counter
-        -- assigned by INIT_PRODUCER_ID; the value lives only for this
-        -- broker process (no persistence — see docs/transactions.md
-        -- for the full-coordinator design that would make PIDs durable).
-        -- Starts at 1 so 0 can be reserved as "unassigned" in client code.
-        next_pid = 1,
+        -- Producer IDs + epochs are now allocated by the durable
+        -- ProducerStateManager (broker.producer_state), so INIT_PRODUCER_ID
+        -- survives restarts for named producers. No volatile per-process
+        -- counter lives on the Server anymore.
 
         max_frame                = opts.max_frame                or DEFAULT_MAX_FRAME,
         max_pending_bytes        = opts.max_pending_bytes        or DEFAULT_MAX_PENDING_BYTES,
@@ -203,6 +245,17 @@ function Server:_unregister_conn(conn)
     -- Implicit LEAVE_GROUP on socket drop. Guarded by connections_by_id
     -- above so it runs exactly once.
     self.coordinator:handle_disconnect(conn)
+
+    -- Abort a transaction the dropped connection left in progress, so it doesn't
+    -- sit ONGOING until the next restart's recovery. Best-effort — a failure
+    -- here still gets resolved on recovery. Guarded by connections_by_id above.
+    if conn.in_txn and conn.producer_name then
+        pcall(function()
+            self.broker.transactions:end_txn(
+                conn.producer_name, conn.pid, conn.epoch, false)
+        end)
+        conn.in_txn = false
+    end
 
     if self.connections > 0 then
         self.connections = self.connections - 1
@@ -376,6 +429,26 @@ function Server:start()
             server  = self,  -- powers /stats snapshot
         })
         mh:start()
+    end
+
+    -- Follower role: serve POST /replicate so a leader can ship us records.
+    local rc = self.replication
+    if rc and rc.enabled then
+        local role = rc.role or "leader"
+        if role == "follower" or role == "both" then
+            local rs = ReplicaServer.new({
+                reactor = self.reactor,
+                broker  = self.broker,
+                host    = rc.replicate_host or "127.0.0.1",
+                port    = rc.replicate_port,
+            })
+            rs:start()
+        end
+        if self.replicator then
+            log:info("replication: leader id=%s followers=%d ack_timeout=%ss",
+                tostring(rc.replica_id or 1), #self.replicator.followers,
+                tostring(self.replicator.ack_timeout))
+        end
     end
 
     self.reactor:run()

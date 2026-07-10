@@ -1,41 +1,56 @@
 -- LuaJIT FFI binding to libsnappy. Used in place of the `snappy` luarocks
 -- rock, which is not published for Lua 5.1. API mirrors what the rock
 -- would have exposed but uses (value, err) return convention.
+--
+-- Snappy is OPTIONAL: it needs both the LuaJIT `ffi` module and a loadable
+-- libsnappy. On stock Lua 5.4 (no ffi) or a host without libsnappy, requiring
+-- this module must NOT raise — the broker still boots and simply rejects
+-- snappy-coded produce requests. `M.available` reports whether the codec is
+-- usable; compress/uncompress return (nil, err) when it isn't.
 
-local ffi = require("ffi")
+local M = {}
 
-ffi.cdef[[
-typedef enum {
-    SNAPPY_OK = 0,
-    SNAPPY_INVALID_INPUT = 1,
-    SNAPPY_BUFFER_TOO_SMALL = 2
-} snappy_status;
+-- Guard the ffi require + ffi.load so a missing dependency degrades to
+-- "unavailable" instead of a load-time crash. `ffi` is absent on stock Lua;
+-- ffi.load raises if libsnappy can't be resolved.
+local ok, ffi = pcall(require, "ffi")
+local lib
+if ok and ffi then
+    pcall(function()
+        ffi.cdef[[
+        typedef enum {
+            SNAPPY_OK = 0,
+            SNAPPY_INVALID_INPUT = 1,
+            SNAPPY_BUFFER_TOO_SMALL = 2
+        } snappy_status;
 
-size_t snappy_max_compressed_length(size_t source_length);
+        size_t snappy_max_compressed_length(size_t source_length);
 
-snappy_status snappy_compress(const char* input,
-                              size_t input_length,
-                              char* compressed,
-                              size_t* compressed_length);
+        snappy_status snappy_compress(const char* input,
+                                      size_t input_length,
+                                      char* compressed,
+                                      size_t* compressed_length);
 
-snappy_status snappy_uncompressed_length(const char* compressed,
-                                          size_t compressed_length,
-                                          size_t* result);
+        snappy_status snappy_uncompressed_length(const char* compressed,
+                                                  size_t compressed_length,
+                                                  size_t* result);
 
-snappy_status snappy_uncompress(const char* compressed,
-                                size_t compressed_length,
-                                char* uncompressed,
-                                size_t* uncompressed_length);
-]]
+        snappy_status snappy_uncompress(const char* compressed,
+                                        size_t compressed_length,
+                                        char* uncompressed,
+                                        size_t* uncompressed_length);
+        ]]
+        -- ffi.load("snappy") resolves to libsnappy.so on Linux/WSL and
+        -- libsnappy.dylib on macOS. The unversioned symlink is provided by the
+        -- -dev package; if that's missing, libsnappy.so.1 is the runtime name.
+        lib = ffi.load("snappy")
+    end)
+end
 
--- ffi.load("snappy") resolves to libsnappy.so on Linux/WSL and
--- libsnappy.dylib on macOS. The unversioned symlink is provided by the
--- -dev package; if that's missing, libsnappy.so.1 is the runtime name.
-local lib = ffi.load("snappy")
+-- available reports whether the snappy codec can actually be used on this host.
+M.available = (lib ~= nil)
 
 local SNAPPY_OK              = 0
-local SNAPPY_INVALID_INPUT   = 1
-local SNAPPY_BUFFER_TOO_SMALL = 2
 
 -- Upper bound on a single decompressed frame. snappy_uncompressed_length only
 -- parses the varint length prefix at the front of the frame — it does NOT
@@ -48,15 +63,16 @@ local MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 
 local function status_name(code)
     code = tonumber(code)
-    if     code == SNAPPY_OK              then return "OK"
-    elseif code == SNAPPY_INVALID_INPUT   then return "INVALID_INPUT"
-    elseif code == SNAPPY_BUFFER_TOO_SMALL then return "BUFFER_TOO_SMALL"
+    if     code == 0 then return "OK"
+    elseif code == 1 then return "INVALID_INPUT"
+    elseif code == 2 then return "BUFFER_TOO_SMALL"
     else   return string.format("UNKNOWN(%d)", code)
     end
 end
 
-local function compress(data)
+function M.compress(data)
     assert(type(data) == "string", "data must be a string")
+    if not lib then return nil, "snappy unavailable (no ffi/libsnappy)" end
 
     local in_len  = #data
     local max_len = tonumber(lib.snappy_max_compressed_length(in_len))
@@ -71,8 +87,9 @@ local function compress(data)
     return ffi.string(out, out_len[0]), nil
 end
 
-local function uncompress(data)
+function M.uncompress(data)
     assert(type(data) == "string", "data must be a string")
+    if not lib then return nil, "snappy unavailable (no ffi/libsnappy)" end
 
     local in_len  = #data
     local out_len = ffi.new("size_t[1]")
@@ -96,7 +113,7 @@ local function uncompress(data)
             declared, MAX_UNCOMPRESSED_BYTES)
     end
 
-    local ok, result, err = pcall(function()
+    local pok, result, err = pcall(function()
         local out = ffi.new("char[?]", out_len[0])
         local st  = lib.snappy_uncompress(data, in_len, out, out_len)
         if st ~= SNAPPY_OK then
@@ -104,7 +121,7 @@ local function uncompress(data)
         end
         return ffi.string(out, out_len[0]), nil
     end)
-    if not ok then
+    if not pok then
         -- pcall caught a raised error (e.g. ffi.new allocation failure); `result`
         -- holds the error object here.
         return nil, string.format("snappy_uncompress: %s", tostring(result))
@@ -115,7 +132,4 @@ local function uncompress(data)
     return result, nil
 end
 
-return {
-    compress   = compress,
-    uncompress = uncompress,
-}
+return M

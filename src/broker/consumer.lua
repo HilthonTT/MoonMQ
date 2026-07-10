@@ -1,5 +1,6 @@
 local brk_m  = require("src.broker")
 local util_m = require("src.core.util")
+local compression = require("src.record.compression")
 local log    = require("src.log.logger").get("consumer")
 
 -- ConsumerRecord holds a consumed message with its metadata
@@ -143,7 +144,38 @@ function Consumer:poll()
             if self:owns(topic_name, partition_id)
                 and partition and offset < partition.offset then
                 local msg, next_offset, read_err = partition:read_message(offset)
-                if msg then
+                if msg and msg:is_control() then
+                    -- Transaction COMMIT/ABORT marker: it occupies an offset but
+                    -- is not an application record, so advance past it (committing
+                    -- if enabled) without emitting it. No read_committed
+                    -- filtering — data records from aborted txns are still
+                    -- delivered; only the marker itself is hidden.
+                    if self.auto_commit then
+                        local cok, cerr =
+                            self:commit_offset(topic_name, partition_id, next_offset)
+                        if not cok then
+                            if #records > 0 then return records, nil end
+                            return nil, cerr
+                        end
+                    end
+                    self.offsets[topic_name][partition_id] = next_offset
+                elseif msg then
+                    -- Decompress transparently so consumers always see plaintext
+                    -- regardless of how the record was stored. The stored value is
+                    -- the (possibly compressed) bytes; msg:codec() records which
+                    -- codec, if any.
+                    local value = msg.value
+                    local mcodec = msg:codec()
+                    if mcodec ~= 0 then
+                        local plain, derr = compression.decompress(mcodec, msg.value)
+                        if not plain then
+                            if #records > 0 then return records, nil end
+                            return nil, string.format(
+                                "decompress %s/partition-%d offset %d: %s",
+                                topic_name, partition_id, offset, tostring(derr))
+                        end
+                        value = plain
+                    end
                     -- Commit BEFORE advancing the in-memory offset. If we bumped
                     -- self.offsets first and the commit then failed, a caller that
                     -- treats the error as "poll produced nothing" would resume from
@@ -168,7 +200,7 @@ function Consumer:poll()
                         partition_id,
                         offset,
                         msg.key,
-                        msg.value,
+                        value,
                         msg.timestamp
                     )
                 else

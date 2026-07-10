@@ -3,6 +3,8 @@ local tpm_m      = require("src.storage.topic_manager")
 local topic_config = require("src.storage.topic_config")
 local util_m     = require("src.core.util")
 local offmgr_m   = require("src.storage.offset_manager")
+local prodstate_m = require("src.storage.producer_state")
+local txn_m      = require("src.broker.txn_coordinator")
 
 local Broker = {}
 Broker.__index = Broker
@@ -45,6 +47,25 @@ function Broker.new(data_dir, opts)
         return nil, oerr
     end
     broker.offsets = offsets
+
+    -- Durable producer state (PIDs, epochs, idempotent-produce memos) lives in
+    -- another internal topic, __producer_state, built the same way. This is what
+    -- lets idempotent/transactional producers survive a reconnect or restart.
+    local prod_state, perr =
+        prodstate_m.ProducerStateManager.new(topic_manager, opts.producer_state)
+    if not prod_state then
+        return nil, perr
+    end
+    broker.producer_state = prod_state
+
+    -- Transaction coordinator (built LAST: it uses topic_manager, offsets, and
+    -- producer_state during its own crash-recovery pass, which resolves any
+    -- transaction left in flight by a previous crash).
+    local txn, terr = txn_m.Coordinator.new(broker, opts.transactions)
+    if not txn then
+        return nil, terr
+    end
+    broker.transactions = txn
 
     return broker, nil
 end

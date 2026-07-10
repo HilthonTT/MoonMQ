@@ -53,6 +53,16 @@ M.OP_JOIN_GROUP       = 0x10
 M.OP_LEAVE_GROUP      = 0x11
 M.OP_GROUP_HEARTBEAT  = 0x12
 
+-- Transactions (Kafka-style, atomic multi-partition — see docs/transactions.md).
+-- BEGIN_TXN starts a transaction on a connection that opened a durable producer
+-- (a producer_name / transactional_id); transactional PRODUCE_IDEMPOTENT frames
+-- then implicitly enrol their partitions, TXN_OFFSET_COMMIT buffers offsets into
+-- the txn, and END_TXN commits or aborts atomically. All three are acked with
+-- OP_OK.
+M.OP_BEGIN_TXN        = 0x13
+M.OP_END_TXN          = 0x14
+M.OP_TXN_OFFSET_COMMIT = 0x15
+
 -- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
@@ -99,6 +109,14 @@ M.ERR_OUT_OF_ORDER_SEQUENCE = 11
 --   one connection maps to at most one group membership.
 M.ERR_GROUP_MEMBER_UNKNOWN = 12
 M.ERR_GROUP_CONFLICT       = 13
+-- Transactional / durable-producer error codes (see docs/transactions.md).
+-- PRODUCER_FENCED: a produce/transaction op arrived with an epoch older than
+--   the current one for this producer id — a newer session (same
+--   transactional_id / producer_name) has taken over and fenced this one.
+M.ERR_PRODUCER_FENCED      = 50
+M.ERR_INVALID_TXN_STATE    = 51
+M.ERR_TRANSACTION_TIMED_OUT = 52
+M.ERR_OFFSETS_OUT_OF_RANGE_FOR_TXN = 53
 
 local function encode_string(s)
     assert(type(s) == "string", "s must be a string")
@@ -165,8 +183,13 @@ function M.encode_auth_ok(correl_id)
     return encode_frame(M.OP_AUTH_OK, correl_id, "")
 end
 
-function M.encode_produce(correl_id, topic, key, value)
-    local payload = encode_string(topic) .. encode_string(key) .. encode_string(value)
+-- PRODUCE payload: u8 codec | str topic | str key | str value.
+-- `codec` is the compression codec the broker should store the value under
+-- (0 none, 1 gzip, 2 snappy — see src/record/message.lua). Defaults to 0 so
+-- callers that don't compress are unaffected.
+function M.encode_produce(correl_id, topic, key, value, codec)
+    local payload = string.pack(">B", codec or 0)
+        .. encode_string(topic) .. encode_string(key) .. encode_string(value)
     return encode_frame(M.OP_PRODUCE, correl_id, payload)
 end
 
@@ -182,22 +205,45 @@ end
 -- PRODUCE_IDEMPOTENT request: u64 pid | u32 seq | string topic | string key | string value
 -- Response: identical to OP_PRODUCE_ACK (partition + offset). Duplicate
 -- retries return the ORIGINAL ack — see _handle_produce_idempotent.
-function M.encode_init_producer_id(correl_id)
-    return encode_frame(M.OP_INIT_PRODUCER_ID, correl_id, "")
+-- INIT_PRODUCER_ID request now carries an optional producer_name (a stable
+-- identity — Kafka's transactional_id). Empty name = today's ephemeral
+-- session-scoped PID; a non-empty name gets a durable PID + monotonic epoch
+-- back so idempotence survives reconnects/restarts and old sessions are fenced.
+function M.encode_init_producer_id(correl_id, producer_name)
+    return encode_frame(M.OP_INIT_PRODUCER_ID, correl_id,
+        encode_string(producer_name or ""))
 end
 
-function M.encode_producer_id(correl_id, pid)
-    local payload = string.pack(">I8", pid)
+function M.decode_init_producer_id(payload)
+    -- Back-compat: an empty payload (old clients) means no producer name.
+    -- Uses M.decode_string (exported) because the local `decode_string` isn't in
+    -- scope this high in the file — same forward-reference reason
+    -- decode_produce_idempotent is defined near the bottom.
+    if #payload == 0 then return { producer_name = "" }, nil end
+    local name, _, err = M.decode_string(payload, 1, M.MAX_PRODUCER_NAME)
+    if not name then return nil, err end
+    return { producer_name = name }, nil
+end
+
+-- PRODUCER_ID reply: u64 pid | u16 epoch.
+function M.encode_producer_id(correl_id, pid, epoch)
+    local payload = string.pack(">I8I2", pid, epoch or 0)
     return encode_frame(M.OP_PRODUCER_ID, correl_id, payload)
 end
 
 function M.decode_producer_id(payload)
-    if #payload < 8 then return nil, "short producer_id" end
-    return { pid = string.unpack(">I8", payload, 1) }, nil
+    if #payload < 10 then return nil, "short producer_id" end
+    local pid, epoch = string.unpack(">I8I2", payload, 1)
+    return { pid = pid, epoch = epoch }, nil
 end
 
-function M.encode_produce_idempotent(correl_id, pid, seq, topic, key, value)
-    local payload = string.pack(">I8I4", pid, seq)
+-- PRODUCE_IDEMPOTENT payload:
+--   u64 pid | u32 seq | u16 epoch | u8 codec | str topic | str key | str value
+-- epoch fences zombie producers (durable/transactional producers, see
+-- src/storage/producer_state.lua); 0 for a plain session-scoped idempotent
+-- producer. codec is the compression codec (as in PRODUCE).
+function M.encode_produce_idempotent(correl_id, pid, seq, topic, key, value, epoch, codec)
+    local payload = string.pack(">I8I4I2B", pid, seq, epoch or 0, codec or 0)
         .. encode_string(topic)
         .. encode_string(key)
         .. encode_string(value)
@@ -244,6 +290,34 @@ end
 function M.encode_commit(correl_id, topic, partition, offset)
     local payload = encode_string(topic) .. string.pack(">I4I8", partition, offset)
     return encode_frame(M.OP_COMMIT, correl_id, payload)
+end
+
+-- BEGIN_TXN carries no payload: the connection already holds the durable
+-- producer identity (pid/epoch/name) it transacts under.
+function M.encode_begin_txn(correl_id)
+    return encode_frame(M.OP_BEGIN_TXN, correl_id, "")
+end
+
+-- END_TXN: u8 commit (1 = commit, 0 = abort).
+function M.encode_end_txn(correl_id, commit)
+    return encode_frame(M.OP_END_TXN, correl_id,
+        string.pack(">B", commit and 1 or 0))
+end
+
+function M.decode_end_txn(payload)
+    if #payload < 1 then return nil, "short end_txn" end
+    return { commit = string.unpack(">B", payload, 1) ~= 0 }, nil
+end
+
+-- TXN_OFFSET_COMMIT: str group | u32 count | (str topic | u32 partition | u64 offset)*
+function M.encode_txn_offset_commit(correl_id, group, offsets)
+    local parts = { encode_string(group), string.pack(">I4", #offsets) }
+    for i = 1, #offsets do
+        local o = offsets[i]
+        parts[#parts + 1] = encode_string(o.topic)
+        parts[#parts + 1] = string.pack(">I4I8", o.partition, o.offset)
+    end
+    return encode_frame(M.OP_TXN_OFFSET_COMMIT, correl_id, table.concat(parts))
 end
 
 function M.encode_create_topic(correl_id, name, num_partitions)
@@ -365,10 +439,14 @@ local MAX_PASSWORD      = 1024
 -- decode an attacker-chosen number of length-prefixed strings. 256 is
 -- far above any realistic subscription set.
 local MAX_GROUP_TOPICS  = 256
+-- Producer name (a.k.a. transactional_id): a stable, human-assigned identity.
+-- 256 is generous; it's the key into __producer_state.
+local MAX_PRODUCER_NAME = 256
 M.MAX_TOPIC_NAME = MAX_TOPIC_NAME
 M.MAX_GROUP_ID   = MAX_GROUP_ID
 M.MAX_MEMBER_ID  = MAX_MEMBER_ID
 M.MAX_GROUP_TOPICS = MAX_GROUP_TOPICS
+M.MAX_PRODUCER_NAME = MAX_PRODUCER_NAME
 
 function M.decode_hello(payload)
     if #payload < 4 then return nil, "short hello" end
@@ -384,13 +462,15 @@ function M.decode_auth(payload)
 end
 
 function M.decode_produce(payload)
-    local topic, p, err = decode_string(payload, 1, MAX_TOPIC_NAME)
+    if #payload < 1 then return nil, "short produce header" end
+    local codec = string.unpack(">B", payload, 1)
+    local topic, p, err = decode_string(payload, 2, MAX_TOPIC_NAME)
     if not topic then return nil, err end
     local key, p2, kerr = decode_string(payload, p)
     if not key then return nil, kerr end
     local value, _, verr = decode_string(payload, p2)
     if not value then return nil, verr end
-    return { topic = topic, key = key, value = value }, nil
+    return { codec = codec, topic = topic, key = key, value = value }, nil
 end
 
 function M.decode_subscribe(payload)
@@ -504,6 +584,31 @@ function M.decode_commit(payload)
     return { topic = topic, partition = partition, offset = offset }, nil
 end
 
+-- Cap offsets-per-txn-commit so one frame can't ask us to decode an
+-- attacker-chosen number of triples. 1024 is far above any realistic batch.
+local MAX_TXN_OFFSETS = 1024
+
+function M.decode_txn_offset_commit(payload)
+    local group, p, gerr = decode_string(payload, 1, MAX_GROUP_ID)
+    if not group then return nil, gerr end
+    if #payload - p + 1 < 4 then return nil, "short txn_offset_commit count" end
+    local count, pos = string.unpack(">I4", payload, p)
+    if count > MAX_TXN_OFFSETS then
+        return nil, string.format("too many offsets (%d > %d)", count, MAX_TXN_OFFSETS)
+    end
+    local offsets = {}
+    for _ = 1, count do
+        local topic, np, terr = decode_string(payload, pos, MAX_TOPIC_NAME)
+        if not topic then return nil, terr end
+        if #payload - np + 1 < 12 then return nil, "short txn_offset entry" end
+        local partition, offset = string.unpack(">I4I8", payload, np)
+        offsets[#offsets + 1] =
+            { topic = topic, partition = partition, offset = offset }
+        pos = np + 12
+    end
+    return { group = group, offsets = offsets }, nil
+end
+
 function M.decode_topic_list(payload)
     if #payload < 4 then return nil, "short topic list" end
     local count = string.unpack(">I4", payload, 1)
@@ -529,8 +634,9 @@ end
 -- Idempotent produce decode. Lives here because it depends on the
 -- decode_string helper and the MAX_TOPIC_NAME constant declared above.
 function M.decode_produce_idempotent(payload)
-    if #payload < 12 then return nil, "short produce_idempotent header" end
-    local pid, seq, p = string.unpack(">I8I4", payload, 1)
+    -- header = pid(8) + seq(4) + epoch(2) + codec(1) = 15 bytes.
+    if #payload < 15 then return nil, "short produce_idempotent header" end
+    local pid, seq, epoch, codec, p = string.unpack(">I8I4I2B", payload, 1)
     local topic, p2, terr = decode_string(payload, p, MAX_TOPIC_NAME)
     if not topic then return nil, terr end
     local key, p3, kerr = decode_string(payload, p2)
@@ -540,6 +646,8 @@ function M.decode_produce_idempotent(payload)
     return {
         pid       = pid,
         seq       = seq,
+        epoch     = epoch,
+        codec     = codec,
         topic     = topic,
         key       = key,
         value     = value,

@@ -124,8 +124,12 @@ Some modules under `src/` depend on libraries that may not be present:
 
 - **`src/record/compression.lua`** needs the `zlib` LuaRocks module (gzip support).
 - **`src/record/snappy.lua`** needs LuaJIT's FFI and `libsnappy` (Snappy support).
-- **`src/server/replica.lua`** loads on stock Lua, but real replication needs a peer
-  broker exposing an HTTP `/replicate` endpoint.
+  Both codecs load lazily: a broker without them still boots and only rejects
+  produce requests that ask for the missing codec.
+- **Replication** (`src/server/replicator.lua` + `src/server/replica_server.lua`)
+  loads on stock Lua. Configure it under `Server.Replication` (single-leader,
+  static peers); a follower serves `POST /replicate` and a leader ships records
+  to its peers. `Server.Acks: "all"` blocks produces until followers ack.
 
 ### Logging to a file
 
@@ -346,8 +350,9 @@ src/
                    batching, retention, crash recovery)
   commitlog/       alternative "commitlog" backend (jocko-style: dense offset
                    index, byte-budget retention, key compaction)
-  record/          on-disk record codec (CRC-framed key/value messages);
-                   compression helpers (not yet wired into the write path)
+  record/          on-disk record codec (v2: CRC-framed key/value + attrs byte
+                   for compression codec + txn control flag); gzip/snappy
+                   compression wired into the produce/store path
   io/              filesystem helpers and durability primitives (fsync,
                    ftruncate, atomic rename — POSIX and Windows)
   metrics/         Prometheus-style metrics registry

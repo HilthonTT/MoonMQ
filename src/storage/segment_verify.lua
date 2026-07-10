@@ -1,9 +1,8 @@
-local crc32   = require("src.core.crc32")
 local io_sync = require("src.io.io_sync")
+local msg_m   = require("src.record.message")
 local log     = require("src.log.logger").get("segment_verify")
 
-local HEADER_SIZE    = 8
-local MSG_HEADER_LEN = 12
+local HEADER_SIZE = 8   -- the 8-byte length prefix in front of each record body
 
 -- Scan `file_path` from byte `start_at` to EOF. Truncate (+fsync) at the
 -- first bad record. Returns the byte position right after the last valid
@@ -56,7 +55,7 @@ local function verify_file(file_path, start_at)
         local record_end = current + HEADER_SIZE + total_size
 
         if record_end > file_size
-           or total_size < MSG_HEADER_LEN + 4 + 4 then
+           or total_size < msg_m.MIN_BODY then
             log:error("%s: bad framing at %d, truncating", file_path, current)
             truncate_at = current
             break
@@ -68,14 +67,10 @@ local function verify_file(file_path, start_at)
             break
         end
 
-        local header_bytes = body:sub(1, MSG_HEADER_LEN)
-        local stored_header_crc= string.unpack(">I4", body, MSG_HEADER_LEN + 1)
-        local payload_end = #body - 4
-        local payload = body:sub(MSG_HEADER_LEN + 4 + 1, payload_end)
-        local stored_payload_crc = string.unpack(">I4", body, payload_end + 1)
-
-        if crc32(header_bytes) ~= stored_header_crc or crc32(payload) ~= stored_payload_crc then
-            log:error("%s: CRC mismatch at %d, truncating", file_path, current)
+        -- Validate framing + both CRCs through the single authoritative codec.
+        local _, derr = msg_m.decode_body(body)
+        if derr then
+            log:error("%s: %s at %d, truncating", file_path, derr, current)
             truncate_at = current
             break
         end

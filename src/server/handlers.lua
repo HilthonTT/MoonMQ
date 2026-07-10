@@ -15,11 +15,42 @@ local Connection = require("src.server.connection")
 local uuid       = require("src.core.uuid")
 local consumer_m = require("src.broker.consumer")
 local msg_m      = require("src.record.message")
+local compression = require("src.record.compression")
 local metrics    = require("src.metrics")
 local log        = require("src.log.logger").get("server")
 local push_log   = require("src.log.logger").get("push")
 
 local M = {}
+
+-- Build the Message to append for a produce request, applying compression when
+-- a codec is requested. The KEY is always stored plaintext (so commitlog
+-- key-compaction still matches); only the value is compressed, and the codec is
+-- recorded in the record's attrs byte so read paths can decompress. Returns
+-- (Message, nil) or (nil, err) when the requested codec isn't available here.
+local function build_stored_message(codec, key, value)
+    codec = codec or msg_m.CODEC_NONE
+    if codec == msg_m.CODEC_NONE then
+        return msg_m.Message.new(key, value, 0)
+    end
+    if not compression.available(codec) then
+        return nil, string.format("compression codec %s unavailable on this broker",
+            compression.codec_name(codec))
+    end
+    local stored, cerr = compression.compress(codec, value)
+    if not stored then
+        return nil, string.format("compress (%s) failed: %s",
+            compression.codec_name(codec), cerr)
+    end
+    -- codec id occupies attrs bits 0-1; no control bit on data records.
+    return msg_m.Message.new(key, stored, 0, codec & msg_m.ATTR_CODEC_MASK)
+end
+
+-- Map a coordinator error "code" hint to a wire error code.
+local function txn_err_code(code)
+    if code == "fenced" then return proto.ERR_PRODUCER_FENCED end
+    if code == "state"  then return proto.ERR_INVALID_TXN_STATE end
+    return proto.ERR_INTERNAL
+end
 
 function M.hello(server, conn, correl, payload)
     local h, err = proto.decode_hello(payload)
@@ -96,7 +127,11 @@ function M.produce(server, conn, correl, payload)
         return
     end
 
-    local msg = msg_m.Message.new(p.key, p.value, 0)
+    local msg, berr = build_stored_message(p.codec, p.key, p.value)
+    if not msg then
+        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, berr))
+        return
+    end
     local part_id, offset, werr = server.producer:produce(p.topic, msg)
     if werr then
         local code = werr:find("does not exist", 1, true)
@@ -110,17 +145,49 @@ function M.produce(server, conn, correl, payload)
     conn:send(proto.encode_produce_ack(correl, part_id, offset))
 end
 
--- INIT_PRODUCER_ID: assign a u64 producer ID to this connection. Repeated
--- calls on the same connection are tolerated but reset all per-PID seq
--- state (a client that asks for a fresh PID has lost track of its
--- sequences). PIDs are not durable.
-function M.init_producer_id(server, conn, correl, _payload)
-    local pid = server.next_pid
-    server.next_pid = server.next_pid + 1
-    conn.pid = pid
-    conn.seq_state = {}
-    log:info("conn=%s assigned producer_id=%d", conn.id_short, pid)
-    conn:send(proto.encode_producer_id(correl, pid))
+-- INIT_PRODUCER_ID: assign a producer ID (+ epoch) to this connection.
+--
+-- Empty producer_name → an ephemeral, session-scoped PID (today's behaviour):
+-- the PID and its sequence memos live only on this connection and vanish when
+-- it closes. Epoch is always 0.
+--
+-- Non-empty producer_name → a DURABLE producer identity backed by
+-- __producer_state: the same PID is returned across reconnects/restarts and the
+-- epoch is bumped each session so a stale old session is fenced. The dedup memo
+-- is persisted, so an idempotent retry survives a broker restart.
+function M.init_producer_id(server, conn, correl, payload)
+    local req, err = proto.decode_init_producer_id(payload)
+    if not req then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    local ps = server.broker.producer_state
+
+    if req.producer_name == "" then
+        local pid = ps:allocate_ephemeral()
+        conn.pid           = pid
+        conn.epoch         = 0
+        conn.producer_name = nil
+        conn.seq_state     = {}
+        log:info("conn=%s assigned ephemeral producer_id=%d", conn.id_short, pid)
+        conn:send(proto.encode_producer_id(correl, pid, 0))
+        return
+    end
+
+    local pid, epoch, gerr = ps:get_or_create_producer(req.producer_name)
+    if not pid then
+        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL,
+            gerr or "producer id allocation failed"))
+        return
+    end
+    conn.pid           = pid
+    conn.epoch         = epoch
+    conn.producer_name = req.producer_name
+    conn.seq_state     = {}   -- durable producers dedup via the persisted memo
+    log:info("conn=%s producer_id=%d epoch=%d name=%s",
+        conn.id_short, pid, epoch, req.producer_name)
+    conn:send(proto.encode_producer_id(correl, pid, epoch))
 end
 
 -- PRODUCE_IDEMPOTENT: like PRODUCE, but checks (PID, topic, seq) for
@@ -165,13 +232,46 @@ function M.produce_idempotent(server, conn, correl, payload)
         return
     end
 
-    local slot = conn.seq_state[p.topic]
-    local last_seq = slot and slot.last_seq or -1
+    local ps       = server.broker.producer_state
+    local durable  = conn.producer_name ~= nil
 
-    if p.seq == last_seq and slot then
-        -- Idempotent retry: replay the original ack.
-        conn:send(proto.encode_produce_ack(correl,
-            slot.last_partition, slot.last_offset))
+    -- Epoch fencing (durable producers only): a stale-epoch frame means a newer
+    -- session has taken over this producer identity — reject the zombie.
+    if durable then
+        local cur = ps:current_epoch(conn.pid)
+        if cur ~= nil and p.epoch ~= cur then
+            conn:send(proto.encode_error(correl, proto.ERR_PRODUCER_FENCED,
+                string.format("producer fenced: frame epoch %d != current %d",
+                    p.epoch, cur)))
+            return
+        end
+    end
+
+    -- Dedup state comes from the DURABLE memo for named producers (so it
+    -- survives reconnect/restart) or from in-memory per-connection state for
+    -- ephemeral producers (session-scoped, today's behaviour).
+    local last_seq, last_offset, last_partition
+    if durable then
+        local m = ps:lookup_memo(conn.pid, p.topic)
+        if m then
+            last_seq, last_offset, last_partition =
+                m.last_seq, m.last_offset, m.last_partition
+        else
+            last_seq = -1
+        end
+    else
+        local slot = conn.seq_state[p.topic]
+        if slot then
+            last_seq, last_offset, last_partition =
+                slot.last_seq, slot.last_offset, slot.last_partition
+        else
+            last_seq = -1
+        end
+    end
+
+    if p.seq == last_seq and last_offset ~= nil then
+        -- Idempotent retry: replay the original ack without re-appending.
+        conn:send(proto.encode_produce_ack(correl, last_partition, last_offset))
         return
     elseif p.seq < last_seq or p.seq > last_seq + 1 then
         conn:send(proto.encode_error(correl, proto.ERR_OUT_OF_ORDER_SEQUENCE,
@@ -184,7 +284,11 @@ function M.produce_idempotent(server, conn, correl, payload)
     -- producer so partitioning + group-commit fsync behave identically
     -- to the non-idempotent path. The (partition, offset) we get back
     -- is what we memo so a retry can replay the same ack.
-    local msg = msg_m.Message.new(p.key, p.value, 0)
+    local msg, berr = build_stored_message(p.codec, p.key, p.value)
+    if not msg then
+        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, berr))
+        return
+    end
     local partition_id, offset, werr = server.producer:produce(p.topic, msg)
     if werr then
         local code = werr:find("does not exist", 1, true)
@@ -193,11 +297,38 @@ function M.produce_idempotent(server, conn, correl, payload)
         return
     end
 
-    conn.seq_state[p.topic] = {
-        last_seq       = p.seq,
-        last_offset    = offset,
-        last_partition = partition_id,
-    }
+    if durable then
+        -- Persist the memo so a retry after a restart replays this ack. The
+        -- record is already durable; if persisting the memo fails, the
+        -- idempotence guarantee for THIS record is degraded (a later retry could
+        -- duplicate), so surface it rather than acking as if fully durable.
+        local ok, rerr = ps:record_produce(conn.pid, p.topic, p.seq,
+            offset, partition_id)
+        if not ok then
+            conn:send(proto.encode_error(correl, proto.ERR_INTERNAL,
+                "produced but failed to persist producer state: " .. tostring(rerr)))
+            return
+        end
+    else
+        conn.seq_state[p.topic] = {
+            last_seq       = p.seq,
+            last_offset    = offset,
+            last_partition = partition_id,
+        }
+    end
+
+    -- If this producer is inside a transaction, enrol the partition it just
+    -- wrote to as a participant, so END_TXN writes a COMMIT/ABORT marker there.
+    if conn.in_txn and conn.producer_name then
+        local pok, perr, pcode = server.broker.transactions:add_partition(
+            conn.producer_name, conn.pid, conn.epoch, p.topic, partition_id)
+        if not pok then
+            conn:send(proto.encode_error(correl, txn_err_code(pcode),
+                "produced but failed to enrol partition in txn: " .. tostring(perr)))
+            return
+        end
+    end
+
     metrics.inc("moonmq_produce_records_total", 1, { topic = p.topic })
     metrics.inc("moonmq_idempotent_produce_total", 1, { topic = p.topic })
 
@@ -361,8 +492,8 @@ function M.commit(server, conn, correl, payload)
     end
     -- Bounds-check the partition against the topic before forwarding to
     -- the consumer. Without this, a client could commit to any u32
-    -- partition id — currently the consumer stub silently accepts it,
-    -- but that's a future foot-gun once offset persistence lands.
+    -- partition id, and offset persistence (OffsetManager) would store a
+    -- commit for a partition that doesn't exist.
     local topic, terr = server.broker:get_topic(c.topic)
     if not topic then
         conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
@@ -544,6 +675,76 @@ function M.group_heartbeat(server, conn, correl, payload)
     conn:send(proto.encode_ok(correl))
 end
 
+-- BEGIN_TXN: start a transaction on this connection. Requires a durable
+-- producer identity (a producer_name was given to INIT_PRODUCER_ID) so the
+-- coordinator has a stable transactional_id + epoch to fence on.
+function M.begin_txn(server, conn, correl, _payload)
+    if not conn.producer_name then
+        conn:send(proto.encode_error(correl, proto.ERR_INVALID_TXN_STATE,
+            "transactions require a durable producer (producer_name in INIT_PRODUCER_ID)"))
+        return
+    end
+    local ok, err, code = server.broker.transactions:begin(
+        conn.producer_name, conn.pid, conn.epoch)
+    if not ok then
+        conn:send(proto.encode_error(correl, txn_err_code(code), err))
+        return
+    end
+    conn.in_txn = true
+    log:info("conn=%s began txn=%s epoch=%d", conn.id_short, conn.producer_name, conn.epoch)
+    conn:send(proto.encode_ok(correl))
+end
+
+-- END_TXN: commit or abort the in-progress transaction. On commit the
+-- coordinator writes COMMIT markers to every participant partition and applies
+-- buffered offset commits atomically; on abort it writes ABORT markers and drops
+-- the buffered offsets.
+function M.end_txn(server, conn, correl, payload)
+    if not conn.in_txn or not conn.producer_name then
+        conn:send(proto.encode_error(correl, proto.ERR_INVALID_TXN_STATE,
+            "no transaction in progress"))
+        return
+    end
+    local e, derr = proto.decode_end_txn(payload)
+    if not e then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, derr))
+        return
+    end
+    local ok, err, code = server.broker.transactions:end_txn(
+        conn.producer_name, conn.pid, conn.epoch, e.commit)
+    if not ok then
+        conn:send(proto.encode_error(correl, txn_err_code(code), err))
+        return
+    end
+    conn.in_txn = false
+    log:info("conn=%s %s txn=%s", conn.id_short,
+        e.commit and "committed" or "aborted", conn.producer_name)
+    conn:send(proto.encode_ok(correl))
+end
+
+-- TXN_OFFSET_COMMIT: buffer consumer offsets into the transaction. They are
+-- persisted only when the txn commits — the consume-transform-produce pattern's
+-- exactly-once handoff.
+function M.txn_offset_commit(server, conn, correl, payload)
+    if not conn.in_txn or not conn.producer_name then
+        conn:send(proto.encode_error(correl, proto.ERR_INVALID_TXN_STATE,
+            "no transaction in progress"))
+        return
+    end
+    local t, derr = proto.decode_txn_offset_commit(payload)
+    if not t then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, derr))
+        return
+    end
+    local ok, err, code = server.broker.transactions:add_offsets(
+        conn.producer_name, conn.pid, conn.epoch, t.group, t.offsets)
+    if not ok then
+        conn:send(proto.encode_error(correl, txn_err_code(code), err))
+        return
+    end
+    conn:send(proto.encode_ok(correl))
+end
+
 function M.goodbye(_server, conn, _correl, _payload)
     conn:close(Connection.REASON_CLIENT_GOODBYE)
 end
@@ -565,6 +766,9 @@ M.BY_OP = {
     [proto.OP_JOIN_GROUP]         = M.join_group,
     [proto.OP_LEAVE_GROUP]        = M.leave_group,
     [proto.OP_GROUP_HEARTBEAT]    = M.group_heartbeat,
+    [proto.OP_BEGIN_TXN]          = M.begin_txn,
+    [proto.OP_END_TXN]            = M.end_txn,
+    [proto.OP_TXN_OFFSET_COMMIT]  = M.txn_offset_commit,
     [proto.OP_GOODBYE]            = M.goodbye,
 }
 

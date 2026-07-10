@@ -1,17 +1,33 @@
 # Transactions in MoonMQ
 
-Status: **partial**. Session-scoped idempotent producer landed 2026-06-21.
-Full Kafka-style transactions (`read_committed` isolation, cross-partition
-atomicity, exactly-once semantics across consumer + producer) are
-deferred — they require a consumer-group coordinator and durable offset
-storage, neither of which exists yet.
+Status: **atomic multi-partition transactions shipped** (2026-07-10), building on
+the session-scoped idempotent producer (2026-06-21) and durable consumer offsets.
+
+What now ships:
+
+- **Durable producers** (`src/storage/producer_state.lua`): a producer opened
+  with a stable `producer_name` (Kafka's `transactional_id`) gets a PID + epoch
+  that survive reconnects and broker restarts. Each new session bumps the epoch,
+  fencing the old one (`ERR_PRODUCER_FENCED`). Idempotent-produce sequence memos
+  are persisted, so a retry replays the original ack across a restart.
+- **Atomic multi-partition transactions** (`src/broker/txn_coordinator.lua`):
+  `BEGIN_TXN` / transactional `PRODUCE_IDEMPOTENT` / `TXN_OFFSET_COMMIT` /
+  `END_TXN`. On commit the coordinator writes COMMIT control records to every
+  participant partition and applies buffered offset commits; on abort it writes
+  ABORT markers and drops the offsets. State lives in the internal
+  `__transaction_state` topic and is re-driven idempotently on crash recovery
+  (ONGOING → abort, PREPARE_COMMIT → roll forward).
+
+What is still **deferred** (see §2): `read_committed` consumer isolation and the
+Last Stable Offset. Consumers currently read every record — including data
+records from aborted transactions; only the COMMIT/ABORT control markers are
+hidden from consumers. That is the accepted trade-off for this phase.
 
 This document records:
 
-1. What ships today: session-scoped idempotent producer.
-2. What is intentionally NOT in scope today.
-3. The design surface for the deferred full-transaction system, so the
-   next pass can pick it up without re-discovering the constraints.
+1. What ships today (idempotent producer + atomic transactions).
+2. What is intentionally NOT in scope today (`read_committed` / LSO).
+3. The original design surface, retained for the deferred isolation work.
 
 ---
 
@@ -98,28 +114,33 @@ local replay = c:produce_at_seq("orders", "key-1", "value-1", 0)
 
 ## 2. Out of scope (today)
 
+Still deferred:
+
 - `read_committed` consumer isolation level.
 - Last Stable Offset (LSO) tracking on partitions.
-- COMMIT / ABORT control records in the log.
-- Cross-partition atomic commit.
-- Transactional offset-commit (offsets written as part of the same txn
-  as the records they cover).
-- `__transaction_state` coordinator topic.
-- PID expiry & PID generation epochs.
-- Producer fencing across reconnects (require last-known epoch).
+- Filtering aborted records out at read time (needs LSO + read_committed).
+- PID expiry / garbage-collecting idle producer state.
+
+Now implemented (were previously out of scope):
+
+- COMMIT / ABORT control records in the log (v2 record format, control bit).
+- Cross-partition atomic commit via the transaction coordinator.
+- Transactional offset-commit (`TXN_OFFSET_COMMIT`, applied on commit).
+- `__transaction_state` coordinator topic + crash recovery.
+- PID generation epochs and producer fencing across reconnects.
 
 ---
 
 ## 3. Deferred design: full Kafka-style transactions
 
-The work below is blocked on two prerequisites:
+The prerequisites below have since landed and are noted for context; the
+remaining deferred work is `read_committed` isolation + LSO (see §2).
 
-- **Consumer subsystem.** Today `commit_offset` and `load_offset` are
-  no-ops (see `src/broker/consumer.lua`). Until offsets are durable, the
-  transactional offset commit can't be implemented.
-- **`__consumer_offsets` topic.** Real Kafka stores committed offsets
-  in an internal topic with the same replication and storage path as
-  user topics. We need that internal-topic mechanism in place.
+- **Consumer subsystem.** `commit_offset` / `load_offset` are now durable
+  (`src/broker/consumer.lua` → `OffsetManager`).
+- **`__consumer_offsets` topic.** Implemented (`src/storage/offset_manager.lua`);
+  `__producer_state` and `__transaction_state` follow the same internal-topic
+  pattern.
 
 ### Components
 

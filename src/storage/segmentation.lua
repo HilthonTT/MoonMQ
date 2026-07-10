@@ -2,7 +2,6 @@ local topic_m = require("src.storage.topic")
 local time_m = require("src.core.time")
 local fs_m = require("src.io.fs")
 local msg_m = require("src.record.message")
-local crc32 = require("src.core.crc32")
 local socket = require("socket")
 local io_sync = require("src.io.io_sync")
 local verify_file = require("src.storage.segment_verify")
@@ -658,8 +657,7 @@ function SegmentedPartition:read_message(offset)
     -- lands mid-record the 8 bytes decode to an arbitrary (or negative, via the
     -- u64 high bit) length, and reading it blindly is a memory-exhaustion DoS.
     -- seg.bytes_written is the in-memory segment size, so no extra syscall.
-    local HEADER_LEN = 12
-    if total_size < HEADER_LEN + 4 + 4 then
+    if total_size < msg_m.MIN_BODY then
         return nil, offset, "corrupt header: total_size too small"
     end
     if total_size > seg.bytes_written - (local_pos + 8) then
@@ -671,29 +669,12 @@ function SegmentedPartition:read_message(offset)
         return nil, offset, "failed to read message body: unexpected EOF"
     end
 
-    local header_bytes       = body:sub(1, HEADER_LEN)
-    local stored_header_crc  = string.unpack(">I4", body, HEADER_LEN + 1)
-    local payload_start      = HEADER_LEN + 4 + 1
-    local payload_end        = #body - 4
-    local payload            = body:sub(payload_start, payload_end)
-    local stored_payload_crc = string.unpack(">I4", body, payload_end + 1)
-
-    if crc32(header_bytes) ~= stored_header_crc then
-        return nil, offset, "header checksum mismatch"
+    -- Decode + CRC-validate through the single authoritative codec so the
+    -- on-disk format lives in exactly one place (src/record/message.lua).
+    local m, derr = msg_m.decode_body(body)
+    if not m then
+        return nil, offset, derr
     end
-    if crc32(payload) ~= stored_payload_crc then
-        return nil, offset, "payload checksum mismatch"
-    end
-
-    local key_size, timestamp = string.unpack(">I4I8", header_bytes)
-    if key_size < 0 or key_size > #payload then
-        return nil, offset, "corrupt header: key_size out of range"
-    end
-
-    local key   = payload:sub(1, key_size)
-    local value = payload:sub(key_size + 1)
-
-    local m           = msg_m.Message.new(key, value, timestamp)
     local next_offset = offset + 8 + total_size
 
     return m, next_offset, nil

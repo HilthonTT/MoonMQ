@@ -142,14 +142,24 @@ end
 local Producer = {}
 Producer.__index = Producer
 
-function Producer.new(broker, acks)
+-- opts (optional):
+--   replicator  a Replicator (src/server/replicator.lua). Required for
+--               acks=all: without configured followers there is no
+--               high-watermark to wait on. When present, EVERY produced record
+--               is also shipped to followers (async for acks<all; awaited for
+--               acks=all).
+function Producer.new(broker, acks, opts)
     assert(getmetatable(broker) == brk.Broker, "broker must be a Broker instance")
     assert(type(acks) == "number", "acks must be a number")
-    assert(acks ~= AckMode.AckAll, ERR_ACKS_ALL_UNSUPPORTED)
+    opts = opts or {}
+    if acks == AckMode.AckAll then
+        assert(opts.replicator, ERR_ACKS_ALL_UNSUPPORTED)
+    end
 
     return setmetatable({
         broker = broker,
         acks = acks,
+        replicator = opts.replicator,
         partitioner = default_partitioner,
         -- Sticky-partition state for empty-key sends. Keyed by topic name
         -- since num_partitions varies per topic. See default_partitioner.
@@ -161,7 +171,8 @@ function Producer:produce(topic_name, msg)
     assert(type(topic_name) == "string", "topic_name must be a string")
     assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
 
-    if self.acks == AckMode.AckAll then
+    if self.acks == AckMode.AckAll
+        and not (self.replicator and self.replicator:enabled()) then
         return -1, -1, ERR_ACKS_ALL_UNSUPPORTED
     end
 
@@ -190,6 +201,18 @@ function Producer:produce(topic_name, msg)
         return -1, -1, string.format("failed to write message: %s", werr)
     end
 
+    -- Ship to followers whenever replication is configured. `partition.offset`
+    -- is the leader's log-end offset after this write — what a follower must
+    -- reach to hold this record. Async for acks<all; acks=all awaits it below.
+    if self.replicator and self.replicator:enabled() then
+        local bytes, berr = message.serialize_message(msg)
+        if bytes then
+            self.replicator:replicate(topic_name, partition_id, partition.offset, bytes)
+        else
+            log:error("replication skipped: serialize failed: %s", tostring(berr))
+        end
+    end
+
     if self.acks == AckMode.AckLeader then
         -- request_sync coalesces concurrent acks=1 waiters into one fsync
         -- when the partition has a committer attached (set at server boot
@@ -199,6 +222,18 @@ function Producer:produce(topic_name, msg)
         local sok, serr = partition:request_sync()
         if not sok then
             return -1, -1, string.format("failed to sync partition: %s", serr)
+        end
+    elseif self.acks == AckMode.AckAll then
+        -- Leader durability first, then block until every follower has the
+        -- record (or the ack timeout fires).
+        local sok, serr = partition:request_sync()
+        if not sok then
+            return -1, -1, string.format("failed to sync partition: %s", serr)
+        end
+        local rok, rerr = self.replicator:wait_for(
+            topic_name, partition_id, partition.offset)
+        if not rok then
+            return -1, -1, rerr
         end
     end
 

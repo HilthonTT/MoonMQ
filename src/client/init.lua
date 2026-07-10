@@ -1,8 +1,18 @@
 local socket = require("socket")
 local proto = require("src.wire.protocol")
 local uuid = require("src.core.uuid")
+local msg_m = require("src.record.message")
 
 local DEFAULT_TIMEOUT = 30
+
+-- Compression codec name → id. Kept local (rather than via
+-- src.record.compression) so the client doesn't pull in the native codec
+-- probes; the broker validates availability and errors if it can't honour it.
+local CODEC_BY_NAME = {
+    none   = msg_m.CODEC_NONE,
+    gzip   = msg_m.CODEC_GZIP,
+    snappy = msg_m.CODEC_SNAPPY,
+}
 
 local Client = {}
 Client.__index = Client
@@ -33,6 +43,11 @@ function Client.new(opts)
         -- back from the broker — at-most-once delivery without
         -- application-level dedup.
         pid = nil,
+        -- Compression codec applied to produced values (name resolved to an id
+        -- here; the broker stores the value under it and consumers decompress
+        -- transparently). Defaults to none.
+        compression = CODEC_BY_NAME[tostring(opts.compression or "none"):lower()]
+                      or msg_m.CODEC_NONE,
         next_seq = {},  -- topic -> next u32 seq to send
         -- Consumer-group membership, populated by join_group(). The
         -- broker-assigned member_id is reused by group_heartbeat/leave_group
@@ -89,13 +104,16 @@ function Client.new(opts)
         end
     end
 
-    -- Idempotent producer init (optional). On reconnect the caller must
-    -- pass idempotent=true again — PIDs are not durable across the
-    -- broker process or this socket. See docs/transactions.md for the
-    -- coordinator-backed design that would make PIDs survivable.
-    if opts.idempotent then
+    -- Producer-id init (optional). Two modes:
+    --   * opts.producer_name set → DURABLE producer: the broker returns the same
+    --     pid across reconnects/restarts and a bumped epoch each session, so
+    --     idempotence survives a restart and old sessions are fenced.
+    --   * opts.idempotent (no name) → ephemeral session-scoped pid (pids are not
+    --     durable across the socket/process; re-init on reconnect).
+    if opts.producer_name or opts.idempotent then
         local icorrel = uuid.bytes()
-        ok, err = c:_write(proto.encode_init_producer_id(icorrel))
+        ok, err = c:_write(proto.encode_init_producer_id(icorrel,
+            opts.producer_name))
         if not ok then c:close(); return nil, "send init_producer_id: " .. err end
 
         op, _, payload, rerr = c:_read_until(icorrel)
@@ -114,7 +132,9 @@ function Client.new(opts)
             c:close()
             return nil, "decode producer_id: " .. perr
         end
-        c.pid = pinfo.pid
+        c.pid   = pinfo.pid
+        c.epoch = pinfo.epoch
+        c.producer_name = opts.producer_name
     end
 
     return c
@@ -227,9 +247,10 @@ function Client:produce(topic, key, value)
         -- delivery. On success we commit the bump.
         seq_used = self.next_seq[topic] or 0
         frame = proto.encode_produce_idempotent(
-            correl, self.pid, seq_used, topic, key, value)
+            correl, self.pid, seq_used, topic, key, value,
+            self.epoch or 0, self.compression)
     else
-        frame = proto.encode_produce(correl, topic, key, value)
+        frame = proto.encode_produce(correl, topic, key, value, self.compression)
     end
 
     local ok, err = self:_write(frame)
@@ -259,7 +280,7 @@ function Client:produce_at_seq(topic, key, value, seq)
 
     local correl = uuid.bytes()
     local frame = proto.encode_produce_idempotent(
-        correl, self.pid, seq, topic, key, value)
+        correl, self.pid, seq, topic, key, value, self.epoch or 0, self.compression)
     local ok, err = self:_write(frame)
     if not ok then return nil, err end
 
@@ -465,6 +486,49 @@ function Client:leave_group(group_id, member_id)
     self.group_id  = nil
     self.member_id = nil
     return true
+end
+
+-- ---- Transactions ---------------------------------------------------------
+-- These require a client opened with a producer_name (durable producer); the
+-- broker fences on its pid+epoch. A typical flow:
+--   c:begin_transaction()
+--   c:produce("out", k, v)                       -- transactional produce
+--   c:send_offsets_to_transaction("g", { {topic="in", partition=1, offset=42} })
+--   c:commit_transaction()                       -- or c:abort_transaction()
+
+local function _txn_expect_ok(c, frame)
+    local ok, err = c:_write(frame)
+    if not ok then return nil, err end
+    local op, _, payload, rerr = c:_read_until(select(2, proto.parse_frame(frame:sub(5))))
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_OK then
+        return nil, string.format("expected OK, got 0x%02x", op)
+    end
+    return true
+end
+
+function Client:begin_transaction()
+    assert(self.producer_name, "transactions require a producer_name client")
+    return _txn_expect_ok(self, proto.encode_begin_txn(uuid.bytes()))
+end
+
+function Client:commit_transaction()
+    return _txn_expect_ok(self, proto.encode_end_txn(uuid.bytes(), true))
+end
+
+function Client:abort_transaction()
+    return _txn_expect_ok(self, proto.encode_end_txn(uuid.bytes(), false))
+end
+
+-- offsets is a list of { topic=, partition=, offset= }.
+function Client:send_offsets_to_transaction(group, offsets)
+    assert(type(group) == "string", "group must be a string")
+    assert(type(offsets) == "table", "offsets must be a list")
+    return _txn_expect_ok(self,
+        proto.encode_txn_offset_commit(uuid.bytes(), group, offsets))
 end
 
 function Client:close()

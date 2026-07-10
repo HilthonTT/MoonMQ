@@ -92,7 +92,29 @@ if is_main(arg, ...) then
 
     local s = cfg.Server or {}
     local gc = s.GroupCommit or {}
+
+    -- Replication config (single-leader, static). Peers are the followers a
+    -- leader ships to; map JSON {Id, Address} to the {id, address} the server
+    -- expects. Absent/Enabled=false leaves replication off.
+    local rep = s.Replication or {}
+    local peers = {}
+    for _, p in ipairs(rep.Peers or {}) do
+        peers[#peers + 1] = { id = p.Id, address = p.Address }
+    end
+    local replication = {
+        enabled        = rep.Enabled or false,
+        replica_id     = rep.ReplicaId or 1,
+        role           = rep.Role or "leader",
+        replicate_host = rep.ReplicateHost or "127.0.0.1",
+        replicate_port = rep.ReplicatePort,
+        peers          = peers,
+        lag_max        = rep.LagMax,
+        ack_timeout    = rep.AckTimeout,
+    }
+
     local srv = assert(Server.new({
+        acks                   = s.Acks,   -- "none" | "leader" | "all" (default leader)
+        replication            = replication,
         data_dir               = s.DataDir or "./data_server",
         -- Storage engine for topics that don't pin one themselves: "segmented"
         -- (default) or "commitlog". Per-topic config sidecars still win.
