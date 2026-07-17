@@ -112,9 +112,46 @@ if is_main(arg, ...) then
         ack_timeout    = rep.AckTimeout,
     }
 
+    -- Cluster config (static membership + partition ownership; see
+    -- docs/cluster.md). Absent → single-broker, zero overhead.
+    local cluster = nil
+    local cl = s.Cluster
+    if cl and cl.Enabled ~= false and cl.BrokerId then
+        local cluster_peers = {}
+        for _, p in ipairs(cl.Peers or {}) do
+            cluster_peers[#cluster_peers + 1] =
+                { id = p.Id, address = p.Address, token = p.Token }
+        end
+        cluster = {
+            broker_id    = cl.BrokerId,
+            host         = cl.Host or "127.0.0.1",
+            port         = cl.Port,
+            peers        = cluster_peers,
+            token        = cl.Token,
+            peer_timeout = cl.PeerTimeout,
+            batch_bytes  = cl.BatchBytes,
+        }
+    end
+
+    -- Autobalancer loop (needs Cluster; run on ONE broker per cluster).
+    local autobalance = nil
+    local ab = s.Autobalance
+    if ab and ab.Enabled ~= false and cluster then
+        autobalance = {
+            interval_s             = ab.IntervalSeconds,
+            dry_run                = ab.DryRun,
+            window                 = ab.Window,
+            min_valid              = ab.MinValid,
+            percentile             = ab.Percentile,
+            max_actions_per_detect = ab.MaxActionsPerDetect,
+        }
+    end
+
     local srv = assert(Server.new({
         acks                   = s.Acks,   -- "none" | "leader" | "all" (default leader)
         replication            = replication,
+        cluster                = cluster,
+        autobalance            = autobalance,
         data_dir               = s.DataDir or "./data_server",
         -- Storage engine for topics that don't pin one themselves: "segmented"
         -- (default) or "commitlog". Per-topic config sidecars still win.

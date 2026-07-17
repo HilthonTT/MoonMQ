@@ -22,7 +22,7 @@ local function detect_os()
 end
 
 local function detect_arch()
-    local ok, pipe = pcall(io.popen, "uname -s 2>/dev/null")
+    local ok, pipe = pcall(io.popen, "uname -m 2>/dev/null")
     if ok and pipe then
 		local out = pipe:read("l")
 		pipe:close()

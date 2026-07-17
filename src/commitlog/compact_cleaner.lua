@@ -35,7 +35,15 @@ function CompactCleaner.new()
     }, CompactCleaner)
 end
 
--- clean returns (cleaned_segments, nil) or (nil, err).
+-- clean returns (segments', err?). The returned list is ALWAYS the valid,
+-- open segment set the caller should adopt — even alongside an error:
+--   * a failure while building the ".cleaned" twins leaves every original
+--     untouched, so the input list comes back with the error;
+--   * a failure while swapping returns the already-swapped prefix plus the
+--     untouched original suffix, so at most ONE segment (the mid-swap
+--     casualty) is degraded instead of the previous behaviour where the
+--     caller kept a list of closed, renamed-over segment objects and every
+--     subsequent read raised "attempt to use a closed file".
 function CompactCleaner:clean(segments)
     if #segments == 0 then
         return segments, nil
@@ -48,9 +56,16 @@ function CompactCleaner:clean(segments)
         end)
     end
 
-    -- Pass 2: rewrite each segment, keeping only latest-per-key records.
-    local cleaned = {}
-    for _, seg in ipairs(segments) do
+    -- Pass 2a: build EVERY ".cleaned" twin before touching any original, so a
+    -- write failure here aborts the whole compaction with the live segment
+    -- set fully intact.
+    local twins = {}
+    local function abort_twins(err)
+        for _, twin in ipairs(twins) do twin:delete() end
+        return segments, err
+    end
+
+    for i, seg in ipairs(segments) do
         -- Start the ".cleaned" twin from empty. Segment.new opens "a+b" and its
         -- build_index adopts whatever is already in the file, so a leftover twin
         -- from a compaction that failed mid-run (without a process restart, so
@@ -61,7 +76,8 @@ function CompactCleaner:clean(segments)
         os.remove(segment_m.index_path(seg.dir, seg.base_offset, ".cleaned"))
 
         local cs, err = Segment.new(seg.dir, seg.base_offset, seg.max_bytes, ".cleaned")
-        if not cs then return nil, err end
+        if not cs then return abort_twins(err) end
+        twins[i] = cs
 
         local write_err
         seg:each(function(offset, msg)
@@ -77,22 +93,29 @@ function CompactCleaner:clean(segments)
                 if not ok then write_err = werr end
             end
         end)
-        if write_err then
-            cs:delete()
-            return nil, write_err
-        end
+        if write_err then return abort_twins(write_err) end
 
-        -- Flush the rewritten log before the rename so a crash can't leave a
+        -- Flush the rewritten log before any rename so a crash can't leave a
         -- ".cleaned" with buffered-but-unwritten records.
         cs:sync()
-
-        local rerr = cs:replace(seg)
-        if rerr then return nil, rerr end
-
-        cleaned[#cleaned + 1] = cs
     end
 
-    return cleaned, nil
+    -- Pass 2b: swap originals for twins, updating the result list as each
+    -- swap lands. A replace failure keeps the already-swapped prefix and the
+    -- still-open original suffix; the unapplied twins are deleted (the one
+    -- mid-replace is left for open()'s ".cleaned" orphan recovery).
+    local out = {}
+    for i = 1, #segments do out[i] = segments[i] end
+    for i, seg in ipairs(segments) do
+        local rerr = twins[i]:replace(seg)
+        if rerr then
+            for j = i + 1, #twins do twins[j]:delete() end
+            return out, rerr
+        end
+        out[i] = twins[i]
+    end
+
+    return out, nil
 end
 
 return CompactCleaner

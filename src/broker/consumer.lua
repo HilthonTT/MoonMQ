@@ -140,8 +140,10 @@ function Consumer:poll()
         for partition_id, offset in pairs(partition_offsets) do
             local partition = topic.partitions[partition_id]
             -- Skip partitions this member doesn't own (group assignment), that
+            -- the CLUSTER moved to another broker (stale local copy), that
             -- vanished, or that we've consumed up to the tail.
             if self:owns(topic_name, partition_id)
+                and self.broker:serves_partition(topic_name, partition_id)
                 and partition and offset < partition.offset then
                 local msg, next_offset, read_err = partition:read_message(offset)
                 if msg and msg:is_control() then
@@ -204,9 +206,21 @@ function Consumer:poll()
                         msg.timestamp
                     )
                 else
-                    -- Skip past a torn / corrupted tail; otherwise surface.
                     if is_eof_error(read_err) then
-                        self.offsets[topic_name][partition_id] = partition.offset
+                        -- Two distinct EOF-flavoured situations:
+                        --  * offset < oldest retained: retention aged our
+                        --    cursor out. Resume at the OLDEST retained offset
+                        --    — skipping to the tail here would silently drop
+                        --    every record retention actually kept.
+                        --  * otherwise: torn/corrupted tail; skip to the tail
+                        --    as before.
+                        local oldest = partition.oldest_offset
+                            and partition:oldest_offset() or 0
+                        if offset < oldest then
+                            self.offsets[topic_name][partition_id] = oldest
+                        else
+                            self.offsets[topic_name][partition_id] = partition.offset
+                        end
                     else
                         return nil, string.format("failed to read message: %s", read_err or "unknown error")
                     end

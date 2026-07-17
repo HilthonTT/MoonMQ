@@ -252,15 +252,20 @@ function CommitLog:split()
     for i = 1, #self.segments do segments[i] = self.segments[i] end
     segments[#segments + 1] = segment
 
+    -- The cleaner may return a valid segment list ALONGSIDE an error (partial
+    -- compaction — see CompactCleaner:clean). Adopt whatever list it says is
+    -- live before propagating the error, so self.segments never points at
+    -- closed/renamed-over segment objects.
     local cleaned, cerr = self.cleaner:clean(segments)
+    if cleaned then
+        self.segments = cleaned
+        -- The newest segment is always the last of the returned list. We can't
+        -- reuse the local `segment` handle directly: the CompactCleaner replaces
+        -- each segment (including this fresh one) with a ".cleaned" twin and
+        -- closes the original, so the live active is whatever sits at the tail.
+        self.active_segment = cleaned[#cleaned]
+    end
     if cerr then return cerr end
-
-    self.segments = cleaned
-    -- The newest segment is always the last of the returned list. We can't
-    -- reuse the local `segment` handle directly: the CompactCleaner replaces
-    -- each segment (including this fresh one) with a ".cleaned" twin and
-    -- closes the original, so the live active is whatever sits at the tail.
-    self.active_segment = cleaned[#cleaned]
     return nil
 end
 

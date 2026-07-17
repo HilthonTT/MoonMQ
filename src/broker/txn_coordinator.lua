@@ -240,42 +240,56 @@ function Coordinator:add_offsets(txn_id, pid, epoch, group, offsets)
     return true
 end
 
--- Write a COMMIT/ABORT control marker to one participant partition. Best-effort
--- per participant: a missing topic/partition (shouldn't happen — topic deletion
--- isn't supported) is logged and skipped rather than wedging the whole txn.
+-- Write a COMMIT/ABORT control marker to one participant partition. A missing
+-- topic/partition (shouldn't happen — topic deletion isn't supported) is
+-- logged and treated as success; an actual WRITE failure is returned so the
+-- transaction is not marked complete with markers missing. Returns (true, nil)
+-- or (nil, err).
 function Coordinator:_write_marker(participant, marker, pid, epoch)
     local topic = self.broker.topic_manager.topics[participant.topic]
     if not topic then
         log:warn("participant topic %s vanished; skipping marker", participant.topic)
-        return
+        return true
     end
     local part = topic.partitions[participant.partition]
     if not part then
         log:warn("participant %s/partition-%d vanished; skipping marker",
             participant.topic, participant.partition)
-        return
+        return true
     end
     local value = string.pack(CONTROL_VALUE_FMT, marker, pid, epoch)
     -- Control record: attrs control bit set, empty key.
     local rec = msg_m.Message.new("", value, os.time() * 1000, msg_m.ATTR_CONTROL)
     local _, werr = part:write_message(rec)
     if werr then
-        log:error("marker write to %s/partition-%d failed: %s",
+        return nil, string.format("marker write to %s/partition-%d failed: %s",
             participant.topic, participant.partition, tostring(werr))
-        return
     end
     if part.request_sync then part:request_sync() end
+    return true
 end
 
 -- _finish drives the second half of a commit/abort: write markers to every
 -- participant, apply (commit) or drop (abort) buffered offsets, then persist the
 -- terminal state. Idempotent so crash recovery can re-run it.
+--
+-- Any marker/offset failure leaves the txn in its PREPARE_* state and returns
+-- the error: the decision is durable, the completion is not — recovery (or a
+-- retried END_TXN, which end_txn allows for a matching PREPARE state) re-runs
+-- this until everything lands. Advancing to COMPLETE_* past a failed offset
+-- commit would silently break the txn's atomicity contract: output records
+-- committed, input offsets not, and the client told "success".
 function Coordinator:_finish(txn_id, commit)
     local t = self.txns[txn_id]
     local marker = commit and MARKER_COMMIT or MARKER_ABORT
 
     for _, p in pairs(t.participants) do
-        self:_write_marker(p, marker, t.pid, t.epoch)
+        local ok, err = self:_write_marker(p, marker, t.pid, t.epoch)
+        if not ok then
+            log:error("txn %s: %s (left in %s for retry/recovery)",
+                txn_id, err, S_NAME[t.state])
+            return nil, err
+        end
     end
 
     if commit then
@@ -283,7 +297,10 @@ function Coordinator:_finish(txn_id, commit)
             local ok, cerr = self.broker.offsets:commit(
                 o.group, o.topic, o.partition, o.offset)
             if not ok then
-                log:error("txn %s: offset commit failed: %s", txn_id, tostring(cerr))
+                local err = string.format("offset commit failed: %s", tostring(cerr))
+                log:error("txn %s: %s (left in %s for retry/recovery)",
+                    txn_id, err, S_NAME[t.state])
+                return nil, err
             end
         end
     end
@@ -296,7 +313,28 @@ end
 -- (nil, err, code).
 function Coordinator:end_txn(txn_id, pid, epoch, commit)
     local t = self.txns[txn_id]
-    if not t or t.state ~= S.ONGOING then
+    if not t then
+        return nil, "no transaction in progress", "state"
+    end
+
+    -- Retry path: a previous END_TXN durably recorded this same decision but
+    -- failed while completing (marker/offset write error). Re-run the finish;
+    -- it's idempotent. A retry with the OPPOSITE decision is refused — the
+    -- prepared decision is already durable and recovery will enforce it.
+    if t.state == S.PREPARE_COMMIT or t.state == S.PREPARE_ABORT then
+        local okp0, perr0 = self:_check_producer(txn_id, pid, epoch)
+        if not okp0 then return nil, perr0, "fenced" end
+        local prepared_commit = (t.state == S.PREPARE_COMMIT)
+        if prepared_commit ~= commit then
+            return nil, string.format(
+                "transaction already prepared to %s; cannot %s",
+                prepared_commit and "commit" or "abort",
+                commit and "commit" or "abort"), "state"
+        end
+        return self:_finish(txn_id, commit)
+    end
+
+    if t.state ~= S.ONGOING then
         return nil, "no transaction in progress", "state"
     end
     local okp, perr = self:_check_producer(txn_id, pid, epoch)
@@ -343,10 +381,18 @@ function Coordinator:_recover()
         if t.state == S.ONGOING or t.state == S.PREPARE_ABORT then
             t.state = S.PREPARE_ABORT
             self:_persist(txn_id)
-            self:_finish(txn_id, false)
+            local ok, err = self:_finish(txn_id, false)
+            if not ok then
+                -- Still PREPARE_ABORT; the next recovery (or a client retry)
+                -- re-runs the finish. Loud, not fatal — the broker can serve.
+                log:error("recovery: txn %s abort incomplete: %s", txn_id, tostring(err))
+            end
             resolved = resolved + 1
         elseif t.state == S.PREPARE_COMMIT then
-            self:_finish(txn_id, true)
+            local ok, err = self:_finish(txn_id, true)
+            if not ok then
+                log:error("recovery: txn %s commit incomplete: %s", txn_id, tostring(err))
+            end
             resolved = resolved + 1
         end
     end

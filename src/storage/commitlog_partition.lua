@@ -118,6 +118,12 @@ function CommitLogPartition:read_message(offset)
     return msg, next_offset, nil
 end
 
+-- oldest_offset: first offset still readable after retention/compaction.
+-- Consumers whose committed offset aged out resume here (see Consumer:poll).
+function CommitLogPartition:oldest_offset()
+    return self.commitlog:oldest_offset()
+end
+
 -- offset_for_timestamp returns the offset of the earliest retained message
 -- whose timestamp is >= ts, or nil if none qualifies. The CommitLog has no
 -- time index (unlike SegmentedPartition), so this is a linear scan from the

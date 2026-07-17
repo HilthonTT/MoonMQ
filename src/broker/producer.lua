@@ -148,6 +148,10 @@ Producer.__index = Producer
 --               high-watermark to wait on. When present, EVERY produced record
 --               is also shipped to followers (async for acks<all; awaited for
 --               acks=all).
+--   router      a cluster Router (src/cluster/router.lua). When present,
+--               produce consults partition ownership: records for a partition
+--               owned by a peer broker are forwarded to that peer instead of
+--               written locally. nil = single-broker behaviour.
 function Producer.new(broker, acks, opts)
     assert(getmetatable(broker) == brk.Broker, "broker must be a Broker instance")
     assert(type(acks) == "number", "acks must be a number")
@@ -160,6 +164,7 @@ function Producer.new(broker, acks, opts)
         broker = broker,
         acks = acks,
         replicator = opts.replicator,
+        router = opts.router,
         partitioner = default_partitioner,
         -- Sticky-partition state for empty-key sends. Keyed by topic name
         -- since num_partitions varies per topic. See default_partitioner.
@@ -196,18 +201,39 @@ function Producer:produce(topic_name, msg)
         return -1, -1, string.format("partition %d does not exist", partition_id)
     end
 
+    -- Cluster routing: a partition owned by a peer broker gets its record
+    -- forwarded there rather than appended to the local (stale) log. Ordering
+    -- per partition is preserved — every producer routes through the same
+    -- ownership table, so all writes for the partition land on the owner.
+    if self.router then
+        local peer, rerr = self.router:route(topic_name, partition_id)
+        if rerr then return -1, -1, rerr end
+        if peer then
+            local roffset, ferr = self.router:forward(peer, topic_name, partition_id, msg)
+            if not roffset then return -1, -1, ferr end
+            return partition_id, roffset, nil
+        end
+    end
+
     local offset, werr = partition:write_message(msg)
     if werr then
         return -1, -1, string.format("failed to write message: %s", werr)
     end
 
-    -- Ship to followers whenever replication is configured. `partition.offset`
-    -- is the leader's log-end offset after this write — what a follower must
+    -- Capture the log-end offset covering THIS record now: request_sync can
+    -- park this coroutine on the group committer, and other producers may
+    -- append meanwhile. Waiting on a later re-read of partition.offset would
+    -- block this produce on records it never wrote (and fail it on someone
+    -- else's replication lag).
+    local record_leo = partition.offset
+
+    -- Ship to followers whenever replication is configured. `record_leo` is
+    -- the leader's log-end offset after this write — what a follower must
     -- reach to hold this record. Async for acks<all; acks=all awaits it below.
     if self.replicator and self.replicator:enabled() then
         local bytes, berr = message.serialize_message(msg)
         if bytes then
-            self.replicator:replicate(topic_name, partition_id, partition.offset, bytes)
+            self.replicator:replicate(topic_name, partition_id, record_leo, bytes)
         else
             log:error("replication skipped: serialize failed: %s", tostring(berr))
         end
@@ -231,7 +257,7 @@ function Producer:produce(topic_name, msg)
             return -1, -1, string.format("failed to sync partition: %s", serr)
         end
         local rok, rerr = self.replicator:wait_for(
-            topic_name, partition_id, partition.offset)
+            topic_name, partition_id, record_leo)
         if not rok then
             return -1, -1, rerr
         end

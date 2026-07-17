@@ -87,7 +87,15 @@ end
 function M.bytes(n)
     assert(type(n) == "number" and n > 0, "n must be a positive integer")
  
-    local picked = os_utils.IS_WINDOWS and urandom_windows or urandom_unix
+    -- Explicit branch, not `and/or`: on Windows without FFI, urandom_windows
+    -- is nil and the `or` would fall through to urandom_unix — a guaranteed
+    -- /dev/urandom miss that spams a "CSPRNG failed" warning on every call.
+    local picked
+    if os_utils.IS_WINDOWS then
+        picked = urandom_windows
+    else
+        picked = urandom_unix
+    end
     if picked then
         local b, err = picked(n)
         if b then return b end

@@ -55,7 +55,12 @@ function Goal.hard_goals_accept(action, cluster, goals_by_priority, proposer)
         end
     end
 
-    cluster:apply_action(action:undo())
+    -- The undo must apply cleanly — a failed revert would leave the probe's
+    -- mutation in the snapshot and every later goal would balance against a
+    -- placement that doesn't exist. That's a programming error, not a
+    -- recoverable condition, so fail loudly.
+    local undone, uerr = cluster:apply_action(action:undo())
+    assert(undone, "hard-goal probe could not be reverted: " .. tostring(uerr))
     return accepted
 end
 

@@ -65,6 +65,19 @@ local function now_iso()
     return string.format("%s.%03dZ", os.date("!%Y-%m-%dT%H:%M:%S", secs), ms)
 end
 
+-- Replace control characters in the final message with visible escapes.
+-- Several call sites format attacker-influenced bytes into log lines (client
+-- name/version, usernames, HTTP header values); raw \r\n would let a client
+-- forge whole log records, and raw ESC can corrupt an operator's terminal or
+-- spoof entries in a log pipeline. Neutralizing centrally means no call site
+-- has to remember to sanitize.
+local CTRL_ESCAPES = { ["\r"] = "\\r", ["\n"] = "\\n", ["\t"] = "\\t" }
+local function sanitize(msg)
+    return (msg:gsub("%c", function(c)
+        return CTRL_ESCAPES[c] or string.format("\\x%02x", c:byte())
+    end))
+end
+
 local function emit(component, level_num, fmt, ...)
     assert(type(component) == "string", "component must be a string")
     assert(type(level_num) == "number", "level_num must be a number")
@@ -80,7 +93,7 @@ local function emit(component, level_num, fmt, ...)
     end
     local line = string.format(
         "%s [%s] [%s] %s\n",
-        now_iso(), LEVEL_LABEL[level_num], component, msg)
+        now_iso(), LEVEL_LABEL[level_num], component, sanitize(msg))
     for i = 1, #state.sinks do
         -- pcall: never let a broken sink (closed file, EBADF, full disk)
         -- crash an in-flight request. We'd rather lose a log line than

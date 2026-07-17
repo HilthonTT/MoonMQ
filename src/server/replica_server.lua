@@ -17,6 +17,7 @@
 local socket  = require("socket")
 local json    = require("dkjson")
 local msg_m   = require("src.record.message")
+local httpk   = require("src.server.http_kit")
 local log     = require("src.log.logger").get("replica_server")
 
 local M = {}
@@ -24,7 +25,6 @@ M.__index = M
 
 local READ_DEADLINE  = 10
 local WRITE_DEADLINE = 5
-local MAX_HEADERS    = 8192
 local MAX_BODY       = 8 * 1024 * 1024   -- generous vs the 1 MiB frame cap
 
 function M.new(opts)
@@ -36,61 +36,10 @@ function M.new(opts)
     }, M)
 end
 
--- Read up to and including the header terminator, returning
--- (header_str, leftover_body_bytes) or (nil, err). Leftover is any body bytes
--- that arrived in the same recv as the end of the headers.
-local function read_headers(reactor, sock, deadline)
-    sock:settimeout(0)
-    local buf = ""
-    while #buf < MAX_HEADERS do
-        if socket.gettime() > deadline then return nil, "read deadline" end
-        local chunk, err, partial = sock:receive(MAX_HEADERS - #buf)
-        local progressed = false
-        if chunk then buf = buf .. chunk; progressed = #chunk > 0
-        elseif partial and #partial > 0 then buf = buf .. partial; progressed = true end
-
-        local idx = buf:find("\r\n\r\n", 1, true)
-        if idx then return buf:sub(1, idx + 3), buf:sub(idx + 4) end
-
-        if err == "timeout" then reactor:wait_readable(sock)
-        elseif err == "closed" then return nil, "peer closed"
-        elseif err then return nil, err
-        elseif not progressed then reactor:sleep(0.02) end
-    end
-    return nil, "headers too large"
-end
-
-local function read_body(reactor, sock, have, want, deadline)
-    if want <= 0 then return have end
-    if want > MAX_BODY then return nil, "body too large" end
-    sock:settimeout(0)
-    local parts = { have }
-    local got = #have
-    while got < want do
-        if socket.gettime() > deadline then return nil, "read deadline" end
-        local chunk, err, partial = sock:receive(want - got)
-        if chunk then parts[#parts + 1] = chunk; got = got + #chunk
-        elseif partial and #partial > 0 then parts[#parts + 1] = partial; got = got + #partial end
-        if got >= want then break end
-        if err == "timeout" then reactor:wait_readable(sock)
-        elseif err == "closed" then return nil, "peer closed"
-        elseif err then return nil, err end
-    end
-    return table.concat(parts)
-end
-
-local STATUS_TEXT = {
-    [200] = "OK", [400] = "Bad Request", [404] = "Not Found",
-    [405] = "Method Not Allowed", [500] = "Internal Server Error",
-}
-
+-- HTTP plumbing (read_headers / read_body / respond) lives in
+-- src/server/http_kit.lua, shared with the cluster endpoint.
 local function respond(reactor, sock, status, ctype, body)
-    local text = STATUS_TEXT[status] or "Status"
-    local response = string.format(
-        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n" ..
-        "Connection: close\r\n\r\n%s",
-        status, text, ctype, #body, body)
-    reactor:send_all(sock, response, socket.gettime() + WRITE_DEADLINE)
+    httpk.respond(reactor, sock, status, ctype, body, WRITE_DEADLINE)
 end
 
 -- Apply one serialized record (len(8) | body) to (topic, partition). Returns
@@ -116,7 +65,7 @@ end
 
 function M:_handle(sock)
     local deadline = socket.gettime() + READ_DEADLINE
-    local headers, leftover = read_headers(self.reactor, sock, deadline)
+    local headers, leftover = httpk.read_headers(self.reactor, sock, deadline)
     if not headers then pcall(function() sock:close() end); return end
 
     local method, path = headers:match("^(%S+)%s+(%S+)")
@@ -138,7 +87,8 @@ function M:_handle(sock)
     if not topic or not partition then
         status, ctype, body = 400, "text/plain", "missing X-Topic/X-Partition\n"
     else
-        local payload, berr = read_body(self.reactor, sock, leftover, clen, deadline)
+        local payload, berr = httpk.read_body(
+            self.reactor, sock, leftover, clen, deadline, MAX_BODY)
         if not payload then
             status, ctype, body = 400, "text/plain", "body: " .. tostring(berr) .. "\n"
         else

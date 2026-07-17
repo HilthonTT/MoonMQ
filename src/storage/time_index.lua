@@ -35,6 +35,24 @@ function M.maybe_append(segment, ts, file_pos, interval_bytes)
         return
     end
 
+    -- Monotonicity guard: floor_pos binary-searches this index, which is only
+    -- correct if entry timestamps never decrease. Timestamps are
+    -- client-supplied and can arrive out of order — skip (don't index) any
+    -- record older than the newest indexed timestamp, like Kafka does. The
+    -- record itself is still findable: lookups linear-scan from the
+    -- preceding entry. Lazily seed the high-water mark from the index tail
+    -- so a reopened segment keeps the invariant across restarts.
+    if segment.last_indexed_ts == nil then
+        local n = M.count(segment.index_file)
+        if n > 0 then
+            local tail_ts = M.read_entry(segment.index_file, n - 1)
+            segment.last_indexed_ts = tail_ts
+        end
+    end
+    if segment.last_indexed_ts and ts < segment.last_indexed_ts then
+        return
+    end
+
     local entry = string.pack(">I8I4", ts, file_pos)
     -- Reposition to EOF before writing: offset_for_timestamp reads this "a+b"
     -- index handle, and a write directly after a read is stdio UB that Windows
@@ -53,6 +71,7 @@ function M.maybe_append(segment, ts, file_pos, interval_bytes)
     -- the roll/close fsync; we don't pay that cost per entry.
     segment.index_file:flush()
     segment.last_indexed_at = file_pos
+    segment.last_indexed_ts = ts
 end
 
 -- Number of complete entries in the index. Index files are short arrays of

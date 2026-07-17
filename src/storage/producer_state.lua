@@ -38,7 +38,17 @@ local K_IDENTITY = "\1"   -- "\1" .. producer_name
 local K_MEMO     = "\2"   -- "\2" .. u64 pid .. topic
 
 local IDENTITY_VALUE_FMT = ">I8I2"        -- pid, epoch
-local MEMO_VALUE_FMT     = ">I4I8I4"      -- last_seq, last_offset, last_partition
+-- Memo carries the epoch that wrote it: dedup state is only valid within the
+-- SAME producer session. A reconnect bumps the epoch and the client restarts
+-- its sequences at 0 (Kafka KIP-360 semantics); without the epoch scope, the
+-- new session's seq 0 would collide with the old session's memo and be
+-- swallowed as a "retry" — silently losing the record.
+local MEMO_VALUE_FMT     = ">I4I8I4I2"    -- last_seq, last_offset, last_partition, epoch
+local MEMO_VALUE_FMT_V1  = ">I4I8I4"      -- pre-epoch memos (read-compat only)
+
+-- The identity epoch packs as u16; the 65,536th session of one name would
+-- overflow string.pack mid-write. Fail the INIT instead (fresh name = fresh pid).
+local MAX_EPOCH = 0xFFFF
 
 local ProducerStateManager = {}
 ProducerStateManager.__index = ProducerStateManager
@@ -127,6 +137,11 @@ function ProducerStateManager:get_or_create_producer(name)
     if existing then
         pid   = existing.pid
         epoch = existing.epoch + 1
+        if epoch > MAX_EPOCH then
+            return nil, nil, string.format(
+                "producer %q exhausted its epoch space (%d sessions); use a new name",
+                name, MAX_EPOCH + 1)
+        end
     else
         pid   = self.next_pid
         self.next_pid = self.next_pid + 1
@@ -171,16 +186,19 @@ function ProducerStateManager:lookup_memo(pid, topic)
 end
 
 -- record_produce persists (and memoizes) the sequence/offset for a freshly
--- appended idempotent record. Returns (true, nil) or (nil, err).
-function ProducerStateManager:record_produce(pid, topic, seq, offset, partition)
+-- appended idempotent record, tagged with the epoch of the session that wrote
+-- it. Returns (true, nil) or (nil, err).
+function ProducerStateManager:record_produce(pid, topic, seq, offset, partition, epoch)
+    epoch = epoch or 0
     local key = K_MEMO .. string.pack(">I8", pid) .. topic
-    local val = string.pack(MEMO_VALUE_FMT, seq, offset, partition)
+    local val = string.pack(MEMO_VALUE_FMT, seq, offset, partition, epoch)
     local ok, err = self:_write(key, val)
     if not ok then return nil, err end
 
     local t = self.memo[pid]
     if not t then t = {}; self.memo[pid] = t end
-    t[topic] = { last_seq = seq, last_offset = offset, last_partition = partition }
+    t[topic] = { last_seq = seq, last_offset = offset,
+                 last_partition = partition, epoch = epoch }
     return true, nil
 end
 
@@ -210,11 +228,20 @@ function ProducerStateManager:recover()
                 if #key >= 1 + 8 then
                     local pid = string.unpack(">I8", key, 2)
                     local topic = key:sub(1 + 8 + 1)
-                    local ok, s, off, prt = pcall(string.unpack, MEMO_VALUE_FMT, m.value)
+                    local ok, s, off, prt, ep =
+                        pcall(string.unpack, MEMO_VALUE_FMT, m.value)
+                    if not ok then
+                        -- Pre-epoch memo (v1 format). Epoch 0: any session
+                        -- after a reconnect has epoch >= 1 and correctly
+                        -- treats this memo as belonging to an older session.
+                        ok, s, off, prt = pcall(string.unpack, MEMO_VALUE_FMT_V1, m.value)
+                        ep = 0
+                    end
                     if ok then
                         local t = self.memo[pid]
                         if not t then t = {}; self.memo[pid] = t end
-                        t[topic] = { last_seq = s, last_offset = off, last_partition = prt }
+                        t[topic] = { last_seq = s, last_offset = off,
+                                     last_partition = prt, epoch = ep }
                         if pid > max_pid then max_pid = pid end
                         restored = restored + 1
                     end

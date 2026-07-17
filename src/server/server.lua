@@ -36,6 +36,12 @@ local Replicator       = require("src.server.replicator")
 local ReplicaServer    = require("src.server.replica_server")
 local replica_m        = require("src.server.replica")
 local version_m        = require("src.core.version")
+local Assignments      = require("src.cluster.assignments")
+local Peer             = require("src.cluster.peer")
+local Router           = require("src.cluster.router")
+local Reassigner       = require("src.cluster.reassigner")
+local ClusterServer    = require("src.cluster.cluster_server")
+local BalanceLoop      = require("src.cluster.balance_loop")
 local log              = require("src.log.logger").get("server")
 
 -- acks mode names accepted from config (Server.Acks).
@@ -159,11 +165,56 @@ function Server.new(opts)
     -- on it. nil when replication is off or this node has no followers.
     local replicator = build_replicator(reactor, opts.replication)
 
+    -- Cluster membership + partition ownership (static config, like
+    -- replication). Builds the Assignments table (durable, in data_dir), one
+    -- Peer client per configured peer, the produce Router, and the Reassigner
+    -- that executes autobalancer plans. All nil when opts.cluster is unset —
+    -- the zero-config single-broker deployment.
+    local cluster = nil
+    local cc = opts.cluster
+    if cc and cc.enabled ~= false then
+        assert(type(cc.broker_id) == "string" and #cc.broker_id > 0,
+            "cluster.broker_id required")
+        local assignments, aerr = Assignments.new(opts.data_dir, cc.broker_id)
+        if not assignments then return nil, aerr end
+
+        local peers = {}
+        for _, p in ipairs(cc.peers or {}) do
+            peers[p.id] = Peer.new(p.id, p.address,
+                { token = p.token or cc.token, timeout = cc.peer_timeout })
+        end
+
+        -- Consumers consult ownership through the broker (see
+        -- Broker:serves_partition) so a moved partition's stale local copy
+        -- stops being served the moment the cutover flips.
+        broker.cluster_assignments = assignments
+
+        cluster = {
+            broker_id   = cc.broker_id,
+            assignments = assignments,
+            peers       = peers,
+            router      = Router.new({
+                assignments = assignments, peers = peers, self_id = cc.broker_id,
+            }),
+            reassigner  = Reassigner.new({
+                broker = broker, assignments = assignments, peers = peers,
+                self_id = cc.broker_id, reactor = reactor,
+                batch_bytes = cc.batch_bytes,
+            }),
+            host  = cc.host or "127.0.0.1",
+            port  = cc.port,          -- nil = endpoint off (client-only node)
+            token = cc.token,
+        }
+    end
+
     -- Ack mode: config may pass a name ("none"/"leader"/"all") or a number.
     local acks = opts.acks
     if type(acks) == "string" then acks = ACKS_BY_NAME[acks:lower()] end
     if acks == nil then acks = prd_m.AckMode.AckLeader end
-    local producer = prd_m.Producer.new(broker, acks, { replicator = replicator })
+    local producer = prd_m.Producer.new(broker, acks, {
+        replicator = replicator,
+        router     = cluster and cluster.router or nil,
+    })
 
     return setmetatable({
         broker      = broker,
@@ -171,6 +222,8 @@ function Server.new(opts)
         reactor     = reactor,
         replicator  = replicator,
         replication = opts.replication,
+        cluster     = cluster,
+        autobalance = opts.autobalance,   -- see :start; nil = off
         coordinator = GroupCoordinator.new(broker, {
             max_groups = opts.max_groups or DEFAULT_MAX_GROUPS,
         }),
@@ -411,6 +464,13 @@ function Server:start()
 
     self:_install_signal_handlers()
 
+    -- Let AUTH's PBKDF2 verification yield back to the reactor between
+    -- iteration slices, so an authentication in progress no longer stalls
+    -- every other connection (see src/server/auth.lua).
+    if self.authenticator and self.authenticator.set_yield_fn then
+        self.authenticator:set_yield_fn(function() reactor:sleep(0) end)
+    end
+
     -- Start the consumer-group reaper. running gates its loop so it exits
     -- cleanly when the reactor stops (set false after :run() returns).
     self.running = true
@@ -429,6 +489,55 @@ function Server:start()
             server  = self,  -- powers /stats snapshot
         })
         mh:start()
+    end
+
+    -- Cluster endpoint: serve the inter-broker reassignment/routing API so
+    -- peers can migrate partitions here and forward produces. Only when a
+    -- port is configured — a node can be a cluster *client* (own peers,
+    -- forward produces) without serving the endpoint itself.
+    if self.cluster and self.cluster.port then
+        local cs = ClusterServer.new({
+            reactor     = self.reactor,
+            broker      = self.broker,
+            assignments = self.cluster.assignments,
+            broker_id   = self.cluster.broker_id,
+            host        = self.cluster.host,
+            port        = self.cluster.port,
+            token       = self.cluster.token,
+        })
+        cs:start()
+    end
+
+    -- Autobalancer loop: periodically feed the cluster model and execute the
+    -- resulting plan through the Reassigner. Off unless opts.autobalance is
+    -- set AND this node has a cluster config; run it on exactly one broker
+    -- (the controller) — see src/cluster/balance_loop.lua.
+    local ac = self.autobalance
+    if ac and ac.enabled ~= false then
+        if not self.cluster then
+            log:warn("autobalance configured without cluster config; ignoring")
+        else
+            local loop = BalanceLoop.new({
+                broker      = self.broker,
+                assignments = self.cluster.assignments,
+                peers       = self.cluster.peers,
+                self_id     = self.cluster.broker_id,
+                reassigner  = self.cluster.reassigner,
+                interval_s  = ac.interval_s,
+                dry_run     = ac.dry_run,
+                goals       = ac.goals,
+                window      = ac.window,
+                min_valid   = ac.min_valid,
+                percentile  = ac.percentile,
+                max_actions_per_detect = ac.max_actions_per_detect,
+            })
+            self.balance_loop = loop
+            self.reactor:spawn(function()
+                loop:run(self.reactor, function() return self.running end)
+            end)
+            log:info("autobalance: interval=%ss dry_run=%s",
+                tostring(loop.interval_s), tostring(loop.dry_run))
+        end
     end
 
     -- Follower role: serve POST /replicate so a leader can ship us records.

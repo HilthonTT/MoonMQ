@@ -148,6 +148,16 @@ function SegmentedPartition.new(topic, id, dir, opts)
     end
     opts = opts or {}
 
+    -- Timeindex entries pack the in-segment file position as u32, so a
+    -- segment larger than 4 GiB would make maybe_append raise mid-produce —
+    -- AFTER the record is on disk, so the producer's retry would duplicate.
+    -- Reject the misconfiguration up front (the commitlog backend does too).
+    if opts.max_segment_size and opts.max_segment_size > 0xFFFFFFFF then
+        return nil, string.format(
+            "max_segment_size %d exceeds the 4 GiB timeindex limit",
+            opts.max_segment_size)
+    end
+
     local partition_dir = fs_m.join_path(dir, string.format("partition-%d", id))
     local ok, err = fs_m.mkdir(partition_dir)
     if not ok then
@@ -418,18 +428,11 @@ end
 -- Internal: roll the active segment once it's full. Flushes + fsyncs the
 -- segment we're sealing, advances the on-disk checkpoint past it, and
 -- opens the next segment at the new base offset.
-function SegmentedPartition:_roll_if_full(incoming_bytes)
-    local current_size = self.active_segment.bytes_written
-    if current_size + incoming_bytes <= self.max_segment_size then
-        return nil
-    end
-    -- Allow a single record to overshoot if the segment is empty —
-    -- otherwise an oversized message could never be written.
-    if current_size == 0 then
-        return nil
-    end
-
-    local new_base = self.active_segment.base_offset + current_size
+-- _roll_now seals the active segment at its TRACKED size and opens the next
+-- one. Shared by the size-triggered roll and the append-position guard below.
+function SegmentedPartition:_roll_now()
+    local new_base = self.active_segment.base_offset
+                   + self.active_segment.bytes_written
 
     self.active_segment.file:flush()
     local sok, serr = io_sync.sync(self.active_segment.file)
@@ -466,6 +469,54 @@ function SegmentedPartition:_roll_if_full(incoming_bytes)
     return nil
 end
 
+function SegmentedPartition:_roll_if_full(incoming_bytes)
+    local current_size = self.active_segment.bytes_written
+    if current_size + incoming_bytes <= self.max_segment_size then
+        return nil
+    end
+    -- Allow a single record to overshoot if the segment is empty —
+    -- otherwise an oversized message could never be written.
+    if current_size == 0 then
+        return nil
+    end
+    return self:_roll_now()
+end
+
+-- Position the active segment for an append and verify the physical EOF
+-- matches the tracked size. They diverge when a previous write FAILED after
+-- partially flushing (ENOSPC/EIO can land a prefix of the record): the
+-- garbage sits at physical EOF while bytes_written still points before it.
+-- Appending on top would put acked records at physical positions that don't
+-- match their advertised offsets — unreadable immediately, and destroyed by
+-- recovery's torn-tail truncation. Instead, seal this segment at its tracked
+-- size (the garbage past it is invisible to reads and truncated by the next
+-- recovery) and roll to a fresh segment.
+-- Returns (nil) when ready to append, or an error string.
+function SegmentedPartition:_ensure_append_position()
+    local pos, perr = self.active_segment.file:seek("end")
+    if not pos then
+        return string.format("failed to seek segment: %s", tostring(perr))
+    end
+    if pos == self.active_segment.bytes_written then
+        return nil
+    end
+
+    log:error("segment %020d: physical EOF %d != tracked %d "
+        .. "(previous failed write left partial bytes); sealing and rolling",
+        self.active_segment.base_offset, pos, self.active_segment.bytes_written)
+    local rerr = self:_roll_now()
+    if rerr then return rerr end
+
+    local npos, nerr = self.active_segment.file:seek("end")
+    if not npos then
+        return string.format("failed to seek fresh segment: %s", tostring(nerr))
+    end
+    if npos ~= 0 then
+        return string.format("fresh segment not empty (%d bytes)", npos)
+    end
+    return nil
+end
+
 -- write_message serializes msg via msg_m.serialize_message and appends it
 -- to the active segment, rolling if the segment is full.
 -- Returns (global_offset, nil) on success, (nil, err) on failure.
@@ -480,18 +531,18 @@ function SegmentedPartition:write_message(msg)
     local rerr = self:_roll_if_full(#bytes)
     if rerr then return nil, rerr end
 
+    -- Position at EOF and verify it matches the tracked size (also satisfies
+    -- stdio's read→write positioning requirement on this "a+b" handle; see
+    -- _ensure_append_position for the failed-write divergence case).
+    local perr = self:_ensure_append_position()
+    if perr then return nil, perr end
+
     -- file_pos_in_segment = bytes_written BEFORE the append. This is
     -- both the seek-target for read_message and the value we record in
     -- the timeindex entry.
     local file_pos_in_segment = self.active_segment.bytes_written
     local global_offset = self.active_segment.base_offset + file_pos_in_segment
 
-    -- Reposition to EOF before writing: read_message seeks+reads on this same
-    -- "a+b" handle, and C stdio (enforced by Windows UCRT) rejects a write
-    -- directly after a read on an update stream without an intervening
-    -- positioning call. Without this, a consumer reading a non-tail record
-    -- poisons the handle and the next produce fails.
-    self.active_segment.file:seek("end")
     local ok, werr = self.active_segment.file:write(bytes)
     if not ok then
         return nil, string.format("failed to write message: %s", werr)
@@ -526,10 +577,10 @@ function SegmentedPartition:write(data)
     local rerr = self:_roll_if_full(#data)
     if rerr then return false, rerr end
 
-    -- Reposition to EOF before writing (see write_message): reads on this "a+b"
-    -- handle leave it in read state, and a write directly after is stdio UB that
-    -- Windows UCRT rejects.
-    self.active_segment.file:seek("end")
+    -- Position at EOF, verify against the tracked size (see write_message).
+    local perr = self:_ensure_append_position()
+    if perr then return false, perr end
+
     local ok, werr = self.active_segment.file:write(data)
     if not ok then return false, werr end
 
@@ -627,6 +678,17 @@ function SegmentedPartition:_segment_for_offset(offset)
         end
     end
     return nil
+end
+
+-- oldest_offset: the first offset still readable after retention cleaning —
+-- the oldest surviving segment's base. Consumers whose committed offset aged
+-- out resume here instead of skipping to the tail (which would silently drop
+-- every still-retained record).
+function SegmentedPartition:oldest_offset()
+    local first = self.segments[1]
+    if first then return first.base_offset end
+    local active = self.active_segment
+    return active and active.base_offset or 0
 end
 
 -- read_message: same on-disk format as Partition:read_message — the segment

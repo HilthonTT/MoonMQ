@@ -171,7 +171,27 @@ function Segment:write(record)
     -- otherwise poison this handle so the next produce fails. seek("end") is the
     -- required reposition (append mode already targets EOF, so it's a no-op to
     -- the byte position).
-    self.file:seek("end")
+    local pos, serr = self.file:seek("end")
+    if not pos then
+        return false, string.format("log seek failed: %s", tostring(serr))
+    end
+
+    -- Physical EOF must match the tracked position. They diverge when a
+    -- previous write failed after partially flushing (ENOSPC/EIO): garbage
+    -- sits at EOF while `position` still points before it, and appending on
+    -- top would misalign every later record's indexed position (misframed
+    -- reads now, torn-tail truncation of acked records on the next open).
+    -- Truncate the garbage away and continue from the tracked position.
+    if pos ~= self.position then
+        local tok, terr = io_sync.truncate(self.file, self.position)
+        if not tok then
+            return false, string.format(
+                "log EOF %d != tracked %d and truncate failed: %s",
+                pos, self.position, tostring(terr))
+        end
+        self.file:seek("end")
+    end
+
     local ok, werr = self.file:write(record)
     if not ok then
         return false, string.format("log write failed: %s", tostring(werr))

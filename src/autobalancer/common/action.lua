@@ -54,7 +54,11 @@ function Action:set_dest_broker_id(dest_broker_id)
 end
 
 -- Return the inverse action. For MOVE, the same topic moves back (broker roles
--- swapped, no dest topic). For SWAP, the two topics/brokers trade places.
+-- swapped, no dest topic). For SWAP, each topic-partition returns to where it
+-- started: after applying the SWAP, src_topic sits on dest_broker and
+-- dest_topic on src_broker, so the inverse keeps the topics with their
+-- partitions and swaps ONLY the broker sides. (Swapping the topics as well
+-- would describe the already-swapped state and fail to apply.)
 function Action:undo()
     if self.action_type == ActionType.MOVE then
         return Action.new(
@@ -69,12 +73,12 @@ function Action:undo()
     -- SWAP
     return Action.new(
         self.action_type,
-        self.dest_topic,           -- was dest, now src
+        self.src_topic,            -- now living on dest_broker...
         self.dest_broker_id,
-        self.src_broker_id,
-        self.src_topic,            -- was src, now dest
-        self.dest_partition,       -- partitions trade with their topics
-        self.src_partition)
+        self.src_broker_id,        -- ...moves back to src_broker
+        self.dest_topic,           -- and vice versa
+        self.src_partition,
+        self.dest_partition)
 end
 
 function Action:equals(other)

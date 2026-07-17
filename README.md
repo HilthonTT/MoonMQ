@@ -9,6 +9,12 @@ TCP and speak a compact binary protocol to produce records, fetch or
 subscribe to topics, create topics, and commit consumer offsets. Topics are
 partitioned append-only logs with CRC-checked on-disk records.
 
+**New to the codebase?** Start with
+[docs/architecture.md](docs/architecture.md) (module map + data flow),
+then [CONTRIBUTING.md](CONTRIBUTING.md) (setup, checks, conventions).
+Deep dives: [docs/cluster.md](docs/cluster.md) ·
+[docs/transactions.md](docs/transactions.md).
+
 ## Requirements
 
 - Lua 5.4 (uses native bitwise operators and `goto`/labels)
@@ -328,6 +334,27 @@ the member's next fetch without pushing a new assignment frame. A member the
 coordinator has evicted is pinned to "own nothing" until it re-joins, and a
 consumer that leaves its group reverts to reading every subscribed partition.
 
+## Clustering & autobalancing (experimental)
+
+MoonMQ brokers can form a static-membership cluster: each broker gets an id,
+a list of peers, and an inter-broker HTTP endpoint. On top of that sits an
+[AutoMQ](https://github.com/AutoMQ/automq)-style autobalancer that watches
+per-partition load (disk bytes, partition counts) across the cluster and
+migrates partitions from hot brokers to cold ones — data copy, exact
+ownership cutover, and produce forwarding included, with zero client changes.
+
+```json
+"Server": {
+  "Cluster":     { "BrokerId": "b1", "Port": 9095,
+                   "Peers": [ { "Id": "b2", "Address": "10.0.0.2:9095" } ] },
+  "Autobalance": { "IntervalSeconds": 60, "DryRun": true }
+}
+```
+
+See **[docs/cluster.md](docs/cluster.md)** for the full design: what moves,
+what the cutover guarantees, configuration reference, and the current
+boundaries (consumer groups stay per-broker; committed offsets don't migrate).
+
 ## Code layout
 
 Layers, from the wire down to the disk. Each directory depends only on the
@@ -344,7 +371,16 @@ src/
   client/          network client (speaks the wire protocol over TCP)
   wire/            binary protocol codec, shared by server and client
   broker/          broker domain layer: Broker (topics + offsets facade),
-                   in-process Producer/Consumer, ConsumerGroup coordinator FSM
+                   in-process Producer/Consumer, ConsumerGroup coordinator FSM,
+                   transaction coordinator
+  cluster/         multi-broker layer: partition-ownership table, inter-broker
+                   HTTP endpoint + peer client, partition reassigner (data
+                   migration), produce router, autobalancer loop
+                   → docs/cluster.md
+  autobalancer/    AutoMQ-style rebalancing engine: cluster model, windowed
+                   load samples, distribution goals, anomaly detector — pure
+                   decision engine, executed via cluster/reassigner
+                   → docs/cluster.md
   storage/         topic/partition management and the default "segmented"
                    backend (segment files, time index, group-commit fsync
                    batching, retention, crash recovery)
@@ -554,9 +590,13 @@ Current coverage:
 
 | Spec file                     | Module under test                                                    |
 | ----------------------------- | -------------------------------------------------------------------- |
+| `autobalancer_spec.lua`       | `src/autobalancer/` — samples, cluster snapshot, goals, detector     |
+| `bugfix_regression_spec.lua`  | pinned regressions from past bug fixes                               |
 | `chaos_spec.lua`              | fault-injection resilience (`ChaosProducer` over Broker/Producer)    |
+| `cluster_spec.lua`            | `src/cluster/` — assignments, reassigner MOVE, produce routing, balance loop |
 | `commitlog_spec.lua`          | `src/commitlog/commitlog.lua` — append, recovery, compaction         |
 | `commitlog_backend_spec.lua`  | commitlog storage backend, end-to-end via Broker/Producer/Consumer   |
+| `compression_spec.lua`        | `src/record/compression.lua` — gzip/snappy produce/consume round-trip |
 | `consumer_assignment_spec.lua`| `src/broker/consumer.lua` — `set_assignment` / `owns` filtering       |
 | `crc32_spec.lua`              | `src/core/crc32.lua` — IEEE 802.3 CRC-32                             |
 | `future_spec.lua`             | `src/core/future.lua` — one-shot coroutine future                    |
@@ -566,12 +606,19 @@ Current coverage:
 | `message_spec.lua`            | `src/record/message.lua` — message wire format                       |
 | `offset_manager_spec.lua`     | `src/storage/offset_manager.lua` — durable group offsets             |
 | `partition_spec.lua`          | `src/storage/topic_manager.lua` — partition append, read, recovery via TopicManager |
+| `producer_state_spec.lua`     | `src/storage/producer_state.lua` — durable PIDs, epochs, seq memos   |
+| `replication_spec.lua`        | `src/server/replicator.lua` — ISR/HWM tracking, acks=all waits       |
+| `review_fixes_spec.lua`       | pinned regressions from the 2026-07-17 code review                   |
 | `segmentation_spec.lua`       | `src/storage/segmentation.lua` — `SegmentedPartition` roll & lookup  |
 | `sql_lexer_spec.lua`          | `src/repl/sql/lexer.lua` — MQL console tokenizer                     |
 | `sql_parser_spec.lua`         | `src/repl/sql/parser.lua` — MQL statement grammar                    |
 | `time_spec.lua`               | `src/core/time.lua` — duration constants                             |
 | `topic_manager_spec.lua`      | `src/storage/topic_manager.lua` — topic/partition creation           |
+| `transactions_spec.lua`       | `src/broker/txn_coordinator.lua` — atomic multi-partition txns       |
 | `util_spec.lua`               | `src/core/util.lua` — topic-name validation                          |
+
+The standalone `spec/storage_smoke.lua` (run via `make smoke`, not busted)
+exercises the restart/recovery + segment-roll path end-to-end.
 
 Credit:
 

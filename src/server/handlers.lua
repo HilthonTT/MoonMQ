@@ -247,13 +247,18 @@ function M.produce_idempotent(server, conn, correl, payload)
         end
     end
 
-    -- Dedup state comes from the DURABLE memo for named producers (so it
-    -- survives reconnect/restart) or from in-memory per-connection state for
-    -- ephemeral producers (session-scoped, today's behaviour).
+    -- Dedup state comes from the DURABLE memo for named producers or from
+    -- in-memory per-connection state for ephemeral producers. The durable memo
+    -- only applies when it was written by THIS session (same epoch): a
+    -- reconnect bumps the epoch and the client restarts its sequences at 0,
+    -- so an old session's memo must not swallow the new session's first
+    -- records as "retries" (KIP-360 semantics). Idempotent-retry protection
+    -- therefore spans a session — including a broker restart mid-session —
+    -- but not a producer reconnect, which starts a fresh sequence space.
     local last_seq, last_offset, last_partition
     if durable then
         local m = ps:lookup_memo(conn.pid, p.topic)
-        if m then
+        if m and (m.epoch or 0) == conn.epoch then
             last_seq, last_offset, last_partition =
                 m.last_seq, m.last_offset, m.last_partition
         else
@@ -303,7 +308,7 @@ function M.produce_idempotent(server, conn, correl, payload)
         -- idempotence guarantee for THIS record is degraded (a later retry could
         -- duplicate), so surface it rather than acking as if fully durable.
         local ok, rerr = ps:record_produce(conn.pid, p.topic, p.seq,
-            offset, partition_id)
+            offset, partition_id, conn.epoch)
         if not ok then
             conn:send(proto.encode_error(correl, proto.ERR_INTERNAL,
                 "produced but failed to persist producer state: " .. tostring(rerr)))
@@ -455,6 +460,12 @@ function M.fetch(server, conn, correl, payload)
         conn.subscriptions[f.topic] = true
     end
     conn.mode = "pull"
+    -- Pull mode commits AFTER a record is handed to the send layer (below),
+    -- exactly like the push path. With poll()'s auto-commit on, a batch
+    -- truncated by max_records (or dropped by a failed send) would have had
+    -- its offsets durably committed anyway — permanently skipping the
+    -- records that were never delivered.
+    consumer.auto_commit = false
 
     -- Restrict to this member's assigned partitions (no-op unless joined).
     server.coordinator:apply_assignment(conn)
@@ -466,11 +477,38 @@ function M.fetch(server, conn, correl, payload)
     end
     if records then
         local limit = math.min(#records, f.max_records or #records)
+
+        -- Rewind the in-memory cursor for everything we are NOT sending, so
+        -- the next FETCH re-reads it. poll() returns at most one record per
+        -- partition, so each rewind target is exact.
+        for i = limit + 1, #records do
+            local r = records[i]
+            consumer.offsets[r.topic][r.partition] = r.offset
+        end
+
         for i = 1, limit do
             local r = records[i]
             local frame = proto.encode_record(correl,
                 r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
-            if not conn:send(frame) then return end
+            if not conn:send(frame) then
+                -- Send layer refused (connection closing): rewind the rest of
+                -- the batch too; nothing sent from here on was committed.
+                for j = i, limit do
+                    local rr = records[j]
+                    consumer.offsets[rr.topic][rr.partition] = rr.offset
+                end
+                return
+            end
+            -- Commit only after the record is accepted by the send layer —
+            -- at-least-once, same contract as the push path. A commit failure
+            -- is logged but doesn't abort the response: the record was
+            -- delivered, and an uncommitted offset merely means redelivery.
+            local adv = consumer.offsets[r.topic][r.partition]
+            local cok, commit_err = consumer:commit_offset(r.topic, r.partition, adv)
+            if not cok then
+                log:error("conn=%s fetch commit %s/partition-%d: %s",
+                    conn.id_short, r.topic, r.partition, commit_err)
+            end
         end
         if limit > 0 then
             metrics.inc("moonmq_fetch_records_total", limit, { topic = f.topic })

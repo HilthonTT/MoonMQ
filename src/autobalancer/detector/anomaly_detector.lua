@@ -48,6 +48,11 @@ end
 
 -- Compute the rebalance plan without executing it. Returns (actions, snapshot)
 -- so callers can inspect the post-plan cluster state the goals converged on.
+--
+-- Goals apply their accepted actions to the shared snapshot as they generate
+-- them, so when the plan cap truncates a goal's output the EXCESS actions must
+-- be undone in the snapshot — otherwise later goals (and the published
+-- metrics) would reason from placements the executed plan never creates.
 function AnomalyDetector:detect()
     local snapshot = self.cluster_model:snapshot()
     local actions = {}
@@ -55,12 +60,22 @@ function AnomalyDetector:detect()
 
     for _, goal in ipairs(self.goals) do
         local produced = goal:optimize(snapshot, self.goals)
-        for _, action in ipairs(produced) do
-            if cap and #actions >= cap then break end
-            actions[#actions + 1] = action
+        local room = cap and (cap - #actions) or #produced
+        for i = 1, math.min(#produced, room) do
+            actions[#actions + 1] = produced[i]
         end
-        if cap and #actions >= cap then
-            self.log:warn("plan hit max_actions_per_detect=%d; some goals not fully applied", cap)
+        if #produced > room then
+            -- Revert the dropped tail, newest first, so the snapshot matches
+            -- exactly the actions that made it into the plan.
+            for i = #produced, room + 1, -1 do
+                local undone, uerr = snapshot:apply_action(produced[i]:undo())
+                if not undone then
+                    self.log:error("failed to revert over-cap action %s: %s",
+                        produced[i]:pretty(), tostring(uerr))
+                end
+            end
+            self.log:warn("plan hit max_actions_per_detect=%d; %d action(s) dropped",
+                cap, #produced - room)
             break
         end
     end

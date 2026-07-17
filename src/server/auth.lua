@@ -21,12 +21,24 @@ local DEFAULT_HASH_BYTES        = 32
 -- Exported so the hash CLI (bin/moonmq-hash.lua) and any other caller pick
 -- up the same default instead of hard-coding a copy that silently drifts.
 -- NOTE: verification cost scales linearly with this count, and PBKDF2 here
--- is pure-Lua running inline on the single reactor thread (see Auth:verify
--- -> pbkdf2_hmac_sha256). At 600k a single AUTH stalls the whole event
--- loop for a noticeable time; moving hashing off the reactor is the real
--- fix (tracked separately) — this constant is deliberately kept high for
--- offline-brute-force resistance, not because the reactor cost is solved.
+-- is pure-Lua. Three mitigations keep an unauthenticated attacker from
+-- wedging the single reactor thread with it (each AUTH used to stall the
+-- whole event loop for the full 600k iterations):
+--   * verification yields back to the reactor every YIELD_EVERY iterations
+--     when the Server installs a yield_fn (see Auth:set_yield_fn), so other
+--     connections keep making progress during a derivation;
+--   * a keyed digest of the last successful credentials short-circuits
+--     re-verification, so legitimate reconnects don't pay PBKDF2 at all;
+--   * at most max_inflight derivations run concurrently — beyond that AUTH
+--     fails fast with "busy" (without counting toward the IP ban, so an
+--     attacker can't use the gate to get victims banned).
 M.DEFAULT_PBKDF2_ITERATIONS = DEFAULT_PBKDF2_ITERATIONS
+
+-- How many PBKDF2 iterations run between yields when a yield_fn is
+-- installed. ~8k iterations is a few ms of pure-Lua HMAC — long enough to
+-- keep the derivation efficient, short enough that produce/fetch latency
+-- stays flat while someone is authenticating.
+local YIELD_EVERY = 8192
 
 -- Upper bound on the iteration count parse_hash will accept. A corrupted or
 -- typo'd config shouldn't be able to wedge auth in a 2^31-iter PBKDF2 loop.
@@ -44,8 +56,12 @@ local function xor_strings(a, b)
     return table.concat(out)
 end
 
-local function pbkdf2_hmac_sha256(password, salt, iterations, dklen)
+-- opts (optional): { yield_fn = function() ... end } — called every
+-- YIELD_EVERY iterations so a cooperative scheduler can interleave other
+-- work. Callers without a scheduler (the hash CLI, tests) just omit it.
+local function pbkdf2_hmac_sha256(password, salt, iterations, dklen, opts)
     assert(type(dklen) == "number" and dklen > 0, "dklen must be positive")
+    local yield_fn = opts and opts.yield_fn
     local hLen = 32
     local blocks = math.ceil(dklen / hLen)
     local output = {}
@@ -55,10 +71,11 @@ local function pbkdf2_hmac_sha256(password, salt, iterations, dklen)
         local u_bin  = sha2.hex_to_bin(u_hex)
         local f      = u_bin
 
-        for _ = 2, iterations do
+        for i = 2, iterations do
             u_hex = sha2.hmac(sha2.sha256, password, u_bin)
             u_bin = sha2.hex_to_bin(u_hex)
             f     = xor_strings(f, u_bin)
+            if yield_fn and i % YIELD_EVERY == 0 then yield_fn() end
         end
 
         output[block_i] = f
@@ -170,7 +187,24 @@ function M.static_authenticator(opts)
         failures       = {},
         failures_n     = 0,
         last_sweep     = socket.gettime(),
+
+        -- Reactor-stall mitigations (see the note at the top of the file).
+        max_inflight   = opts.max_inflight or 4,
+        inflight       = 0,
+        yield_fn       = nil,               -- installed by the Server
+        -- Per-process random key for the success-digest cache. HMAC keying
+        -- means the cache never stores anything derivable from the password
+        -- by an attacker who can read a memory dump of just the cache slot.
+        cred_key       = rng.bytes(32),
+        cred_cache     = nil,               -- digest of last good (user, pass)
     }, Auth)
+end
+
+-- Install a cooperative-yield callback (the Server passes one that parks the
+-- current coroutine on the reactor for a tick). With it installed, a PBKDF2
+-- verification no longer freezes the event loop for its full duration.
+function Auth:set_yield_fn(fn)
+    self.yield_fn = fn
 end
  
 function Auth:_maybe_sweep(now)
@@ -251,10 +285,17 @@ function Auth:_verify_password(password, stored)
     local parsed, perr = parse_hash(stored)
     if not parsed then return false, perr end
     local computed = pbkdf2_hmac_sha256(
-        password, parsed.salt, parsed.iterations, #parsed.hash)
+        password, parsed.salt, parsed.iterations, #parsed.hash,
+        { yield_fn = self.yield_fn })
     return compare_secure(computed, parsed.hash)
 end
- 
+
+-- Keyed digest of a credential pair for the success cache. \0 separates the
+-- fields so ("ab","c") can't collide with ("a","bc").
+function Auth:_cred_digest(user, pass)
+    return sha2.hmac(sha2.sha256, self.cred_key, (user or "") .. "\0" .. (pass or ""))
+end
+
 function Auth:verify(user, pass, ip)
     local now = socket.gettime()
     self:_maybe_sweep(now)
@@ -266,12 +307,42 @@ function Auth:verify(user, pass, ip)
         return false, string.format("ip banned for %d more seconds", remaining)
     end
 
+    -- Fast path: exactly the credentials that last verified successfully.
+    -- Skips the expensive PBKDF2 for legitimate reconnects; a wrong guess
+    -- never matches (the digest is HMAC-keyed and success-only). Revealing
+    -- "these are the good credentials" via the faster path is moot — a
+    -- successful AUTH reveals that anyway.
+    local digest = self:_cred_digest(user, pass)
+    if self.cred_cache and compare_secure(digest, self.cred_cache) then
+        if self.failures[ip] ~= nil then
+            self.failures[ip] = nil
+            self.failures_n = self.failures_n - 1
+        end
+        return true, nil
+    end
+
+    -- Concurrency gate on the expensive derivation. Rejected attempts do NOT
+    -- count toward the IP ban — the gate trips under an attacker's parallel
+    -- flood, and a legitimate user caught in it should retry, not get banned.
+    if self.inflight >= self.max_inflight then
+        return false, "auth busy, retry"
+    end
+
+    self.inflight = self.inflight + 1
     -- Run BOTH compares regardless of intermediate results so timing
-    -- doesn't reveal which field is wrong.
-    local user_ok = compare_secure(user or "", self.username)
-    local pass_ok = self:_verify_password(pass or "", self.password_hash)
+    -- doesn't reveal which field is wrong. pcall guards the inflight
+    -- counter — a yield_fn that throws at shutdown must not leak a slot.
+    local ok, user_ok, pass_ok = pcall(function()
+        return compare_secure(user or "", self.username),
+               self:_verify_password(pass or "", self.password_hash)
+    end)
+    self.inflight = self.inflight - 1
+    if not ok then
+        return false, "auth aborted"
+    end
 
     if user_ok and pass_ok then
+        self.cred_cache = digest
         if self.failures[ip] ~= nil then
             self.failures[ip] = nil
             self.failures_n = self.failures_n - 1

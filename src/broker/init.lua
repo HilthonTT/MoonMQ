@@ -211,6 +211,17 @@ function Broker:tick_cleaners()
     return ran
 end
 
+-- serves_partition reports whether this broker currently serves reads/writes
+-- for (topic, partition). Always true in a single-broker deployment;
+-- cluster-aware once the Server installs the ownership table (see
+-- Server.new / src/cluster/assignments.lua). Consumers use this to stop
+-- reading the stale local copy of a partition that was reassigned away.
+function Broker:serves_partition(topic_name, partition_id)
+    local a = self.cluster_assignments
+    if not a then return true end
+    return a:owned_by_self(topic_name, partition_id)
+end
+
 function Broker:get_topic(name)
     assert(type(name) == "string", "name must be a string")
 

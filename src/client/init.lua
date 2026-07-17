@@ -298,7 +298,7 @@ function Client:fetch(topic, group, max_records)
     local correl = uuid.bytes()
     local data = proto.encode_fetch(correl, topic, group, max_records)
     local ok, err = self:_write(data)
-    if not ok then return nil end
+    if not ok then return nil, err end
 
     local records = {}
     while true do
