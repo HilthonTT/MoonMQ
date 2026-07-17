@@ -16,7 +16,7 @@ jobs:
     name: lint + test + smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Lua 5.4, LuaRocks, and zlib headers
         run: |
@@ -25,13 +25,29 @@ jobs:
           sudo apt-get install -y lua5.4 liblua5.4-dev luarocks zlib1g-dev
 
       - name: Install Lua dependencies
+        # luarocks-5.4, NOT plain luarocks: the Debian/Ubuntu `luarocks`
+        # launcher defaults to Lua 5.1 (`luarocks config lua_version` → 5.1),
+        # so an unversioned install puts busted and every dep under 5.1 and
+        # the 5.4-only specs (string.pack, bitwise operators) error out.
+        # Same reason the Makefile's `make deps` uses luarocks-5.4.
         run: |
-          sudo luarocks install busted
-          sudo luarocks install luasocket
-          sudo luarocks install dkjson
-          sudo luarocks install lua-zlib
-          sudo luarocks install luaposix
-          sudo luarocks install luacheck
+          sudo luarocks-5.4 install busted
+          sudo luarocks-5.4 install luasocket
+          sudo luarocks-5.4 install dkjson
+          sudo luarocks-5.4 install lua-zlib
+          sudo luarocks-5.4 install luaposix
+          sudo luarocks-5.4 install luacheck
+
+      - name: Verify toolchain targets Lua 5.4
+        # Fail HERE, loudly, if busted ever binds to the wrong interpreter
+        # again — not 40 specs deep with misleading per-test errors. The
+        # luarocks-generated wrapper hard-codes the interpreter and 5.4
+        # module paths, so grepping it is a faithful binding check.
+        run: |
+          lua5.4 -e 'assert(_VERSION == "Lua 5.4", _VERSION)'
+          busted --version
+          grep -q '5\.4' "$(command -v busted)" \
+            || { echo "::error::busted is not bound to Lua 5.4"; exit 1; }
 
       - name: Lint (luacheck)
         run: luacheck src bin main.lua spec
