@@ -1,5 +1,7 @@
 -- Normalizer that normalize the value to [0, 1]
 local LinearNormalizer = {}
+LinearNormalizer.__index = LinearNormalizer
+
 function LinearNormalizer.new(min, max)
   assert(type(min) == "number", "min must be a number")
   assert(type(max) == "number", "max must be a number")

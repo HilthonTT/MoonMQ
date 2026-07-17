@@ -5,6 +5,7 @@ local util_m     = require("src.core.util")
 local offmgr_m   = require("src.storage.offset_manager")
 local prodstate_m = require("src.storage.producer_state")
 local txn_m      = require("src.broker.txn_coordinator")
+local uuid = require("src.core.uuid")
 
 local Broker = {}
 Broker.__index = Broker
@@ -21,21 +22,18 @@ function Broker.new(data_dir, opts)
     opts = opts or {}
 
     local success, err = fs_m.mkdir(data_dir)
-    if not success then
-        return nil, err
-    end
+    if not success then return nil, err end
 
     local topic_manager = tpm_m.new(data_dir, {
         default_backend = opts.default_backend,
     })
     local broker = setmetatable({
+        id = uuid.bytes(),
         topic_manager = topic_manager,
     }, Broker)
 
     local lerr = broker:load_topics()
-    if lerr then
-        return nil, lerr
-    end
+    if lerr then return nil, lerr end
 
     -- Durable consumer offsets live in an internal __consumer_offsets topic.
     -- Build the manager after user topics are loaded (load_topics will have
@@ -43,9 +41,7 @@ function Broker.new(data_dir, opts)
     -- detects that and replays it rather than re-creating). opts.offsets is an
     -- optional { num_partitions = N } passed through to first-time creation.
     local offsets, oerr = offmgr_m.OffsetManager.new(topic_manager, opts.offsets)
-    if not offsets then
-        return nil, oerr
-    end
+    if not offsets then return nil, oerr end
     broker.offsets = offsets
 
     -- Durable producer state (PIDs, epochs, idempotent-produce memos) lives in
@@ -53,18 +49,16 @@ function Broker.new(data_dir, opts)
     -- lets idempotent/transactional producers survive a reconnect or restart.
     local prod_state, perr =
         prodstate_m.ProducerStateManager.new(topic_manager, opts.producer_state)
-    if not prod_state then
-        return nil, perr
-    end
+    if not prod_state then return nil, perr end
+
     broker.producer_state = prod_state
 
     -- Transaction coordinator (built LAST: it uses topic_manager, offsets, and
     -- producer_state during its own crash-recovery pass, which resolves any
     -- transaction left in flight by a previous crash).
     local txn, terr = txn_m.Coordinator.new(broker, opts.transactions)
-    if not txn then
-        return nil, terr
-    end
+    if not txn then return nil, terr end
+
     broker.transactions = txn
 
     return broker, nil

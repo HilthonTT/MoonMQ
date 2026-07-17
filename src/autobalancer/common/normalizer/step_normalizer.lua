@@ -4,6 +4,8 @@ local LinearNormalizer = require("src.autobalancer.common.normalizer.linear_norm
 -- LinearNormalizer, otherwise it will be normalized with a logarithmic function which approaches 1 while the value
 -- approaches infinity.
 local StepNormalizer = {}
+StepNormalizer.__index = StepNormalizer
+
 function StepNormalizer.new(min, step, step_offset, step_value)
   assert(type(min) == "number", "min must be a number")
   assert(type(step) == "number", "step must be a number")
