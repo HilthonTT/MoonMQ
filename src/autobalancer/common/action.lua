@@ -13,7 +13,13 @@ local ACTION_TYPE_NAMES = {
 local Action = {}
 Action.__index = Action
 
-function Action.new(action_type, src_topic, src_broker_id, dest_broker_id, dest_topic)
+-- src_partition / dest_partition identify *which* partition of the topic moves.
+-- They are optional (default 0) so a caller balancing whole topics can omit
+-- them, but a partition-level balancer (see src/autobalancer/model) threads them
+-- through so a MOVE/SWAP names an exact topic-partition replica, mirroring
+-- AutoMQ's Action-over-TopicPartition.
+function Action.new(action_type, src_topic, src_broker_id, dest_broker_id, dest_topic,
+        src_partition, dest_partition)
     assert(action_type == ActionType.MOVE or action_type == ActionType.SWAP,
         "action_type must be ActionType.MOVE or ActionType.SWAP")
     assert(getmetatable(src_topic) == Topic, "src_topic must be a Topic")
@@ -23,13 +29,19 @@ function Action.new(action_type, src_topic, src_broker_id, dest_broker_id, dest_
     assert(type(dest_broker_id) == "string", "dest_broker_id must be a string")
     assert(action_type ~= ActionType.SWAP or dest_topic ~= nil,
         "SWAP requires a dest_topic")
- 
+    assert(src_partition == nil or type(src_partition) == "number",
+        "src_partition must be a number or nil")
+    assert(dest_partition == nil or type(dest_partition) == "number",
+        "dest_partition must be a number or nil")
+
     return setmetatable({
         action_type    = action_type,
         src_topic      = src_topic,
         dest_topic     = dest_topic,   -- nil for MOVE
         src_broker_id  = src_broker_id,
         dest_broker_id = dest_broker_id,
+        src_partition  = src_partition or 0,
+        dest_partition = dest_partition or 0,
     }, Action)
 end
 
@@ -40,7 +52,7 @@ function Action:set_dest_broker_id(dest_broker_id)
     assert(type(dest_broker_id) == "string", "dest_broker_id must be a string")
     self.dest_broker_id = dest_broker_id
 end
- 
+
 -- Return the inverse action. For MOVE, the same topic moves back (broker roles
 -- swapped, no dest topic). For SWAP, the two topics/brokers trade places.
 function Action:undo()
@@ -49,7 +61,9 @@ function Action:undo()
             self.action_type,
             self.src_topic,
             self.dest_broker_id,   -- was dest, now src
-            self.src_broker_id)    -- was src, now dest
+            self.src_broker_id,    -- was src, now dest
+            nil,
+            self.src_partition)    -- same partition moves back
     end
 
     -- SWAP
@@ -58,7 +72,9 @@ function Action:undo()
         self.dest_topic,           -- was dest, now src
         self.dest_broker_id,
         self.src_broker_id,
-        self.src_topic)            -- was src, now dest
+        self.src_topic,            -- was src, now dest
+        self.dest_partition,       -- partitions trade with their topics
+        self.src_partition)
 end
 
 function Action:equals(other)
@@ -69,13 +85,17 @@ function Action:equals(other)
        and self.dest_broker_id == other.dest_broker_id
        and self.src_topic      == other.src_topic
        and self.dest_topic     == other.dest_topic
+       and self.src_partition  == other.src_partition
+       and self.dest_partition == other.dest_partition
 end
 
 function Action:key()
     return table.concat({
         tostring(self.action_type),
         self.src_topic  and self.src_topic.name  or "",
+        tostring(self.src_partition),
         self.dest_topic and self.dest_topic.name or "",
+        tostring(self.dest_partition),
         self.src_broker_id,
         self.dest_broker_id,
     }, "|")
@@ -84,12 +104,13 @@ end
 function Action:pretty()
     local src = self.src_topic and self.src_topic.name or "?"
     if self.action_type == ActionType.MOVE then
-        return string.format("Action-MOVE: %s@node-%s ---> node-%s",
-            src, self.src_broker_id, self.dest_broker_id)
+        return string.format("Action-MOVE: %s-%d@node-%s ---> node-%s",
+            src, self.src_partition, self.src_broker_id, self.dest_broker_id)
     elseif self.action_type == ActionType.SWAP then
         local dst = self.dest_topic and self.dest_topic.name or "?"
-        return string.format("Action-SWAP: %s@node-%s <--> %s@node-%s",
-            src, self.src_broker_id, dst, self.dest_broker_id)
+        return string.format("Action-SWAP: %s-%d@node-%s <--> %s-%d@node-%s",
+            src, self.src_partition, self.src_broker_id,
+            dst, self.dest_partition, self.dest_broker_id)
     end
     return tostring(self)
 end
