@@ -13,7 +13,11 @@
 -- `attrs` is a bitfield (see ATTR_* below):
 --   bits 0-1  compression codec  (0 none, 1 gzip, 2 snappy)
 --   bit  2    control-record flag (transaction COMMIT/ABORT marker)
---   bits 3-7  reserved (must be 0)
+--   bit  3    transactional-data flag: the header is EXTENDED by
+--             pid(8) + epoch(2) identifying the producer session that wrote
+--             the record (needed to filter aborted records under
+--             read_committed — see docs/transactions.md)
+--   bits 4-7  reserved (must be 0)
 --
 -- IMPORTANT: `value'` is the value bytes AS STORED — already compressed when
 -- the codec bits are set. The KEY is always stored plaintext so commitlog
@@ -42,10 +46,13 @@ local CODEC_SNAPPY = 2
 -- attrs bitfield masks.
 local ATTR_CODEC_MASK = 0x03   -- bits 0-1
 local ATTR_CONTROL    = 0x04   -- bit 2
+local ATTR_TXN        = 0x08   -- bit 3
 
--- attrs (optional, default 0) carries the compression codec + control flag.
--- Callers that don't care (the vast majority) omit it and get 0.
-function Message.new(key, value, timestamp, attrs)
+-- attrs (optional, default 0) carries the compression codec + control/txn
+-- flags. Callers that don't care (the vast majority) omit it and get 0.
+-- pid/epoch identify the producer session and are REQUIRED (enforced at
+-- serialize time) when attrs has ATTR_TXN set; ignored otherwise.
+function Message.new(key, value, timestamp, attrs, pid, epoch)
     assert(type(key) == "string", "key must be a string")
     assert(type(value) == "string", "value must be a string")
     assert(type(timestamp) == "number", "timestamp must be a number")
@@ -58,6 +65,8 @@ function Message.new(key, value, timestamp, attrs)
         value = value,
         timestamp = timestamp,
         attrs = attrs or 0,
+        pid = pid,
+        epoch = epoch,
     }, Message)
 end
 
@@ -68,6 +77,10 @@ end
 
 function Message:is_control()
     return (self.attrs & ATTR_CONTROL) ~= 0
+end
+
+function Message:is_txn()
+    return (self.attrs & ATTR_TXN) ~= 0
 end
 
 local MessageHeader = {}
@@ -83,8 +96,12 @@ function MessageHeader.new(key_size, timestamp)
     }, MessageHeader)
 end
 
--- Header: attrs(1) | k_size(4) | ts(8) = 13 bytes.
+-- Header: attrs(1) | k_size(4) | ts(8) = 13 bytes. When ATTR_TXN is set the
+-- header is extended by pid(8) | epoch(2) = 23 bytes; the header CRC covers
+-- whichever form was written. attrs is the first byte either way, so a
+-- decoder can pick the length before slicing.
 local HEADER_LEN = 13
+local TXN_HEADER_LEN = HEADER_LEN + 8 + 2
 -- Smallest legal body (everything after the 8-byte length prefix):
 -- header(13) + header_crc(4) + payload_crc(4). An empty key+value is allowed.
 local MIN_BODY = HEADER_LEN + 4 + 4
@@ -112,7 +129,15 @@ local function serialize_message(msg)
             tostring(attrs))
     end
 
-    local header  = string.pack(">BI4I8", attrs, #msg.key, ts)
+    local header
+    if (attrs & ATTR_TXN) ~= 0 then
+        if type(msg.pid) ~= "number" or type(msg.epoch) ~= "number" then
+            return nil, "transactional record requires pid and epoch"
+        end
+        header = string.pack(">BI4I8I8I2", attrs, #msg.key, ts, msg.pid, msg.epoch)
+    else
+        header = string.pack(">BI4I8", attrs, #msg.key, ts)
+    end
     local payload = msg.key .. msg.value
 
     local header_crc  = crc32(header)
@@ -137,9 +162,19 @@ local function decode_body(body)
         return nil, "corrupt record: body shorter than minimum"
     end
 
-    local header_bytes       = body:sub(1, HEADER_LEN)
-    local stored_header_crc  = string.unpack(">I4", body, HEADER_LEN + 1)
-    local payload_start      = HEADER_LEN + 4 + 1
+    -- attrs is always the first byte; it decides the header length (the
+    -- transactional extension carries pid+epoch). We trust it only to SIZE
+    -- the header slice — the header CRC then validates the whole header,
+    -- including the attrs byte we peeked at.
+    local peek_attrs = body:byte(1)
+    local hlen = ((peek_attrs & ATTR_TXN) ~= 0) and TXN_HEADER_LEN or HEADER_LEN
+    if #body < hlen + 4 + 4 then
+        return nil, "corrupt record: body shorter than its header form"
+    end
+
+    local header_bytes       = body:sub(1, hlen)
+    local stored_header_crc  = string.unpack(">I4", body, hlen + 1)
+    local payload_start      = hlen + 4 + 1
     local payload_end        = #body - 4
     local payload            = body:sub(payload_start, payload_end)
     local stored_payload_crc = string.unpack(">I4", body, payload_end + 1)
@@ -152,6 +187,10 @@ local function decode_body(body)
     end
 
     local attrs, key_size, timestamp = string.unpack(">BI4I8", header_bytes)
+    local pid, epoch
+    if (attrs & ATTR_TXN) ~= 0 then
+        pid, epoch = string.unpack(">I8I2", header_bytes, HEADER_LEN + 1)
+    end
     if key_size < 0 or key_size > #payload then
         return nil, "corrupt header: key_size out of range"
     end
@@ -159,7 +198,7 @@ local function decode_body(body)
     local key   = payload:sub(1, key_size)
     local value = payload:sub(key_size + 1)
 
-    return Message.new(key, value, timestamp, attrs), nil
+    return Message.new(key, value, timestamp, attrs, pid, epoch), nil
 end
 
 --- Reads exactly one record from `file` at its current position, validating
@@ -210,6 +249,7 @@ return {
     decode_body = decode_body,
     deserialize_record = deserialize_record,
     HEADER_LEN = HEADER_LEN,
+    TXN_HEADER_LEN = TXN_HEADER_LEN,
     MIN_BODY = MIN_BODY,
     -- Codec ids re-exported so storage/broker code can reference them without
     -- pulling in compression.lua (which has optional native deps).
@@ -218,4 +258,5 @@ return {
     CODEC_SNAPPY = CODEC_SNAPPY,
     ATTR_CODEC_MASK = ATTR_CODEC_MASK,
     ATTR_CONTROL    = ATTR_CONTROL,
+    ATTR_TXN        = ATTR_TXN,
 }

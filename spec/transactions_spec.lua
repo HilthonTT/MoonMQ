@@ -27,13 +27,15 @@ local function markers(part)
     return commits, aborts
 end
 
--- Simulate a transactional produce: write a data record to (topic, partition)
--- and enrol it as a participant, the way the produce handler does.
+-- Simulate a transactional produce the way the produce handler does: enrol the
+-- partition BEFORE the append (so the coordinator captures the pre-append LEO
+-- as the txn's first offset there), then write a record carrying the
+-- transactional attr + producer session.
 local function txn_produce(broker, txn_id, pid, epoch, topic_name, partition_id, value)
     local topic = assert(broker:get_topic(topic_name))
-    assert(topic.partitions[partition_id]:write_message(
-        message.Message.new("k", value, 1)))
     assert(broker.transactions:add_partition(txn_id, pid, epoch, topic_name, partition_id))
+    assert(topic.partitions[partition_id]:write_message(
+        message.Message.new("k", value, 1, message.ATTR_TXN, pid, epoch)))
 end
 
 local function flush_txn_state(broker)

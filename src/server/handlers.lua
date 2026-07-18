@@ -27,10 +27,19 @@ local M = {}
 -- key-compaction still matches); only the value is compressed, and the codec is
 -- recorded in the record's attrs byte so read paths can decompress. Returns
 -- (Message, nil) or (nil, err) when the requested codec isn't available here.
-local function build_stored_message(codec, key, value)
+-- txn (optional) = { pid, epoch }: mark the record as transactional data
+-- (ATTR_TXN + producer session in the header) so read_committed consumers can
+-- attribute it to its transaction.
+local function build_stored_message(codec, key, value, txn)
     codec = codec or msg_m.CODEC_NONE
+    local attrs = codec & msg_m.ATTR_CODEC_MASK
+    local pid, epoch
+    if txn then
+        attrs = attrs | msg_m.ATTR_TXN
+        pid, epoch = txn.pid, txn.epoch
+    end
     if codec == msg_m.CODEC_NONE then
-        return msg_m.Message.new(key, value, 0)
+        return msg_m.Message.new(key, value, 0, attrs, pid, epoch)
     end
     if not compression.available(codec) then
         return nil, string.format("compression codec %s unavailable on this broker",
@@ -41,8 +50,7 @@ local function build_stored_message(codec, key, value)
         return nil, string.format("compress (%s) failed: %s",
             compression.codec_name(codec), cerr)
     end
-    -- codec id occupies attrs bits 0-1; no control bit on data records.
-    return msg_m.Message.new(key, stored, 0, codec & msg_m.ATTR_CODEC_MASK)
+    return msg_m.Message.new(key, stored, 0, attrs, pid, epoch)
 end
 
 -- Map a coordinator error "code" hint to a wire error code.
@@ -289,13 +297,41 @@ function M.produce_idempotent(server, conn, correl, payload)
     -- producer so partitioning + group-commit fsync behave identically
     -- to the non-idempotent path. The (partition, offset) we get back
     -- is what we memo so a retry can replay the same ack.
-    local msg, berr = build_stored_message(p.codec, p.key, p.value)
+    --
+    -- Inside a transaction the record is marked transactional (pid/epoch in
+    -- its header) and the chosen partition is enrolled with the coordinator
+    -- BEFORE the append — the enrolment captures the partition's LEO as the
+    -- transaction's first offset there, which is what bounds the LSO and the
+    -- aborted-range filter for read_committed (see Coordinator:add_partition).
+    local in_txn = conn.in_txn and conn.producer_name ~= nil
+    local msg, berr = build_stored_message(p.codec, p.key, p.value,
+        in_txn and { pid = conn.pid, epoch = conn.epoch } or nil)
     if not msg then
         conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, berr))
         return
     end
-    local partition_id, offset, werr = server.producer:produce(p.topic, msg)
+    local produce_opts
+    local enrol_err, enrol_code
+    if in_txn then
+        produce_opts = {
+            pre_append = function(topic_name, partition_id, _partition)
+                local pok, perr, pcode = server.broker.transactions:add_partition(
+                    conn.producer_name, conn.pid, conn.epoch, topic_name, partition_id)
+                if not pok then
+                    enrol_err, enrol_code = perr, pcode
+                    return nil, "failed to enrol partition in txn: " .. tostring(perr)
+                end
+                return true
+            end,
+        }
+    end
+    local partition_id, offset, werr =
+        server.producer:produce(p.topic, msg, produce_opts)
     if werr then
+        if enrol_err then
+            conn:send(proto.encode_error(correl, txn_err_code(enrol_code), werr))
+            return
+        end
         local code = werr:find("does not exist", 1, true)
             and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
         conn:send(proto.encode_error(correl, code, werr))
@@ -322,33 +358,31 @@ function M.produce_idempotent(server, conn, correl, payload)
         }
     end
 
-    -- If this producer is inside a transaction, enrol the partition it just
-    -- wrote to as a participant, so END_TXN writes a COMMIT/ABORT marker there.
-    if conn.in_txn and conn.producer_name then
-        local pok, perr, pcode = server.broker.transactions:add_partition(
-            conn.producer_name, conn.pid, conn.epoch, p.topic, partition_id)
-        if not pok then
-            conn:send(proto.encode_error(correl, txn_err_code(pcode),
-                "produced but failed to enrol partition in txn: " .. tostring(perr)))
-            return
-        end
-    end
-
     metrics.inc("moonmq_produce_records_total", 1, { topic = p.topic })
     metrics.inc("moonmq_idempotent_produce_total", 1, { topic = p.topic })
 
     conn:send(proto.encode_produce_ack(correl, partition_id, offset))
 end
 
-local function ensure_consumer(conn, broker, group_id)
+-- isolation is the wire byte (0 = read_uncommitted, 1 = read_committed) from
+-- the FETCH/SUBSCRIBE frame that creates the consumer. It is fixed at creation:
+-- a later frame asking for a different isolation on the same connection is an
+-- error rather than a silent switch mid-stream.
+local function ensure_consumer(conn, broker, group_id, isolation)
+    local iso = (isolation == proto.ISOLATION_READ_COMMITTED)
+        and "read_committed" or "read_uncommitted"
     if conn.consumer then
         if conn.consumer.group_id ~= group_id then
             return nil, string.format("group_id mismatch (already in group %s)",
                 conn.consumer.group_id)
         end
+        if conn.consumer.isolation ~= iso then
+            return nil, string.format("isolation mismatch (connection is %s)",
+                conn.consumer.isolation)
+        end
         return conn.consumer
     end
-    conn.consumer = consumer_m.Consumer.new(broker, group_id)
+    conn.consumer = consumer_m.Consumer.new(broker, group_id, { isolation = iso })
     return conn.consumer
 end
 
@@ -372,6 +406,7 @@ local function subscriber_loop(server, conn)
                     r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
                 if not conn:send(frame) then return end
                 metrics.inc("moonmq_fetch_records_total", 1, { topic = r.topic })
+                server.broker.traffic:add_out(r.topic, r.partition, #r.key + #r.value)
                 -- Commit only after the record is accepted by the send layer.
                 -- poll() already advanced the in-memory cursor to the next
                 -- offset for this partition; persist that. If conn:send had
@@ -408,7 +443,7 @@ function M.subscribe(server, conn, correl, payload)
             "connection already in pull mode (used FETCH)"))
         return
     end
-    local consumer, cerr = ensure_consumer(conn, server.broker, s.group_id)
+    local consumer, cerr = ensure_consumer(conn, server.broker, s.group_id, s.isolation)
     if not consumer then
         conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
         return
@@ -445,7 +480,7 @@ function M.fetch(server, conn, correl, payload)
             "connection already in push mode (used SUBSCRIBE)"))
         return
     end
-    local consumer, cerr = ensure_consumer(conn, server.broker, f.group_id)
+    local consumer, cerr = ensure_consumer(conn, server.broker, f.group_id, f.isolation)
     if not consumer then
         conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
         return
@@ -499,6 +534,7 @@ function M.fetch(server, conn, correl, payload)
                 end
                 return
             end
+            server.broker.traffic:add_out(r.topic, r.partition, #r.key + #r.value)
             -- Commit only after the record is accepted by the send layer —
             -- at-least-once, same contract as the push path. A commit failure
             -- is logged but doesn't abort the response: the record was
@@ -542,6 +578,17 @@ function M.commit(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
             string.format("partition %d out of range (1..%d)",
                 c.partition, #topic.partitions)))
+        return
+    end
+    -- Refuse commits for a partition this broker no longer serves (moved to a
+    -- peer). Accepting them would land offsets in the SOURCE broker's
+    -- __consumer_offsets after the migration snapshot was pushed, silently
+    -- diverging from the position the new owner tracks. The client should
+    -- consume — and commit — on the partition's new owner.
+    if not server.broker:serves_partition(c.topic, c.partition) then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            string.format("%s/partition-%d has moved to another broker; commit there",
+                c.topic, c.partition)))
         return
     end
     -- Fence commits from a connection whose group membership has lapsed. A

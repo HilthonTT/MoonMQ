@@ -35,6 +35,12 @@ function Peer:_request(method, path, headers, body)
     headers = headers or {}
     headers["Content-Length"] = tostring(#(body or ""))
     if self.token then headers["X-Cluster-Token"] = self.token end
+    -- Controller identity (set via set_controller): lets the peer fence this
+    -- request if it knows of a newer controller.
+    if self.controller then
+        headers["X-Controller-Epoch"] = tostring(self.controller.epoch)
+        headers["X-Controller-Id"]    = self.controller.id
+    end
 
     local _, code, _, status = http.request{
         url     = string.format("http://%s%s", self.address, path),
@@ -75,14 +81,17 @@ function Peer:ensure_topic(topic, partitions)
 end
 
 -- Append one or more serialized records (concatenated len(8)|body frames, as
--- produced by message.serialize_message) to the peer's partition. Returns
--- (peer_leo, nil) or (nil, err).
-function Peer:append(topic, partition, payload)
-    local resp, err = self:_request("POST", "/cluster/append", {
+-- produced by message.serialize_message) to the peer's partition. `forwarded`
+-- marks the batch as forwarded PRODUCE traffic (counted by the owner's NW_IN
+-- feed) rather than a migration copy. Returns (peer_leo, nil) or (nil, err).
+function Peer:append(topic, partition, payload, forwarded)
+    local headers = {
         ["Content-Type"] = "application/octet-stream",
         ["X-Topic"]      = topic,
         ["X-Partition"]  = tostring(partition),
-    }, payload)
+    }
+    if forwarded then headers["X-Forwarded-Produce"] = "1" end
+    local resp, err = self:_request("POST", "/cluster/append", headers, payload)
     if not resp then return nil, err end
     if type(resp.offset) ~= "number" then
         return nil, string.format("peer %s: response missing offset", self.id)
@@ -109,6 +118,36 @@ function Peer:set_owner(topic, partition, owner)
         json.encode({ topic = topic, partition = partition, owner = owner }))
     if not resp then return nil, err end
     return true
+end
+
+-- set_controller attaches a controller identity to every subsequent request
+-- from this Peer, so the remote can fence a superseded controller. Pass nils
+-- to clear.
+function Peer:set_controller(epoch, id)
+    self.controller = epoch and { epoch = epoch, id = id } or nil
+end
+
+-- claim_controller announces `(epoch, id)` as controller to this peer.
+-- Returns (true, highest) when accepted, (false, highest, reason) when the
+-- peer knows a newer claim, (nil, err) when unreachable.
+function Peer:claim_controller(epoch, id)
+    local resp, err = self:_request("POST", "/cluster/controller/claim",
+        { ["Content-Type"] = "application/json" },
+        json.encode({ epoch = epoch, broker_id = id }))
+    if not resp then return nil, err end
+    if resp.accepted == true then return true, resp.highest end
+    return false, resp.highest, resp.reason
+end
+
+-- Ship committed consumer offsets for one migrated partition to the peer.
+-- `offsets` is { [group] = offset }. The peer applies each commit unless it
+-- already holds a higher one. Returns (applied_count, nil) or (nil, err).
+function Peer:push_offsets(topic, partition, offsets)
+    local resp, err = self:_request("POST", "/cluster/offsets",
+        { ["Content-Type"] = "application/json" },
+        json.encode({ topic = topic, partition = partition, offsets = offsets }))
+    if not resp then return nil, err end
+    return resp.applied or 0
 end
 
 -- Per-partition load report for the autobalancer's cluster model. Returns

@@ -27,16 +27,19 @@ src/cluster/               the EXECUTION layer (actually moving them)
                            entry = owned locally)
   peer.lua                 HTTP client for one peer broker
   cluster_server.lua       the inter-broker endpoint each broker serves
-  reassigner.lua           executes a plan: per MOVE, migrate the data and
-                           flip ownership
+  reassigner.lua           executes a plan: per MOVE, migrate the data +
+                           committed offsets and flip ownership
   router.lua               produce-path routing: forward records for
                            partitions owned elsewhere
-  balance_loop.lua         periodic feed-model → detect → execute glue
+  balance_loop.lua         periodic feed-model → detect → execute glue,
+                           fenced by a claimed controller epoch
+  controller_fence.lua     durable highest-controller-epoch tracking; what
+                           stops two balance loops from duelling
 ```
 
 ## What a MOVE does
 
-`Reassigner:_move(topic, partition, dest)` runs five steps:
+`Reassigner:_move(topic, partition, dest)` runs six steps:
 
 1. **ensure** — dest creates the topic if missing (same partition count).
 2. **copy** — records stream to dest in ~256 KiB batches over
@@ -49,7 +52,14 @@ src/cluster/               the EXECUTION layer (actually moving them)
 4. **drain** — records that landed locally *during* the copy are streamed
    across. Because of step 3 the tail is stable; the drain terminates. If
    the drain fails, ownership is rolled back and the partition stays local.
-5. **confirm** — dest records that it owns the partition (clears any stale
+5. **offsets** — every group's committed offset for the partition is pushed
+   to dest over `POST /cluster/offsets` (higher-wins per group on dest), so
+   consumers resume where they left off instead of restarting. The local
+   COMMIT handler refuses commits for a partition this broker no longer
+   serves, so the snapshot taken here is complete. A failed push degrades to
+   the old start-over behaviour and is logged loudly, but does not roll back
+   the move — the data is already safe on dest.
+6. **confirm** — dest records that it owns the partition (clears any stale
    entry on its side).
 
 The destination partition must be **empty**: records keep their byte offsets
@@ -72,21 +82,39 @@ new owner.
 
 ## The autobalancer loop
 
-`balance_loop.lua` runs on **one** broker per cluster (the de-facto
-controller — running it on several would produce competing plans):
+`balance_loop.lua` runs on **one** broker per cluster. That used to be pure
+convention; it is now **fenced** (`src/cluster/controller_fence.lua`): the
+loop claims a controller epoch (persisted at `<data_dir>/controller-epoch.json`)
+and re-announces it to every peer each pass over
+`POST /cluster/controller/claim`. Every mutating request the reassigner sends
+carries the epoch (`X-Controller-Epoch`/`X-Controller-Id` headers), and a
+broker that has seen a newer claim refuses it with 409 — so if a second broker
+starts the loop, exactly one survives: the elder claimant's next pass is
+rejected and it stops acting (permanently, until an operator restarts it).
+This is fencing, not consensus — two brokers claiming simultaneously against
+disjoint reachable peers can both act until their claims meet; requests
+without epoch headers (hand-driven reassignment, old peers) bypass the fence.
 
-1. Feed the model: local partitions' disk bytes + every peer's
+Each pass:
+
+1. Verify/announce controllership (above).
+2. Feed the model: local partitions' disk bytes + every peer's
    `GET /cluster/loads` report. An unreachable peer is marked inactive for
    the pass (the balancer will never move data *toward* a broker it can't
-   reach).
-2. Run the detector: goals execute in priority order against a shared
+   reach). Loads now carry cumulative per-partition produce/consume byte
+   counters (`src/metrics/traffic.lua`); the loop differences successive
+   reports into **NW_IN / NW_OUT byte rates**, so the network goals act on
+   real signal. Rates start flowing from the second pass; a counter reset
+   (broker restart) primes a fresh baseline instead of feeding a negative.
+3. Run the detector: goals execute in priority order against a shared
    snapshot; the result is a plan of MOVE actions.
-3. Execute the plan through the Reassigner (or just log it with
+4. Execute the plan through the Reassigner (or just log it with
    `DryRun: true`).
 
-Only the DISK and PARTITION_COUNT goals are active by default — there is no
-per-partition byte-rate feed yet, so the NW_IN/NW_OUT goals would act on
-noise. Enable them only if you feed those samples yourself.
+All four goals (NW_IN, NW_OUT, DISK, PARTITION_COUNT) are active by default.
+The network goals' `detect_threshold` (1 MiB/s mean) keeps an idle cluster
+still. Forwarded produces count as NW_IN on the partition's *owner*;
+migration copies are deliberately not counted.
 
 ## Configuration
 
@@ -129,16 +157,23 @@ Start with `DryRun: true` and watch the `balance_loop` log lines and the
 
 * **Consumer groups are per-broker.** Group membership, heartbeats, and
   rebalancing do not span brokers. After a partition moves, consume it from
-  its new owner.
-* **Committed consumer offsets do not migrate.** They live in the source
-  broker's `__consumer_offsets`. A group consuming from the new owner starts
-  from its configured start position.
+  its new owner — committed offsets follow the partition (MOVE step 5), so
+  the group resumes in place, but the membership itself must re-form there.
+* **Offset migration assumes both brokers run the same storage backend for
+  the topic.** Offsets are backend-native cursors (byte offsets vs record
+  counts); they only mean the same thing on dest because the data was copied
+  byte-for-byte from zero.
 * **Local data is left in place after a move.** The ownership table routes
   around it; reclaim disk by deleting the partition directory once you're
   satisfied.
-* **The balance loop is a single controller by convention, not election.**
-  There is no fencing against two brokers both running it — configure it on
-  exactly one.
+* **Controller fencing is not consensus.** A superseded balance loop is
+  refused wherever the newer claim has propagated, and requests without
+  epoch headers bypass the fence entirely. Two controllers claiming at the
+  same instant against disjoint reachable peers can both act until their
+  claims meet.
+* **Transactional produce does not cross brokers.** A transactional record
+  routed to a peer-owned partition is refused (markers could not be written
+  on the owner).
 * **Internal topics (`__*`) never move.**
 * **Inter-broker HTTP is plaintext.** Bind to loopback/private networks,
   set `Token`, firewall the port — same posture as `/replicate` and

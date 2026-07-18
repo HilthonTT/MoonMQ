@@ -39,7 +39,9 @@ function Router:forward(peer, topic_name, partition_id, msg)
     local bytes, serr = msg_m.serialize_message(msg)
     if not bytes then return nil, serr end
 
-    local leo, aerr = peer:append(topic_name, partition_id, bytes)
+    -- forwarded=true so the owner counts this as produce traffic (NW_IN);
+    -- migration batches through the same endpoint deliberately don't.
+    local leo, aerr = peer:append(topic_name, partition_id, bytes, true)
     if not leo then
         return nil, string.format("forward to %s failed: %s", peer.id, aerr)
     end

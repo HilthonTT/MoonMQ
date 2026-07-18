@@ -22,13 +22,23 @@ end
 local Consumer = {}
 Consumer.__index = Consumer
 
-function Consumer.new(broker, group_id)
+-- opts (optional):
+--   isolation  "read_uncommitted" (default) or "read_committed". Under
+--              read_committed, poll() stops at the partition's Last Stable
+--              Offset (no record of an unresolved transaction is delivered)
+--              and data records of aborted transactions are filtered out.
+function Consumer.new(broker, group_id, opts)
     assert(getmetatable(broker) == brk_m.Broker, "broker must be a Broker instance")
     assert(type(group_id) == "string", "group_id must be a string")
+    opts = opts or {}
+    local isolation = opts.isolation or "read_uncommitted"
+    assert(isolation == "read_uncommitted" or isolation == "read_committed",
+        "isolation must be read_uncommitted or read_committed")
 
     return setmetatable({
         broker      = broker,
         group_id    = group_id,
+        isolation   = isolation,
         -- Partition ownership filter set by the group coordinator via
         -- set_assignment. nil = "no restriction" (read every subscribed
         -- partition — the raw FETCH-without-JOIN_GROUP path). When set, poll()
@@ -139,19 +149,40 @@ function Consumer:poll()
 
         for partition_id, offset in pairs(partition_offsets) do
             local partition = topic.partitions[partition_id]
+            -- Read ceiling: the log end, tightened to the Last Stable Offset
+            -- under read_committed so no record of a still-unresolved
+            -- transaction is delivered (aborted records BELOW the LSO are
+            -- filtered per-record further down).
+            local hi = partition and partition.offset or 0
+            if self.isolation == "read_committed" and self.broker.transactions then
+                local lso = self.broker.transactions:lso(topic_name, partition_id)
+                if lso ~= nil and lso < hi then hi = lso end
+            end
             -- Skip partitions this member doesn't own (group assignment), that
             -- the CLUSTER moved to another broker (stale local copy), that
-            -- vanished, or that we've consumed up to the tail.
-            if self:owns(topic_name, partition_id)
+            -- vanished, or that we've consumed up to the tail. The inner loop
+            -- steps over non-application records (control markers, and aborted
+            -- transactional data under read_committed) until it delivers ONE
+            -- data record for this partition or reaches the ceiling — without
+            -- it, every skipped record would cost the caller a whole poll()
+            -- that returns nothing, which looks like end-of-stream.
+            while self:owns(topic_name, partition_id)
                 and self.broker:serves_partition(topic_name, partition_id)
-                and partition and offset < partition.offset then
+                and partition and offset < hi do
                 local msg, next_offset, read_err = partition:read_message(offset)
-                if msg and msg:is_control() then
-                    -- Transaction COMMIT/ABORT marker: it occupies an offset but
-                    -- is not an application record, so advance past it (committing
-                    -- if enabled) without emitting it. No read_committed
-                    -- filtering — data records from aborted txns are still
-                    -- delivered; only the marker itself is hidden.
+                -- Aborted transactional record (read_committed only): occupies
+                -- offsets but must not be delivered — advance past it exactly
+                -- like a control marker.
+                local skip_aborted = msg ~= nil and not msg:is_control()
+                    and self.isolation == "read_committed"
+                    and msg:is_txn() and self.broker.transactions ~= nil
+                    and self.broker.transactions:is_aborted(
+                        topic_name, partition_id, msg.pid, msg.epoch, offset)
+                if msg and (msg:is_control() or skip_aborted) then
+                    -- Transaction COMMIT/ABORT marker (or filtered aborted
+                    -- record): it occupies an offset but is not an application
+                    -- record, so advance past it (committing if enabled)
+                    -- without emitting it, and keep reading.
                     if self.auto_commit then
                         local cok, cerr =
                             self:commit_offset(topic_name, partition_id, next_offset)
@@ -161,6 +192,7 @@ function Consumer:poll()
                         end
                     end
                     self.offsets[topic_name][partition_id] = next_offset
+                    offset = next_offset
                 elseif msg then
                     -- Decompress transparently so consumers always see plaintext
                     -- regardless of how the record was stored. The stored value is
@@ -205,6 +237,7 @@ function Consumer:poll()
                         value,
                         msg.timestamp
                     )
+                    break   -- one data record per partition per poll
                 else
                     if is_eof_error(read_err) then
                         -- Two distinct EOF-flavoured situations:
@@ -224,6 +257,7 @@ function Consumer:poll()
                     else
                         return nil, string.format("failed to read message: %s", read_err or "unknown error")
                     end
+                    break
                 end
             end
         end

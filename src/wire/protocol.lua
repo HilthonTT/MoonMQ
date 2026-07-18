@@ -84,6 +84,13 @@ M.OP_ERROR         = 0xFE
 local CORREL_ID_LEN = 16
 M.CORREL_ID_LEN = CORREL_ID_LEN
 
+-- Consumer isolation levels, carried as an optional trailing byte on
+-- FETCH/SUBSCRIBE (absent = READ_UNCOMMITTED, so old clients are unaffected).
+-- READ_COMMITTED consumers stop at the Last Stable Offset and never see
+-- records of aborted transactions — see docs/transactions.md.
+M.ISOLATION_READ_UNCOMMITTED = 0
+M.ISOLATION_READ_COMMITTED   = 1
+
 -- Error codes. Keep numeric so non-Lua clients can switch on them.
 M.ERR_BAD_FRAME            = 1
 M.ERR_UNKNOWN_OP           = 2
@@ -254,9 +261,11 @@ end
 -- and the per-field max-length constants are declared. Lua forward
 -- references to `local` bindings don't work, hence the placement.
 
-function M.encode_fetch(correl_id, topic, group_id, max_records)
+-- isolation (optional) is an ISOLATION_* byte; omitted/0 = read_uncommitted.
+function M.encode_fetch(correl_id, topic, group_id, max_records, isolation)
     local payload = encode_string(topic) .. encode_string(group_id)
         .. string.pack(">I4", max_records)
+        .. string.pack(">B", isolation or M.ISOLATION_READ_UNCOMMITTED)
     return encode_frame(M.OP_FETCH, correl_id, payload)
 end
 
@@ -269,8 +278,10 @@ function M.encode_record(correl_id, topic, partition, offset, timestamp, key, va
     return encode_frame(M.OP_RECORD, correl_id, payload)
 end
 
-function M.encode_subscribe(correl_id, topic, group_id)
+-- isolation (optional) is an ISOLATION_* byte; omitted/0 = read_uncommitted.
+function M.encode_subscribe(correl_id, topic, group_id, isolation)
     local payload = encode_string(topic) .. encode_string(group_id)
+        .. string.pack(">B", isolation or M.ISOLATION_READ_UNCOMMITTED)
     return encode_frame(M.OP_SUBSCRIBE, correl_id, payload)
 end
 
@@ -476,9 +487,14 @@ end
 function M.decode_subscribe(payload)
     local topic, p, err = decode_string(payload, 1, MAX_TOPIC_NAME)
     if not topic then return nil, err end
-    local group, _, gerr = decode_string(payload, p, MAX_GROUP_ID)
+    local group, p2, gerr = decode_string(payload, p, MAX_GROUP_ID)
     if not group then return nil, gerr end
-    return { topic = topic, group_id = group }, nil
+    -- Optional trailing isolation byte (older clients don't send it).
+    local isolation = M.ISOLATION_READ_UNCOMMITTED
+    if p2 and #payload - p2 + 1 >= 1 then
+        isolation = string.unpack(">B", payload, p2)
+    end
+    return { topic = topic, group_id = group, isolation = isolation }, nil
 end
 
 function M.decode_fetch(payload)
@@ -487,10 +503,17 @@ function M.decode_fetch(payload)
     local group, p2, gerr = decode_string(payload, p, MAX_GROUP_ID)
     if not group then return nil, gerr end
     if #payload - p2 + 1 < 4 then return nil, "short fetch" end
+    local max_records, p3 = string.unpack(">I4", payload, p2)
+    -- Optional trailing isolation byte (older clients don't send it).
+    local isolation = M.ISOLATION_READ_UNCOMMITTED
+    if #payload - p3 + 1 >= 1 then
+        isolation = string.unpack(">B", payload, p3)
+    end
     return {
         topic       = topic,
         group_id    = group,
-        max_records = string.unpack(">I4", payload, p2),
+        max_records = max_records,
+        isolation   = isolation,
     }, nil
 end
 

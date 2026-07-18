@@ -1,7 +1,8 @@
 # Transactions in MoonMQ
 
-Status: **atomic multi-partition transactions shipped** (2026-07-10), building on
-the session-scoped idempotent producer (2026-06-21) and durable consumer offsets.
+Status: **read_committed isolation + Last Stable Offset shipped** (2026-07-18),
+completing the exactly-once story on top of atomic multi-partition transactions
+(2026-07-10) and the session-scoped idempotent producer (2026-06-21).
 
 What now ships:
 
@@ -17,17 +18,39 @@ What now ships:
   ABORT markers and drops the offsets. State lives in the internal
   `__transaction_state` topic and is re-driven idempotently on crash recovery
   (ONGOING → abort, PREPARE_COMMIT → roll forward).
-
-What is still **deferred** (see §2): `read_committed` consumer isolation and the
-Last Stable Offset. Consumers currently read every record — including data
-records from aborted transactions; only the COMMIT/ABORT control markers are
-hidden from consumers. That is the accepted trade-off for this phase.
+- **`read_committed` isolation + Last Stable Offset** (2026-07-18). How it fits
+  together:
+  * Transactional data records carry the producer session in the record header
+    (`ATTR_TXN` bit + pid/epoch — see `src/record/message.lua`), so a reader
+    can attribute any record to its transaction.
+  * The produce path enrols a partition with the coordinator BEFORE the
+    transaction's first append there, capturing the partition's LEO as the
+    txn's `first_offset` — the lower bound of everything it writes there.
+  * **LSO** = min `first_offset` over unresolved transactions touching the
+    partition (`Coordinator:lso`); a `read_committed` consumer never reads at
+    or past it, so every record it does read belongs to a resolved txn.
+  * On abort, the coordinator durably records the range
+    `[first_offset, abort_marker)` per participant in the **abort index**
+    (`src/broker/abort_index.lua`, `<data_dir>/txn-aborts.json`); below the
+    LSO, records matching an aborted `(pid, epoch, range)` are filtered out.
+    Entries are pruned once retention deletes their whole range.
+  * On the wire, `FETCH`/`SUBSCRIBE` take an optional trailing isolation byte
+    (0 = read_uncommitted — the default, and what old clients send; 1 =
+    read_committed). The Lua client: `Client.new{ isolation = "read_committed" }`.
+  * Boundary: transactional produce to a partition owned by a peer broker is
+    refused (`Producer:produce`) — markers could not be written on the owner.
+  * Boundary: abort-index ranges are offset-based, so they assume offsets are
+    stable — true on the segmented backend (the default for user topics; its
+    retention deletes whole segments without renumbering). Don't run
+    transactions against a `commitlog`-backend topic with
+    `cleanup_policy=compact`: compaction renumbers surviving records, which
+    would break the aborted-range filter.
 
 This document records:
 
-1. What ships today (idempotent producer + atomic transactions).
-2. What is intentionally NOT in scope today (`read_committed` / LSO).
-3. The original design surface, retained for the deferred isolation work.
+1. What ships today.
+2. What is intentionally NOT in scope today.
+3. The original design surface, retained for context.
 
 ---
 
@@ -116,10 +139,8 @@ local replay = c:produce_at_seq("orders", "key-1", "value-1", 0)
 
 Still deferred:
 
-- `read_committed` consumer isolation level.
-- Last Stable Offset (LSO) tracking on partitions.
-- Filtering aborted records out at read time (needs LSO + read_committed).
 - PID expiry / garbage-collecting idle producer state.
+- Transactional produce to a partition owned by a peer broker (cluster mode).
 
 Now implemented (were previously out of scope):
 
@@ -128,13 +149,17 @@ Now implemented (were previously out of scope):
 - Transactional offset-commit (`TXN_OFFSET_COMMIT`, applied on commit).
 - `__transaction_state` coordinator topic + crash recovery.
 - PID generation epochs and producer fencing across reconnects.
+- `read_committed` consumer isolation level (2026-07-18).
+- Last Stable Offset (LSO) tracking on partitions (2026-07-18).
+- Filtering aborted records out at read time via the durable abort index
+  (2026-07-18).
 
 ---
 
-## 3. Deferred design: full Kafka-style transactions
+## 3. Original design: full Kafka-style transactions
 
-The prerequisites below have since landed and are noted for context; the
-remaining deferred work is `read_committed` isolation + LSO (see §2).
+Everything below has since landed (including `read_committed` + LSO as of
+2026-07-18); the section is retained as the design rationale.
 
 - **Consumer subsystem.** `commit_offset` / `load_offset` are now durable
   (`src/broker/consumer.lua` → `OffsetManager`).

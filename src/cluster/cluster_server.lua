@@ -9,8 +9,18 @@
 --   GET  /cluster/leo?topic=T&partition=N                → 200 {"offset":LEO}
 --   POST /cluster/owner    json {topic, partition, owner}→ 200 {"ok":true}
 --       Record an ownership change in the local assignments table.
+--   POST /cluster/offsets  json {topic, partition, offsets:{group:offset}}
+--       Apply committed consumer offsets migrated with a partition
+--       (higher-wins per group)                       → 200 {"ok":true,"applied":N}
 --   GET  /cluster/loads                                  → 200 {"broker_id":..,"loads":[..]}
 --       Per-partition disk bytes, feeding peers' autobalancer models.
+--   POST /cluster/controller/claim  json {epoch, broker_id}
+--       Record a controller claim                        → 200 {"accepted":bool,"highest":N}
+--
+-- Mutating routes (append/ensure/owner/offsets) honour optional
+-- X-Controller-Epoch / X-Controller-Id headers: a request from a controller
+-- this broker knows to be superseded is refused with 409 (see
+-- src/cluster/controller_fence.lua). Requests without the headers pass.
 --
 -- HTTP/1.1, Connection: close. Binds 127.0.0.1 by default. When opts.token is
 -- set, every request must carry a matching X-Cluster-Token — set it whenever
@@ -21,6 +31,7 @@ local json   = require("dkjson")
 local msg_m  = require("src.record.message")
 local httpk  = require("src.server.http_kit")
 local util_m = require("src.core.util")
+local ControllerFence = require("src.cluster.controller_fence")
 local log    = require("src.log.logger").get("cluster_server")
 
 local M = {}
@@ -32,14 +43,25 @@ local MAX_BODY       = 8 * 1024 * 1024
 local MAX_PARTITIONS = 1024   -- same bound CREATE_TOPIC enforces on the wire
 
 function M.new(opts)
+    local broker = assert(opts.broker, "broker required")
+    -- Controller fencing (see src/cluster/controller_fence.lua). Share the
+    -- instance with the balance loop when the caller passes one; otherwise
+    -- build our own over the broker's data dir.
+    local fence = opts.fence
+    if not fence then
+        local f, ferr = ControllerFence.new(broker.topic_manager.baseDir)
+        if not f then error("controller fence: " .. tostring(ferr)) end
+        fence = f
+    end
     return setmetatable({
         reactor     = assert(opts.reactor, "reactor required"),
-        broker      = assert(opts.broker, "broker required"),
+        broker      = broker,
         assignments = assert(opts.assignments, "assignments required"),
         broker_id   = assert(opts.broker_id, "broker_id required"),
         host        = opts.host or "127.0.0.1",
         port        = assert(opts.port, "port required"),
         token       = opts.token,
+        fence       = fence,
     }, M)
 end
 
@@ -88,7 +110,9 @@ end
 
 -- Apply 1..N concatenated serialized records to (topic, partition), in order.
 -- One request_sync at the end so a migration batch costs one fsync, not N.
-function M:_append(topic_name, partition_id, payload)
+-- `forwarded` marks the batch as forwarded produce traffic (X-Forwarded-Produce)
+-- — counted into this broker's NW_IN feed; migration copies are not.
+function M:_append(topic_name, partition_id, payload, forwarded)
     local topic, terr = self.broker:get_topic(topic_name)
     if not topic then return 404, "append: " .. tostring(terr) end
     local part = topic.partitions[partition_id]
@@ -106,6 +130,9 @@ function M:_append(topic_name, partition_id, payload)
 
         local _, werr = part:write_message(msg)
         if werr then return 500, "append: write: " .. tostring(werr) end
+        if forwarded and self.broker.traffic then
+            self.broker.traffic:add_in(topic_name, partition_id, #msg.key + #msg.value)
+        end
         applied = applied + 1
         pos = pos + 8 + total_size
     end
@@ -142,18 +169,90 @@ function M:_owner(body)
     return 200, { ok = true }
 end
 
+-- Record (and answer) a controller claim. Always 200; `accepted` tells the
+-- claimant whether it holds the crown here, `highest` what this broker has
+-- seen — a rejected claimant reads it to know what it was superseded by.
+function M:_claim(body)
+    local req = json.decode(body or "")
+    if type(req) ~= "table" or type(req.epoch) ~= "number"
+        or type(req.broker_id) ~= "string" then
+        return 400, "claim: need {epoch, broker_id}"
+    end
+    local ok, err = self.fence:observe(req.epoch, req.broker_id)
+    local highest = self.fence:highest()
+    if ok then
+        log:info("controller claim accepted: epoch %d by %s", req.epoch, req.broker_id)
+        return 200, { accepted = true, highest = highest }
+    end
+    log:warn("controller claim rejected: epoch %d by %s (%s)",
+        req.epoch, req.broker_id, tostring(err))
+    return 200, { accepted = false, highest = highest, reason = err }
+end
+
+-- Fence a mutating request that carries controller headers. Requests without
+-- the headers (older peers, hand-driven reassignment) pass — the fence only
+-- arbitrates between brokers that participate in claiming. Returns (true) or
+-- (nil, err).
+function M:_check_fence(headers)
+    local epoch = httpk.header(headers, "X%-Controller%-Epoch")
+    if not epoch then return true end
+    local id = httpk.header(headers, "X%-Controller%-Id")
+    return self.fence:observe(tonumber(epoch), id)
+end
+
+-- Apply committed consumer offsets pushed by the source broker of a partition
+-- migration. Higher-wins: an offset this broker already advanced past (a group
+-- consuming here since the cutover) is never rolled back.
+function M:_offsets(body)
+    local req = json.decode(body or "")
+    if type(req) ~= "table" or type(req.topic) ~= "string"
+        or type(req.partition) ~= "number" or type(req.offsets) ~= "table" then
+        return 400, "offsets: need {topic, partition, offsets}"
+    end
+    local applied, failed = 0, 0
+    for group, offset in pairs(req.offsets) do
+        if type(group) == "string" and type(offset) == "number" then
+            local existing = self.broker:fetch_offset(group, req.topic, req.partition)
+            if existing == nil or offset > existing then
+                local ok, cerr = self.broker:commit_offset(
+                    group, req.topic, req.partition, offset)
+                if ok then
+                    applied = applied + 1
+                else
+                    failed = failed + 1
+                    log:error("offsets: commit %s %s/partition-%d=%d failed: %s",
+                        group, req.topic, req.partition, offset, tostring(cerr))
+                end
+            end
+        end
+    end
+    if failed > 0 then
+        return 500, string.format("offsets: %d commit(s) failed", failed)
+    end
+    log:info("offsets: applied %d migrated offset(s) for %s/partition-%d",
+        applied, req.topic, req.partition)
+    return 200, { ok = true, applied = applied }
+end
+
 function M:_loads()
     local loads = {}
+    local traffic = self.broker.traffic
     for name, topic in pairs(self.broker.topic_manager.topics) do
         if name:sub(1, 2) ~= "__" then   -- internal topics never rebalance
             for _, p in ipairs(topic.partitions) do
                 -- Only partitions this broker owns: a moved-away partition's
                 -- leftover local data must not count as our load.
                 if self.assignments:owned_by_self(name, p.id) then
+                    local bin, bout = 0, 0
+                    if traffic then bin, bout = traffic:totals(name, p.id) end
                     loads[#loads + 1] = {
-                        topic      = name,
-                        partition  = p.id,
-                        disk_bytes = p.offset or 0,
+                        topic          = name,
+                        partition      = p.id,
+                        disk_bytes     = p.offset or 0,
+                        -- Cumulative counters; the balance loop differences
+                        -- successive reports into NW_IN/NW_OUT byte rates.
+                        bytes_in_total  = bin,
+                        bytes_out_total = bout,
                     }
                 end
             end
@@ -172,9 +271,23 @@ function M:_handle(sock)
     local method, path, query = httpk.request_line(headers)
     local clen = tonumber(httpk.header(headers, "Content%-Length")) or 0
 
+    -- Mutating routes are controller-fenced when the request carries an epoch.
+    local MUTATING = {
+        ["/cluster/append"]  = true,
+        ["/cluster/ensure"]  = true,
+        ["/cluster/owner"]   = true,
+        ["/cluster/offsets"] = true,
+    }
+
     local status, out
+    local fence_ok, fence_err = true, nil
+    if method == "POST" and MUTATING[path] then
+        fence_ok, fence_err = self:_check_fence(headers)
+    end
     if not token_ok(self.token, httpk.header(headers, "X%-Cluster%-Token")) then
         status, out = 401, "bad or missing X-Cluster-Token"
+    elseif not fence_ok then
+        status, out = 409, "fenced: " .. tostring(fence_err)
     elseif method == "POST" and path == "/cluster/append" then
         local topic     = httpk.header(headers, "X%-Topic")
         local partition = tonumber(httpk.header(headers, "X%-Partition"))
@@ -186,16 +299,23 @@ function M:_handle(sock)
             if not payload then
                 status, out = 400, "append: body: " .. tostring(berr)
             else
-                status, out = self:_append(topic, partition, payload)
+                local forwarded =
+                    httpk.header(headers, "X%-Forwarded%-Produce") ~= nil
+                status, out = self:_append(topic, partition, payload, forwarded)
             end
         end
-    elseif method == "POST" and (path == "/cluster/ensure" or path == "/cluster/owner") then
+    elseif method == "POST" and (path == "/cluster/ensure" or path == "/cluster/owner"
+        or path == "/cluster/offsets" or path == "/cluster/controller/claim") then
         local body, berr = httpk.read_body(
             self.reactor, sock, leftover, clen, deadline, MAX_BODY)
         if not body then
             status, out = 400, "body: " .. tostring(berr)
         elseif path == "/cluster/ensure" then
             status, out = self:_ensure(body)
+        elseif path == "/cluster/offsets" then
+            status, out = self:_offsets(body)
+        elseif path == "/cluster/controller/claim" then
+            status, out = self:_claim(body)
         else
             status, out = self:_owner(body)
         end

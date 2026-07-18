@@ -42,6 +42,7 @@ local Router           = require("src.cluster.router")
 local Reassigner       = require("src.cluster.reassigner")
 local ClusterServer    = require("src.cluster.cluster_server")
 local BalanceLoop      = require("src.cluster.balance_loop")
+local ControllerFence  = require("src.cluster.controller_fence")
 local log              = require("src.log.logger").get("server")
 
 -- acks mode names accepted from config (Server.Acks).
@@ -178,6 +179,12 @@ function Server.new(opts)
         local assignments, aerr = Assignments.new(opts.data_dir, cc.broker_id)
         if not assignments then return nil, aerr end
 
+        -- Controller fence, shared between the cluster endpoint (which uses it
+        -- to reject mutations from a superseded controller) and the balance
+        -- loop (which claims an epoch through it).
+        local fence, ferr = ControllerFence.new(opts.data_dir)
+        if not fence then return nil, ferr end
+
         local peers = {}
         for _, p in ipairs(cc.peers or {}) do
             peers[p.id] = Peer.new(p.id, p.address,
@@ -204,6 +211,7 @@ function Server.new(opts)
             host  = cc.host or "127.0.0.1",
             port  = cc.port,          -- nil = endpoint off (client-only node)
             token = cc.token,
+            fence = fence,
         }
     end
 
@@ -504,6 +512,7 @@ function Server:start()
             host        = self.cluster.host,
             port        = self.cluster.port,
             token       = self.cluster.token,
+            fence       = self.cluster.fence,
         })
         cs:start()
     end
@@ -523,6 +532,7 @@ function Server:start()
                 peers       = self.cluster.peers,
                 self_id     = self.cluster.broker_id,
                 reassigner  = self.cluster.reassigner,
+                fence       = self.cluster.fence,
                 interval_s  = ac.interval_s,
                 dry_run     = ac.dry_run,
                 goals       = ac.goals,

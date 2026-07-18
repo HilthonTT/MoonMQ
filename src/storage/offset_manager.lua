@@ -184,6 +184,20 @@ function OffsetManager:fetch(group, topic, partition)
     local t = g[topic];        if not t then return nil end
     return t[partition]
 end
+
+-- offsets_for_partition returns every group's committed offset for one
+-- (topic, partition), as { [group] = offset }. The reassignment layer uses it
+-- to ship a moved partition's consumer positions to the new owner.
+function OffsetManager:offsets_for_partition(topic, partition)
+    local out = {}
+    for group, topics in pairs(self.map) do
+        local t = topics[topic]
+        if t and t[partition] ~= nil then
+            out[group] = t[partition]
+        end
+    end
+    return out
+end
  
 -- recover replays every internal partition front-to-back, rebuilding the map
 -- (last write per key wins). It walks records via part:scan, NOT by iterating

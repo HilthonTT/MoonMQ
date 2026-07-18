@@ -15,6 +15,7 @@ local Reassigner   = require("src.cluster.reassigner")
 local Router       = require("src.cluster.router")
 local BalanceLoop  = require("src.cluster.balance_loop")
 local Action       = require("src.autobalancer.common.action")
+local Resource     = require("src.autobalancer.common.resource")
 
 local BASE = os_utils.IS_WINDOWS and "C:\\Temp\\moonmq_cluster_test"
     or "/tmp/moonmq_cluster_test"
@@ -43,8 +44,8 @@ local function local_peer(node)
             if not out then return nil, err end
             return true
         end,
-        append = function(_, topic, partition, payload)
-            local out, err = unwrap(cs:_append(topic, partition, payload))
+        append = function(_, topic, partition, payload, forwarded)
+            local out, err = unwrap(cs:_append(topic, partition, payload, forwarded))
             if not out then return nil, err end
             return out.offset
         end,
@@ -59,6 +60,12 @@ local function local_peer(node)
                 json.encode({ topic = topic, partition = partition, owner = owner })))
             if not out then return nil, err end
             return true
+        end,
+        push_offsets = function(_, topic, partition, offsets)
+            local out, err = unwrap(cs:_offsets(json.encode(
+                { topic = topic, partition = partition, offsets = offsets })))
+            if not out then return nil, err end
+            return out.applied
         end,
         loads = function(_)
             local out, err = unwrap(cs:_loads())
@@ -254,6 +261,65 @@ describe("reassigner MOVE", function()
     end)
 end)
 
+describe("offset migration on MOVE", function()
+    before_each(function() rmdir(BASE) end)
+
+    it("ships committed offsets to the new owner", function()
+        local a, b = make_cluster()
+        assert(a.broker:create_topic("orders", 1))
+        produce_n(a, "orders", 5)
+
+        -- Consume 3 records on A; auto-commit persists the position.
+        local c = consumer_m.Consumer.new(a.broker, "g1")
+        assert(c:subscribe("orders"))
+        for _ = 1, 3 do assert(c:poll()) end
+        local committed = a.broker:fetch_offset("g1", "orders", 1)
+        assert.is_number(committed)
+        assert.is_true(committed > 0)
+
+        assert.is_true(a.reassigner:_move("orders", 1, "B"))
+
+        -- B now holds g1's position; a consumer there resumes, not restarts.
+        assert.are.equal(committed, b.broker:fetch_offset("g1", "orders", 1))
+        local cb = consumer_m.Consumer.new(b.broker, "g1")
+        assert(cb:subscribe("orders"))
+        local seen = {}
+        for _ = 1, 10 do
+            for _, r in ipairs(assert(cb:poll())) do seen[#seen + 1] = r.value end
+        end
+        assert.are.same({ "v4", "v5" }, seen)
+    end)
+
+    it("never rolls back a higher offset already committed on the dest", function()
+        local a, b = make_cluster()
+        assert(a.broker:create_topic("orders", 1))
+        produce_n(a, "orders", 3)
+
+        local c = consumer_m.Consumer.new(a.broker, "g1")
+        assert(c:subscribe("orders"))
+        assert(c:poll())   -- commit a small offset on A
+        local a_committed = a.broker:fetch_offset("g1", "orders", 1)
+
+        -- Simulate the group having advanced further on B already.
+        assert(b.broker:create_topic("orders", 1))
+        assert(b.broker:commit_offset("g1", "orders", 1, a_committed + 1000))
+
+        -- Push A's (lower) snapshot directly: dest keeps the higher value.
+        local applied = assert(a.peers.B:push_offsets("orders", 1,
+            { g1 = a_committed }))
+        assert.are.equal(0, applied)
+        assert.are.equal(a_committed + 1000, b.broker:fetch_offset("g1", "orders", 1))
+    end)
+
+    it("moves with no committed offsets still succeed", function()
+        local a, b = make_cluster()
+        assert(a.broker:create_topic("orders", 1))
+        produce_n(a, "orders", 2)
+        assert.is_true(a.reassigner:_move("orders", 1, "B"))
+        assert.is_nil(b.broker:fetch_offset("nobody", "orders", 1))
+    end)
+end)
+
 describe("produce routing after a move", function()
     before_each(function() rmdir(BASE) end)
 
@@ -355,6 +421,48 @@ describe("balance loop", function()
             if t and t.partitions[1].offset > 0 then moved = moved + 1 end
         end
         assert.are.equal(2, moved)
+    end)
+
+    it("feeds NW_IN/NW_OUT byte rates from the traffic counters", function()
+        local a, _ = make_cluster()
+        assert(a.broker:create_topic("t1", 1))
+        produce_n(a, "t1", 2)
+
+        local loop = loop_for(a, { dry_run = true })
+        assert(loop:tick())
+        -- First pass only primes the baselines: no rate samples yet.
+        local snap1 = loop.ab.model:snapshot()
+        assert.are.equal(0, snap1:broker_load("A", Resource.NW_IN))
+
+        -- Traffic lands between passes; the next tick differences the
+        -- cumulative counters into rates.
+        a.broker.traffic:add_in("t1", 1, 10 * 1024 * 1024)
+        a.broker.traffic:add_out("t1", 1, 5 * 1024 * 1024)
+        assert(loop:tick())
+
+        local snap2 = loop.ab.model:snapshot()
+        assert.is_true(snap2:broker_load("A", Resource.NW_IN) > 0)
+        assert.is_true(snap2:broker_load("A", Resource.NW_OUT) > 0)
+        assert.is_true(snap2:broker_load("A", Resource.NW_IN)
+            > snap2:broker_load("A", Resource.NW_OUT))
+    end)
+
+    it("counts produce bytes locally and on the forwarding owner", function()
+        local a, b = make_cluster()
+        assert(a.broker:create_topic("orders", 1))
+        produce_n(a, "orders", 1)
+        local bin = a.broker.traffic:totals("orders", 1)
+        assert.is_true(bin > 0)
+
+        -- After a move, produces on A are forwarded: the OWNER (B) counts
+        -- them as produce traffic; the migration copy itself is not counted.
+        assert.is_true(a.reassigner:_move("orders", 1, "B"))
+        local b_bin_after_move = b.broker.traffic:totals("orders", 1)
+        assert.are.equal(0, b_bin_after_move)
+
+        assert(a.producer:produce("orders", msg_m.Message.new("k", "forwarded", 0)))
+        local b_bin = b.broker.traffic:totals("orders", 1)
+        assert.is_true(b_bin > 0)
     end)
 
     it("marks an unreachable peer inactive instead of failing the pass", function()

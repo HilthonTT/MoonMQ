@@ -5,6 +5,7 @@ local util_m     = require("src.core.util")
 local offmgr_m   = require("src.storage.offset_manager")
 local prodstate_m = require("src.storage.producer_state")
 local txn_m      = require("src.broker.txn_coordinator")
+local traffic_m  = require("src.metrics.traffic")
 local uuid = require("src.core.uuid")
 
 local Broker = {}
@@ -30,6 +31,9 @@ function Broker.new(data_dir, opts)
     local broker = setmetatable({
         id = uuid.bytes(),
         topic_manager = topic_manager,
+        -- Per-partition produce/consume byte counters, feeding the
+        -- autobalancer's network goals (see src/metrics/traffic.lua).
+        traffic = traffic_m.new(),
     }, Broker)
 
     local lerr = broker:load_topics()
@@ -204,6 +208,11 @@ function Broker:tick_cleaners()
             for _, p in ipairs(topic.partitions) do
                 if p.tick_cleaner and p:tick_cleaner() then
                     ran = ran + 1
+                    -- Retention just ran: drop aborted-transaction index
+                    -- entries whose whole range aged out with the segments.
+                    if self.transactions and p.oldest_offset then
+                        self.transactions.aborts:prune(name, p.id, p:oldest_offset())
+                    end
                 end
             end
         end

@@ -48,6 +48,13 @@ function Client.new(opts)
         -- transparently). Defaults to none.
         compression = CODEC_BY_NAME[tostring(opts.compression or "none"):lower()]
                       or msg_m.CODEC_NONE,
+        -- Consumer isolation level, applied to every fetch/subscribe from this
+        -- client. "read_committed" hides records of aborted/unresolved
+        -- transactions (the broker stops at the Last Stable Offset).
+        isolation = (tostring(opts.isolation or "read_uncommitted"):lower()
+                     == "read_committed")
+                    and proto.ISOLATION_READ_COMMITTED
+                    or proto.ISOLATION_READ_UNCOMMITTED,
         next_seq = {},  -- topic -> next u32 seq to send
         -- Consumer-group membership, populated by join_group(). The
         -- broker-assigned member_id is reused by group_heartbeat/leave_group
@@ -296,7 +303,7 @@ end
 function Client:fetch(topic, group, max_records)
     max_records = max_records or 100
     local correl = uuid.bytes()
-    local data = proto.encode_fetch(correl, topic, group, max_records)
+    local data = proto.encode_fetch(correl, topic, group, max_records, self.isolation)
     local ok, err = self:_write(data)
     if not ok then return nil, err end
 
@@ -320,7 +327,8 @@ end
 
 function Client:subscribe(topic, group)
     local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_subscribe(correl, topic, group))
+    local ok, err = self:_write(
+        proto.encode_subscribe(correl, topic, group, self.isolation))
     if not ok then return nil, err end
  
     local op, _, payload, rerr = self:_read_until(correl)

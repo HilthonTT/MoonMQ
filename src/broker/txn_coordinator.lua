@@ -18,8 +18,9 @@
 -- Lifecycle:  EMPTY → ONGOING → PREPARE_{COMMIT,ABORT} → COMPLETE_{COMMIT,ABORT}
 -- A COMPLETE_* txn can begin again (same id, next txn), returning to ONGOING.
 
-local msg_m = require("src.record.message")
-local log   = require("src.log.logger").get("txn_coordinator")
+local msg_m      = require("src.record.message")
+local AbortIndex = require("src.broker.abort_index")
+local log        = require("src.log.logger").get("txn_coordinator")
 
 local STATE_TOPIC = "__transaction_state"
 local DEFAULT_PARTITIONS = 16
@@ -78,10 +79,16 @@ function Coordinator.new(broker, opts)
         topic = created
     end
 
+    -- Durable aborted-range index, keyed per partition. Lives beside the
+    -- topic dirs in the broker's data dir.
+    local aborts, aerr = AbortIndex.new(topic_manager.baseDir)
+    if not aborts then return nil, aerr end
+
     local self = setmetatable({
         broker = broker,
         topic  = topic,
         nparts = #topic.partitions,
+        aborts = aborts,
         txns   = {},   -- txn_id -> { pid, epoch, state, participants, pending_offsets }
     }, Coordinator)
 
@@ -99,6 +106,9 @@ end
 -- ---- durable encode/decode of a txn record --------------------------------
 
 -- Durable txn record value: pid(8) epoch(2) state(1) | participants | offsets.
+-- Each participant carries first_offset — the partition LEO captured when the
+-- txn enrolled it (i.e. before the txn's first append there). It bounds both
+-- the LSO and the aborted range recorded on abort.
 local TXN_HEAD_FMT = ">I8I2B"
 
 local function encode_txn(t)
@@ -109,7 +119,7 @@ local function encode_txn(t)
     parts[#parts + 1] = string.pack(">I4", #plist)
     for _, p in ipairs(plist) do
         parts[#parts + 1] = string.pack(">s2", p.topic)
-        parts[#parts + 1] = string.pack(">I4", p.partition)
+        parts[#parts + 1] = string.pack(">I4I8", p.partition, p.first_offset or 0)
     end
     -- pending offsets
     parts[#parts + 1] = string.pack(">I4", #t.pending_offsets)
@@ -126,11 +136,11 @@ local function decode_txn(bytes)
                 participants = {}, pending_offsets = {} }
     local pcount; pcount, pos = string.unpack(">I4", bytes, pos)
     for _ = 1, pcount do
-        local topic, partition
+        local topic, partition, first_offset
         topic, pos = string.unpack(">s2", bytes, pos)
-        partition, pos = string.unpack(">I4", bytes, pos)
+        partition, first_offset, pos = string.unpack(">I4I8", bytes, pos)
         t.participants[topic .. "\0" .. partition] =
-            { topic = topic, partition = partition }
+            { topic = topic, partition = partition, first_offset = first_offset }
     end
     local ocount; ocount, pos = string.unpack(">I4", bytes, pos)
     for _ = 1, ocount do
@@ -201,9 +211,13 @@ function Coordinator:begin(txn_id, pid, epoch)
 end
 
 -- add_partition registers (topic, partition) as a participant. Called from the
--- produce path on a fresh transactional append. Only persists when the
--- participant set actually grows, so repeated produces to the same partition
--- don't amplify writes. Returns (true, nil) or (nil, err, code).
+-- produce path BEFORE the transaction's first append to that partition — the
+-- partition's current LEO is captured as first_offset, which lower-bounds every
+-- record this txn will write there. That ordering is what makes the LSO and
+-- the aborted-range filter conservative-but-correct: registering after the
+-- append would leave the first record outside the recorded range. Only persists
+-- when the participant set actually grows, so repeated produces to the same
+-- partition don't amplify writes. Returns (true, nil) or (nil, err, code).
 function Coordinator:add_partition(txn_id, pid, epoch, topic, partition)
     local t = self.txns[txn_id]
     if not t or t.state ~= S.ONGOING then
@@ -214,7 +228,14 @@ function Coordinator:add_partition(txn_id, pid, epoch, topic, partition)
 
     local key = topic .. "\0" .. partition
     if t.participants[key] then return true end   -- already tracked
-    t.participants[key] = { topic = topic, partition = partition }
+
+    local first_offset = 0
+    local tp = self.broker.topic_manager.topics[topic]
+    local part = tp and tp.partitions[partition]
+    if part then first_offset = part.offset or 0 end
+
+    t.participants[key] =
+        { topic = topic, partition = partition, first_offset = first_offset }
     local ok, err = self:_persist(txn_id)
     if not ok then return nil, err end
     return true
@@ -243,30 +264,31 @@ end
 -- Write a COMMIT/ABORT control marker to one participant partition. A missing
 -- topic/partition (shouldn't happen — topic deletion isn't supported) is
 -- logged and treated as success; an actual WRITE failure is returned so the
--- transaction is not marked complete with markers missing. Returns (true, nil)
--- or (nil, err).
+-- transaction is not marked complete with markers missing. Returns
+-- (true, marker_offset_or_nil) or (nil, err) — the offset lets the abort path
+-- record the aborted range's upper bound.
 function Coordinator:_write_marker(participant, marker, pid, epoch)
     local topic = self.broker.topic_manager.topics[participant.topic]
     if not topic then
         log:warn("participant topic %s vanished; skipping marker", participant.topic)
-        return true
+        return true, nil
     end
     local part = topic.partitions[participant.partition]
     if not part then
         log:warn("participant %s/partition-%d vanished; skipping marker",
             participant.topic, participant.partition)
-        return true
+        return true, nil
     end
     local value = string.pack(CONTROL_VALUE_FMT, marker, pid, epoch)
     -- Control record: attrs control bit set, empty key.
     local rec = msg_m.Message.new("", value, os.time() * 1000, msg_m.ATTR_CONTROL)
-    local _, werr = part:write_message(rec)
+    local moffset, werr = part:write_message(rec)
     if werr then
         return nil, string.format("marker write to %s/partition-%d failed: %s",
             participant.topic, participant.partition, tostring(werr))
     end
     if part.request_sync then part:request_sync() end
-    return true
+    return true, moffset
 end
 
 -- _finish drives the second half of a commit/abort: write markers to every
@@ -284,11 +306,24 @@ function Coordinator:_finish(txn_id, commit)
     local marker = commit and MARKER_COMMIT or MARKER_ABORT
 
     for _, p in pairs(t.participants) do
-        local ok, err = self:_write_marker(p, marker, t.pid, t.epoch)
+        local ok, moffset_or_err = self:_write_marker(p, marker, t.pid, t.epoch)
         if not ok then
             log:error("txn %s: %s (left in %s for retry/recovery)",
-                txn_id, err, S_NAME[t.state])
-            return nil, err
+                txn_id, moffset_or_err, S_NAME[t.state])
+            return nil, moffset_or_err
+        end
+        -- On abort, durably record the aborted range [first_offset, marker)
+        -- so read_committed consumers can filter this txn's data records.
+        -- Failing to persist it must NOT complete the txn — the records would
+        -- become permanently visible — so it's treated like a marker failure.
+        if not commit and moffset_or_err ~= nil then
+            local aok, aerr = self.aborts:add(p.topic, p.partition,
+                t.pid, t.epoch, p.first_offset or 0, moffset_or_err)
+            if not aok then
+                log:error("txn %s: %s (left in %s for retry/recovery)",
+                    txn_id, aerr, S_NAME[t.state])
+                return nil, aerr
+            end
         end
     end
 
@@ -351,6 +386,36 @@ end
 
 -- current exposes a txn's durable snapshot (for tests/observability).
 function Coordinator:current(txn_id) return self.txns[txn_id] end
+
+-- ---- read_committed queries ------------------------------------------------
+
+-- lso returns the Last Stable Offset for (topic, partition): the smallest
+-- first_offset among transactions that are still unresolved (ONGOING or
+-- PREPARE_* — their markers aren't all durable yet) and enrolled this
+-- partition. Every record below the LSO belongs to a resolved transaction
+-- (or none), so a read_committed consumer may read up to it, filtering
+-- aborted ranges via is_aborted. Returns nil when no unresolved transaction
+-- touches the partition — the caller should then use the log-end offset.
+function Coordinator:lso(topic, partition)
+    local key = topic .. "\0" .. partition
+    local min
+    for _, t in pairs(self.txns) do
+        if t.state ~= S.COMPLETE_COMMIT and t.state ~= S.COMPLETE_ABORT then
+            local p = t.participants[key]
+            if p and (min == nil or (p.first_offset or 0) < min) then
+                min = p.first_offset or 0
+            end
+        end
+    end
+    return min
+end
+
+-- is_aborted reports whether the transactional data record at `offset` of
+-- (topic, partition), written by producer session (pid, epoch), belongs to an
+-- aborted transaction. Only meaningful below the LSO.
+function Coordinator:is_aborted(topic, partition, pid, epoch, offset)
+    return self.aborts:is_aborted(topic, partition, pid, epoch, offset)
+end
 
 -- ---- crash recovery --------------------------------------------------------
 

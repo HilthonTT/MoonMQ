@@ -10,7 +10,9 @@
 --               produce router forwards new records for this partition to D
 --   4. drain    copy any records that landed locally during step 2 (the
 --               copy loop yields between batches, so produces can interleave)
---   5. confirm  tell D it owns the partition (clears any stale entry there)
+--   5. offsets  push every group's committed offset for the partition to D
+--               (higher-wins there), so consumers resume in place
+--   6. confirm  tell D it owns the partition (clears any stale entry there)
 --
 -- The cutover (step 3) is exact under the cooperative reactor: once the
 -- ownership entry says D, no new local write can begin, so the drain loop
@@ -22,10 +24,10 @@
 --     on the broker you want acting as controller.
 --   * The destination partition must be empty: records keep their byte
 --     offsets only when D appends from zero.
---   * Committed consumer offsets do NOT migrate (they live in the source
---     broker's __consumer_offsets); groups re-consume from their configured
---     start on D. Local data is left in place after a move — the ownership
---     table is what routes around it.
+--   * Local data is left in place after a move — the ownership table is what
+--     routes around it. Committed consumer offsets DO migrate (step 5); only
+--     if the offsets push fails do groups re-consume from their configured
+--     start on D.
 
 local Action  = require("src.autobalancer.common.action")
 local metrics = require("src.metrics")
@@ -161,7 +163,31 @@ function Reassigner:_move(topic_name, partition_id, dest_id)
         return nil, string.format("tail drain failed (ownership rolled back): %s", drr)
     end
 
-    -- 5. confirm at dest.
+    -- 5. offsets: ship every group's committed offset for this partition to
+    -- the new owner (higher-wins there), so consumers resume where they left
+    -- off instead of restarting from their configured start position. Runs
+    -- after the drain: consumers here stopped being served at the cutover, so
+    -- the snapshot is complete (the COMMIT handler refuses commits for
+    -- partitions this broker no longer serves). A push failure degrades to
+    -- the old behaviour — data is already safe on dest — so it's loud but
+    -- does not roll back the move.
+    if self.broker.offsets and peer.push_offsets then
+        local snapshot = self.broker.offsets:offsets_for_partition(
+            topic_name, partition_id)
+        if next(snapshot) ~= nil then
+            local applied, oerr = peer:push_offsets(topic_name, partition_id, snapshot)
+            if applied then
+                log:info("migrated %d committed offset(s) for %s/partition-%d -> %s",
+                    applied, topic_name, partition_id, dest_id)
+            else
+                log:error("offset migration for %s/partition-%d -> %s failed: %s "
+                    .. "(groups resume from their configured start on dest)",
+                    topic_name, partition_id, dest_id, tostring(oerr))
+            end
+        end
+    end
+
+    -- 6. confirm at dest.
     local cok, coerr = peer:set_owner(topic_name, partition_id, dest_id)
     stop()
     if not cok then
