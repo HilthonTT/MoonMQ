@@ -36,6 +36,19 @@ local STATE_MAX_SEGMENT_SIZE = 8 * 1024 * 1024
 -- Record key type tags (first byte of the record key).
 local K_IDENTITY = "\1"   -- "\1" .. producer_name
 local K_MEMO     = "\2"   -- "\2" .. u64 pid .. topic
+-- Allocator watermark: a single fixed-key record holding next_pid. Only
+-- written when expiry tombstones producer records — without it, deleting the
+-- highest pid's identity would let a restart re-issue that pid to a NEW
+-- producer while a zombie of the old one still holds it (epoch fencing can't
+-- tell them apart: both start their epoch history at 0).
+local K_ALLOC    = "\3"
+local ALLOC_KEY  = K_ALLOC .. "next_pid"
+local ALLOC_VALUE_FMT = ">I8"
+
+-- A zero-length value is a tombstone: the key's prior record is dead. The
+-- commitlog compactor drops tombstones (and everything they superseded) on
+-- its next pass, so expired producer state actually leaves the disk.
+local TOMBSTONE = ""
 
 local IDENTITY_VALUE_FMT = ">I8I2"        -- pid, epoch
 -- Memo carries the epoch that wrote it: dedup state is only valid within the
@@ -90,6 +103,7 @@ function ProducerStateManager.new(topic_manager, opts)
         by_name     = {},   -- producer_name -> { pid=, epoch= }
         epoch_by_pid= {},   -- pid -> current epoch (fencing)
         memo        = {},   -- pid -> topic -> { last_seq, last_offset, last_partition }
+        last_active = {},   -- pid -> ms of last identity/memo write (expiry input)
         next_pid    = 1,    -- monotonic allocator; 0 reserved as "unassigned"
     }, ProducerStateManager)
 
@@ -109,8 +123,8 @@ function ProducerStateManager:_partition_for(key)
 end
 
 -- Append a record and fsync it durable. Returns (true, nil) or (nil, err).
-function ProducerStateManager:_write(key, value)
-    local rec  = msg_m.Message.new(key, value, os.time() * 1000)
+function ProducerStateManager:_write(key, value, now_ms)
+    local rec  = msg_m.Message.new(key, value, now_ms or os.time() * 1000)
     local part = self.topic.partitions[self:_partition_for(key)]
     local _, werr = part:write_message(rec)
     if werr then
@@ -148,12 +162,14 @@ function ProducerStateManager:get_or_create_producer(name)
         epoch = 0
     end
 
+    local now = os.time() * 1000
     local ok, err = self:_write(K_IDENTITY .. name,
-        string.pack(IDENTITY_VALUE_FMT, pid, epoch))
+        string.pack(IDENTITY_VALUE_FMT, pid, epoch), now)
     if not ok then return nil, nil, err end
 
     self.by_name[name]      = { pid = pid, epoch = epoch }
     self.epoch_by_pid[pid]  = epoch
+    self.last_active[pid]   = now
     return pid, epoch, nil
 end
 
@@ -192,21 +208,104 @@ function ProducerStateManager:record_produce(pid, topic, seq, offset, partition,
     epoch = epoch or 0
     local key = K_MEMO .. string.pack(">I8", pid) .. topic
     local val = string.pack(MEMO_VALUE_FMT, seq, offset, partition, epoch)
-    local ok, err = self:_write(key, val)
+    local now = os.time() * 1000
+    local ok, err = self:_write(key, val, now)
     if not ok then return nil, err end
 
     local t = self.memo[pid]
     if not t then t = {}; self.memo[pid] = t end
     t[topic] = { last_seq = seq, last_offset = offset,
                  last_partition = partition, epoch = epoch }
+    self.last_active[pid] = now
     return true, nil
+end
+
+-- expire_idle garbage-collects durable producers whose last identity/memo
+-- write is at least max_idle_ms old. Expiry tombstones the producer's
+-- identity and every sequence memo in __producer_state (compaction later
+-- drops both the tombstones and everything they superseded), so a quiet
+-- producer no longer pins its state forever.
+--
+-- opts:
+--   now_ms     override for tests (default: wall clock).
+--   is_active  fn(name, pid) -> bool. A truthy return vetoes expiry — the
+--              broker uses it to protect producers with an unresolved
+--              transaction, the server to protect pids bound to a live
+--              connection.
+--
+-- Before the first tombstone, the pid allocator's watermark is persisted:
+-- otherwise deleting the highest pid's identity would let a restart hand the
+-- same pid to a NEW producer while a zombie session still holds it, and
+-- epoch fencing could not tell the two apart.
+--
+-- Returns (expired_count, nil) or (expired_count_so_far, err) if a write
+-- failed mid-sweep (in-memory state stays consistent with what was written;
+-- the next sweep retries the rest).
+function ProducerStateManager:expire_idle(max_idle_ms, opts)
+    assert(type(max_idle_ms) == "number" and max_idle_ms > 0,
+        "max_idle_ms must be a positive number")
+    opts = opts or {}
+    local now       = opts.now_ms or os.time() * 1000
+    local is_active = opts.is_active
+
+    local victims = {}
+    for name, e in pairs(self.by_name) do
+        local last = self.last_active[e.pid] or 0
+        if (now - last) >= max_idle_ms
+            and not (is_active and is_active(name, e.pid)) then
+            victims[#victims + 1] = { name = name, pid = e.pid, idle_ms = now - last }
+        end
+    end
+    if #victims == 0 then return 0, nil end
+
+    local ok, err = self:_write(ALLOC_KEY,
+        string.pack(ALLOC_VALUE_FMT, self.next_pid), now)
+    if not ok then return 0, err end
+
+    local expired = 0
+    for _, v in ipairs(victims) do
+        local wok, werr = self:_write(K_IDENTITY .. v.name, TOMBSTONE, now)
+        if not wok then return expired, werr end
+        for topic in pairs(self.memo[v.pid] or {}) do
+            local mok, merr = self:_write(
+                K_MEMO .. string.pack(">I8", v.pid) .. topic, TOMBSTONE, now)
+            if not mok then
+                -- Identity is already tombstoned; drop the in-memory entry so
+                -- serving state never claims more than the log does. Leftover
+                -- memo records are harmless (no identity → pid never revived)
+                -- and get swept next pass.
+                self.by_name[v.name]      = nil
+                self.epoch_by_pid[v.pid]  = nil
+                self.memo[v.pid]          = nil
+                self.last_active[v.pid]   = nil
+                return expired + 1, merr
+            end
+        end
+        self.by_name[v.name]      = nil
+        self.epoch_by_pid[v.pid]  = nil
+        self.memo[v.pid]          = nil
+        self.last_active[v.pid]   = nil
+        expired = expired + 1
+        log:info("expired idle producer %q (pid=%d, idle %.0fs)",
+            v.name, v.pid, v.idle_ms / 1000)
+    end
+    return expired, nil
 end
 
 -- recover replays every internal partition front-to-back, rebuilding the
 -- in-memory identity/memo maps (last write per key wins) and the pid allocator.
 function ProducerStateManager:recover()
     local max_pid = 0
+    local alloc_floor = 0   -- persisted allocator watermark (see expire_idle)
     local restored = 0
+
+    -- Bump a pid's last_active from a record's timestamp (replay is in
+    -- append order per partition, but identity and memo records for one pid
+    -- can land on different partitions — keep the max).
+    local function touch(pid, ts)
+        local cur = self.last_active[pid]
+        if ts and (not cur or ts > cur) then self.last_active[pid] = ts end
+    end
 
     for _, part in ipairs(self.topic.partitions) do
         local serr = part:scan(function(_offset, m)
@@ -216,10 +315,23 @@ function ProducerStateManager:recover()
 
             if tag == K_IDENTITY then
                 local name = key:sub(2)
+                if #m.value == 0 then
+                    -- Tombstone: this producer was expired. Per-key replay
+                    -- order guarantees this supersedes any earlier identity.
+                    local prev = self.by_name[name]
+                    if prev then
+                        self.epoch_by_pid[prev.pid] = nil
+                        self.memo[prev.pid]         = nil
+                        self.last_active[prev.pid]  = nil
+                        self.by_name[name]          = nil
+                    end
+                    return
+                end
                 local ok, pid, epoch = pcall(string.unpack, IDENTITY_VALUE_FMT, m.value)
                 if ok then
                     self.by_name[name]     = { pid = pid, epoch = epoch }
                     self.epoch_by_pid[pid] = epoch
+                    touch(pid, m.timestamp)
                     if pid > max_pid then max_pid = pid end
                     restored = restored + 1
                 end
@@ -228,6 +340,15 @@ function ProducerStateManager:recover()
                 if #key >= 1 + 8 then
                     local pid = string.unpack(">I8", key, 2)
                     local topic = key:sub(1 + 8 + 1)
+                    if #m.value == 0 then
+                        -- Tombstoned memo (producer expiry).
+                        local t = self.memo[pid]
+                        if t then
+                            t[topic] = nil
+                            if next(t) == nil then self.memo[pid] = nil end
+                        end
+                        return
+                    end
                     local ok, s, off, prt, ep =
                         pcall(string.unpack, MEMO_VALUE_FMT, m.value)
                     if not ok then
@@ -242,10 +363,14 @@ function ProducerStateManager:recover()
                         if not t then t = {}; self.memo[pid] = t end
                         t[topic] = { last_seq = s, last_offset = off,
                                      last_partition = prt, epoch = ep }
+                        touch(pid, m.timestamp)
                         if pid > max_pid then max_pid = pid end
                         restored = restored + 1
                     end
                 end
+            elseif tag == K_ALLOC then
+                local ok, floor = pcall(string.unpack, ALLOC_VALUE_FMT, m.value)
+                if ok and floor > alloc_floor then alloc_floor = floor end
             else
                 log:warn("%s: skipping record with unknown key tag", STATE_TOPIC)
             end
@@ -257,6 +382,7 @@ function ProducerStateManager:recover()
     end
 
     self.next_pid = max_pid + 1
+    if alloc_floor > self.next_pid then self.next_pid = alloc_floor end
     if restored > 0 then
         log:info("recovered %d producer-state record(s) from %s; next_pid=%d",
             restored, STATE_TOPIC, self.next_pid)

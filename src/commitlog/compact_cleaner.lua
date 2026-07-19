@@ -82,7 +82,14 @@ function CompactCleaner:clean(segments)
         local write_err
         seg:each(function(offset, msg)
             if write_err then return end
-            if self.m[msg.key] <= offset then
+            -- Kafka-style tombstones: a zero-length value marks the key as
+            -- deleted. Pass 1 already made the tombstone the key's latest
+            -- offset (dropping every superseded record below); skipping the
+            -- tombstone itself here removes the key from the log entirely.
+            -- Safe to drop immediately (no delete.retention.ms grace) because
+            -- readers of compacted internal topics replay front-to-back on
+            -- boot — there is no mid-stream consumer relying on seeing it.
+            if self.m[msg.key] <= offset and #msg.value > 0 then
                 local record, serr = message_m.serialize_message(msg)
                 if not record then
                     write_err = string.format("serialize during compaction: %s",

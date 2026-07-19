@@ -314,9 +314,10 @@ function M.produce_idempotent(server, conn, correl, payload)
     local enrol_err, enrol_code
     if in_txn then
         produce_opts = {
-            pre_append = function(topic_name, partition_id, _partition)
+            pre_append = function(topic_name, partition_id, _partition, remote)
                 local pok, perr, pcode = server.broker.transactions:add_partition(
-                    conn.producer_name, conn.pid, conn.epoch, topic_name, partition_id)
+                    conn.producer_name, conn.pid, conn.epoch, topic_name, partition_id,
+                    remote)
                 if not pok then
                     enrol_err, enrol_code = perr, pcode
                     return nil, "failed to enrol partition in txn: " .. tostring(perr)
@@ -686,17 +687,18 @@ function M.join_group(server, conn, correl, payload)
         member_id = conn.member_id or conn.id_short
     end
 
-    local group, gerr = server.coordinator:get_or_create(j.group_id)
-    if not group then
-        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED, gerr))
-        return
-    end
-    local assignment, jerr = group:join(member_id, j.topics)
+    -- The coordinator routes: locally-coordinated groups join here; in
+    -- cluster mode a group hashed to a peer broker is forwarded there
+    -- (membership then spans the cluster — see group_coordinator.lua).
+    local assignment, jerr, jcode =
+        server.coordinator:join(j.group_id, member_id, j.topics)
     if not assignment then
-        -- join() fails when a subscribed topic doesn't exist, or the group
-        -- has been closed. Map the missing-topic case to a precise code.
-        local code = (jerr and jerr:find("get topic", 1, true))
-            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
+        local code = proto.ERR_INTERNAL
+        if jcode == "limit" then
+            code = proto.ERR_RATE_LIMITED
+        elseif jcode == "topic" then
+            code = proto.ERR_TOPIC_MISSING
+        end
         conn:send(proto.encode_error(correl, code, jerr or "join failed"))
         return
     end
@@ -707,8 +709,8 @@ function M.join_group(server, conn, correl, payload)
     -- created one before the client joined), scope it to the new assignment now
     -- rather than waiting for the next poll.
     server.coordinator:apply_assignment(conn)
-    log:info("conn=%s joined group=%s member=%s state=%s",
-        conn.id_short, j.group_id, member_id, group:state())
+    log:info("conn=%s joined group=%s member=%s",
+        conn.id_short, j.group_id, member_id)
     conn:send(proto.encode_group_assignment(correl, member_id, assignment))
 end
 
@@ -720,16 +722,20 @@ function M.leave_group(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
         return
     end
-    local group = server.coordinator:get(l.group_id)
-    if not group or conn.group_id ~= l.group_id then
+    if conn.group_id ~= l.group_id then
         conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
             "not a member of this group"))
         return
     end
 
-    group:leave(conn.member_id)
-    log:info("conn=%s left group=%s member=%s state=%s",
-        conn.id_short, l.group_id, conn.member_id, group:state())
+    local ok = server.coordinator:leave(l.group_id, conn.member_id)
+    if not ok then
+        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
+            "not a member of this group"))
+        return
+    end
+    log:info("conn=%s left group=%s member=%s",
+        conn.id_short, l.group_id, conn.member_id)
     conn.group_id  = nil
     conn.member_id = nil
     conn:send(proto.encode_ok(correl))
@@ -744,14 +750,16 @@ function M.group_heartbeat(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
         return
     end
-    local group = server.coordinator:get(h.group_id)
-    if not group or conn.group_id ~= h.group_id then
+    if conn.group_id ~= h.group_id then
         conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
             "not a member of this group"))
         return
     end
 
-    local ok, herr = group:heartbeat(conn.member_id)
+    -- Forwarded members refresh their cached assignment as a side effect
+    -- (the coordinator's heartbeat response carries the current one), so a
+    -- rebalance elsewhere in the cluster lands here within one heartbeat.
+    local ok, herr = server.coordinator:heartbeat(h.group_id, conn.member_id)
     if not ok then
         conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
             herr or "unknown member"))

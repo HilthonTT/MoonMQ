@@ -263,4 +263,21 @@ describe("CommitLog", function()
         assert.are.equal("c-only", seen.c)
         l:close()
     end)
+
+    it("compaction drops tombstones (empty value) and the key they delete", function()
+        local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
+        l:append_message(msg("a", "a-live", 1))
+        l:append_message(msg("b", "b-live", 2))
+        l:append_message(msg("a", "", 3))        -- tombstone for "a"
+        l:append_message(msg("c", "c-live", 4))  -- forces the compaction pass
+
+        local seen = {}
+        for _, seg in ipairs(l.segments) do
+            seg:each(function(_, m) seen[m.key] = m.value end)
+        end
+        assert.is_nil(seen.a, "tombstoned key must vanish entirely")
+        assert.are.equal("b-live", seen.b)
+        assert.are.equal("c-live", seen.c)
+        l:close()
+    end)
 end)

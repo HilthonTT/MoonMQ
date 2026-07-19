@@ -72,6 +72,42 @@ local function local_peer(node)
             if not out then return nil, err end
             return out.loads
         end,
+        txn_enroll = function(_, txn, topic, partition, first_offset)
+            local out, err = unwrap(cs:_txn_enroll(json.encode({
+                txn = txn, topic = topic, partition = partition,
+                first_offset = first_offset })))
+            if not out then return nil, err end
+            return true
+        end,
+        txn_resolve = function(_, txn, topic, partition, opts)
+            opts = opts or {}
+            local out, err = unwrap(cs:_txn_resolve(json.encode({
+                txn = txn, topic = topic, partition = partition,
+                aborted = opts.aborted or false, pid = opts.pid,
+                epoch = opts.epoch, first = opts.first, upto = opts.upto })))
+            if not out then return nil, err end
+            return true
+        end,
+        group_join = function(_, group, member, topics, origin)
+            local out, err = unwrap(cs:_group_join(json.encode({
+                group = group, member = member, topics = topics, origin = origin })))
+            if not out then return nil, err, "internal" end
+            if out.ok == false then return nil, out.reason, out.code end
+            return out.assignment
+        end,
+        group_heartbeat = function(_, group, member)
+            local out, err = unwrap(cs:_group_heartbeat(json.encode({
+                group = group, member = member })))
+            if not out then return nil, err end
+            if out.ok == false then return nil, out.reason end
+            return out.assignment or {}
+        end,
+        group_leave = function(_, group, member)
+            local out, err = unwrap(cs:_group_leave(json.encode({
+                group = group, member = member })))
+            if not out then return nil, err end
+            return true
+        end,
     }
 end
 
@@ -349,6 +385,219 @@ describe("produce routing after a move", function()
         local _, _, err = a.producer:produce("orders",
             msg_m.Message.new("k", "v", 0))
         assert.matches("no such peer", err)
+    end)
+end)
+
+describe("transactional produce to a peer-owned partition", function()
+    before_each(function() rmdir(BASE) end)
+
+    -- Drain every available record value (poll returns at most one record
+    -- per partition per pass).
+    local function drain(consumer, max_polls)
+        local all = {}
+        for _ = 1, max_polls or 20 do
+            local records = assert(consumer:poll())
+            if #records == 0 then break end
+            for _, r in ipairs(records) do all[#all + 1] = r.value end
+        end
+        return all
+    end
+
+    -- A coordinates the transaction; B owns orders/partition-1.
+    local function txn_setup()
+        local a, b = make_cluster()
+        a.broker.transactions:set_router(a.router)
+        assert(a.broker:create_topic("orders", 1))
+        assert(b.broker:create_topic("orders", 1))
+        assert(a.assignments:set_owner("orders", 1, "B"))
+        local pid, epoch =
+            assert(a.broker.producer_state:get_or_create_producer("txn-x"))
+        assert(a.broker.transactions:begin("txn-x", pid, epoch))
+        return a, b, pid, epoch
+    end
+
+    -- Transactional produce exactly like the produce handler: pre_append
+    -- enrols the partition (remotely here) before the forwarded append.
+    local function txn_forward_produce(a, pid, epoch, key, value)
+        local msg = msg_m.Message.new(key, value, 1, msg_m.ATTR_TXN, pid, epoch)
+        return a.producer:produce("orders", msg, {
+            pre_append = function(topic_name, partition_id, _p, remote)
+                return a.broker.transactions:add_partition(
+                    "txn-x", pid, epoch, topic_name, partition_id, remote)
+            end,
+        })
+    end
+
+    it("forwards the record, floors the owner's LSO, and commits atomically", function()
+        local a, b, pid, epoch = txn_setup()
+
+        local part_id, _, err = txn_forward_produce(a, pid, epoch, "k1", "cross")
+        assert.is_nil(err)
+        assert.are.equal(1, part_id)
+        assert.is_true(partition_leo(b, "orders", 1) > 0, "record lands on the owner")
+        assert.are.equal(0, partition_leo(a, "orders", 1), "stale local log untouched")
+
+        -- While the txn is unresolved, the OWNER's read_committed consumers
+        -- must not see the record (remote enrolment floored B's LSO).
+        local rc = consumer_m.Consumer.new(b.broker, "g-rc",
+            { isolation = "read_committed" })
+        assert(rc:subscribe("orders"))
+        assert.are.same({}, drain(rc))
+
+        -- Commit on the coordinator: marker + resolve land on the owner.
+        assert(a.broker.transactions:end_txn("txn-x", pid, epoch, true))
+        assert.are.same({ "cross" }, drain(rc))
+    end)
+
+    it("abort records the aborted range in the owner's abort index", function()
+        local a, b, pid, epoch = txn_setup()
+
+        local _, _, perr = txn_forward_produce(a, pid, epoch, "k1", "doomed")
+        assert.is_nil(perr)
+        assert(a.broker.transactions:end_txn("txn-x", pid, epoch, false))
+
+        -- The owner filters the aborted record for read_committed readers
+        -- from its OWN durable abort index (fed by /cluster/txn/resolve)...
+        local rc = consumer_m.Consumer.new(b.broker, "g-rc",
+            { isolation = "read_committed" })
+        assert(rc:subscribe("orders"))
+        assert.are.same({}, drain(rc))
+        assert.is_true(#b.broker.transactions.aborts:entries("orders", 1) > 0)
+
+        -- ...while read_uncommitted still sees it.
+        local ru = consumer_m.Consumer.new(b.broker, "g-ru")
+        assert(ru:subscribe("orders"))
+        assert.are.same({ "doomed" }, drain(ru))
+    end)
+
+    it("fails the produce when remote enrolment fails (LSO safety)", function()
+        local a, b, pid, epoch = txn_setup()
+        a.peers.B.txn_enroll = function() return nil, "connection refused" end
+
+        local _, _, err = txn_forward_produce(a, pid, epoch, "k1", "v")
+        assert.is_not_nil(err)
+        assert.matches("enrol", err)
+        -- The record must NOT have been forwarded to the owner.
+        assert.are.equal(0, partition_leo(b, "orders", 1))
+    end)
+end)
+
+describe("cluster-wide consumer groups", function()
+    local GroupCoordinator = require("src.server.group_coordinator")
+
+    before_each(function() rmdir(BASE) end)
+
+    -- make_cluster plus a cluster-mode GroupCoordinator per node, wired into
+    -- each node's ClusterServer (as Server:start does in production).
+    local function group_cluster()
+        local a, b = make_cluster()
+        for _, node in ipairs({ a, b }) do
+            node.coordinator = GroupCoordinator.new(node.broker, {
+                max_groups = 16,
+                cluster    = { self_id = node.id, peers = node.peers },
+            })
+            node.cluster_server.group_coordinator = node.coordinator
+        end
+        return a, b
+    end
+
+    -- Find a group id whose coordinator is `want` — hashing is deterministic,
+    -- so probe suffixes until one lands there.
+    local function group_for(coordinator, want)
+        for i = 1, 64 do
+            local gid = "g-" .. i
+            if coordinator:coordinator_for(gid) == want then return gid end
+        end
+        error("no group id hashed to " .. want)
+    end
+
+    it("every broker agrees on each group's coordinator", function()
+        local a, b = group_cluster()
+        for i = 1, 20 do
+            local gid = "group-" .. i
+            assert.are.equal(a.coordinator:coordinator_for(gid),
+                             b.coordinator:coordinator_for(gid))
+        end
+    end)
+
+    it("membership spans brokers: a forwarded join rebalances remote members", function()
+        local a, b = group_cluster()
+        assert(a.broker:create_topic("orders", 2))
+        assert(b.broker:create_topic("orders", 2))
+        -- Coordinator is B; both partitions are owned by A (B's view must say
+        -- so — ownership-aware assignment runs on the coordinator).
+        local gid = group_for(a.coordinator, "B")
+        assert(b.assignments:set_owner("orders", 1, "A"))
+        assert(b.assignments:set_owner("orders", 2, "A"))
+
+        -- First member joins via A (forwarded to B): gets both partitions.
+        local asg1 = assert(a.coordinator:join(gid, "mA1", { "orders" }))
+        table.sort(asg1.orders)
+        assert.are.same({ 1, 2 }, asg1.orders)
+        assert.is_true(a.coordinator:member_alive(gid, "mA1"))
+
+        -- Second member joins via A too: coordinator B rebalances both.
+        local asg2 = assert(a.coordinator:join(gid, "mA2", { "orders" }))
+        assert.are.equal(1, #asg2.orders)
+
+        -- B holds the membership (with origins), not A.
+        local group = b.coordinator:get(gid)
+        assert.is_not_nil(group)
+        assert.are.equal("A", group.members.mA1.origin)
+        assert.is_nil(a.coordinator:get(gid))
+
+        -- mA1's cached assignment is stale until its next heartbeat, which
+        -- carries the post-rebalance assignment back.
+        assert.is_true(a.coordinator:heartbeat(gid, "mA1"))
+        local cached = a.coordinator.remote_members[gid].mA1
+        assert.are.equal(1, #cached.orders)
+        local total = #cached.orders + #asg2.orders
+        assert.are.equal(2, total, "the two members split the partitions")
+    end)
+
+    it("assignment is ownership-aware: members only get partitions their broker serves", function()
+        local a, b = group_cluster()
+        assert(a.broker:create_topic("orders", 2))
+        assert(b.broker:create_topic("orders", 2))
+        local gid = group_for(a.coordinator, "B")
+        -- B's view: partition 1 owned by A, partition 2 by B (default self).
+        assert(b.assignments:set_owner("orders", 1, "A"))
+
+        local asg_a = assert(a.coordinator:join(gid, "mA", { "orders" }))   -- via A
+        local asg_b = assert(b.coordinator:join(gid, "mB", { "orders" }))   -- local on B
+        assert.are.same({ 1 }, asg_a.orders, "A-side member gets A-owned partition")
+        assert.are.same({ 2 }, asg_b.orders, "B-side member gets B-owned partition")
+    end)
+
+    it("eviction on the coordinator fences the remote member on its next heartbeat", function()
+        local a, b = group_cluster()
+        assert(a.broker:create_topic("orders", 1))
+        assert(b.broker:create_topic("orders", 1))
+        local gid = group_for(a.coordinator, "B")
+
+        assert(a.coordinator:join(gid, "mA", { "orders" }))
+        assert.is_true(a.coordinator:member_alive(gid, "mA"))
+
+        -- Coordinator-side eviction (as the reaper would on heartbeat timeout).
+        b.coordinator:get(gid):leave("mA")
+
+        local ok = a.coordinator:heartbeat(gid, "mA")
+        assert.is_nil(ok)
+        assert.is_false(a.coordinator:member_alive(gid, "mA"),
+            "lapsed membership must fence commits on the origin broker")
+    end)
+
+    it("leave via the origin broker removes the member on the coordinator", function()
+        local a, b = group_cluster()
+        assert(a.broker:create_topic("orders", 1))
+        assert(b.broker:create_topic("orders", 1))
+        local gid = group_for(a.coordinator, "B")
+
+        assert(a.coordinator:join(gid, "mA", { "orders" }))
+        assert(a.coordinator:leave(gid, "mA"))
+        assert.is_false(a.coordinator:member_alive(gid, "mA"))
+        local group = b.coordinator:get(gid)
+        assert.is_true(group == nil or group.members.mA == nil)
     end)
 end)
 

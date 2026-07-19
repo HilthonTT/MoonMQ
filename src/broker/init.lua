@@ -220,6 +220,28 @@ function Broker:tick_cleaners()
     return ran
 end
 
+-- expire_idle_producers garbage-collects durable producer identities (and
+-- their idempotent-produce memos) idle for at least max_idle_ms, via
+-- ProducerStateManager:expire_idle. The broker adds the one veto only it can
+-- check: a producer whose transaction is still unresolved is never expired
+-- (its epoch is what fences the zombie session during txn recovery). Callers
+-- (the Server) layer their own veto on top via opts.is_active — e.g. pids
+-- bound to a live connection. Returns (expired_count, err?).
+function Broker:expire_idle_producers(max_idle_ms, opts)
+    opts = opts or {}
+    local caller_active = opts.is_active
+    return self.producer_state:expire_idle(max_idle_ms, {
+        now_ms    = opts.now_ms,
+        is_active = function(name, pid)
+            -- transactional_id == producer_name (see txn_coordinator.lua).
+            if self.transactions and self.transactions:has_unresolved(name) then
+                return true
+            end
+            return caller_active ~= nil and caller_active(name, pid) or false
+        end,
+    })
+end
+
 -- serves_partition reports whether this broker currently serves reads/writes
 -- for (topic, partition). Always true in a single-broker deployment;
 -- cluster-aware once the Server installs the ownership table (see

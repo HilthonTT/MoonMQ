@@ -155,10 +155,19 @@ Start with `DryRun: true` and watch the `balance_loop` log lines and the
 
 ## Boundaries (read before enabling)
 
-* **Consumer groups are per-broker.** Group membership, heartbeats, and
-  rebalancing do not span brokers. After a partition moves, consume it from
-  its new owner — committed offsets follow the partition (MOVE step 5), so
-  the group resumes in place, but the membership itself must re-form there.
+* **Consumer groups span the cluster (2026-07-19), with caveats.** Each group
+  hashes to ONE coordinator broker (deterministic over the sorted member ids);
+  JOIN/HEARTBEAT/LEAVE arriving elsewhere are forwarded to it over
+  `/cluster/group/*`. Assignment is ownership-aware: a member only receives
+  partitions owned by the broker its connection lives on (fetches are local —
+  there is no cross-broker fetch forwarding), so a partition whose owner has
+  no connected member goes unassigned until one connects there. Rebalances
+  propagate to remote members via their next heartbeat (assignment rides the
+  response), so remote assignment — and commit fencing — can be up to one
+  heartbeat interval stale. If a group's coordinator broker is unreachable,
+  joins/heartbeats for that group fail until it returns; membership state is
+  in-memory on the coordinator and re-forms after it restarts. The subscribed
+  topics must exist on the coordinator broker.
 * **Offset migration assumes both brokers run the same storage backend for
   the topic.** Offsets are backend-native cursors (byte offsets vs record
   counts); they only mean the same thing on dest because the data was copied
@@ -171,9 +180,14 @@ Start with `DryRun: true` and watch the `balance_loop` log lines and the
   epoch headers bypass the fence entirely. Two controllers claiming at the
   same instant against disjoint reachable peers can both act until their
   claims meet.
-* **Transactional produce does not cross brokers.** A transactional record
-  routed to a peer-owned partition is refused (markers could not be written
-  on the owner).
+* **Transactional produce crosses brokers (2026-07-19), with one window.**
+  A transactional record routed to a peer-owned partition enrols the owner
+  first (`/cluster/txn/enroll` floors its LSO), forwards the record, and on
+  END_TXN writes the marker on the owner and resolves there (aborted ranges
+  land in the owner's abort index). The owner's LSO floor for a REMOTE
+  transaction is in-memory: if the owner restarts mid-transaction,
+  read_committed readers there may see the txn's records until the markers
+  arrive. Reassigning a partition away mid-transaction is unsupported.
 * **Internal topics (`__*`) never move.**
 * **Inter-broker HTTP is plaintext.** Bind to loopback/private networks,
   set `Token`, firewall the port — same posture as `/replicate` and

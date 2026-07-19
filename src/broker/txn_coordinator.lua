@@ -90,6 +90,18 @@ function Coordinator.new(broker, opts)
         nparts = #topic.partitions,
         aborts = aborts,
         txns   = {},   -- txn_id -> { pid, epoch, state, participants, pending_offsets }
+        -- Owner-side registry of REMOTE coordinators' unresolved transactions
+        -- touching partitions this broker owns:
+        --   key(topic, partition) -> { [txn_id] = first_offset }
+        -- Feeds lso() so a read_committed consumer here never reads past a
+        -- transaction still being driven by a peer broker. In-memory only:
+        -- if this broker restarts mid-remote-txn, the floor is lost until the
+        -- peer's markers arrive (see docs/transactions.md §2 caveats).
+        remote = {},
+        -- Cluster produce router (set by the Server via set_router). When
+        -- present, commit/abort markers for a participant partition owned by
+        -- a peer are appended on that peer instead of the stale local log.
+        router = nil,
     }, Coordinator)
 
     local rerr = self:_recover()
@@ -98,6 +110,10 @@ function Coordinator.new(broker, opts)
 end
 
 function Coordinator.topic_name() return STATE_TOPIC end
+
+-- set_router installs the cluster produce router (src/cluster/router.lua).
+-- Nil-safe: without one, every participant is assumed local (single-broker).
+function Coordinator:set_router(router) self.router = router end
 
 function Coordinator:_partition_for(txn_id)
     return (fnv1a(txn_id) % self.nparts) + 1
@@ -218,7 +234,15 @@ end
 -- append would leave the first record outside the recorded range. Only persists
 -- when the participant set actually grows, so repeated produces to the same
 -- partition don't amplify writes. Returns (true, nil) or (nil, err, code).
-function Coordinator:add_partition(txn_id, pid, epoch, topic, partition)
+--
+-- remote (optional) marks a participant partition owned by a peer broker:
+-- { peer = Peer, leo = owner's log-end offset captured before this txn's
+-- first forwarded append }. The owner is enrolled too (peer:txn_enroll), so
+-- ITS read_committed consumers floor their LSO on this transaction — the
+-- coordinator's local lso() is irrelevant there. A failed remote enrolment
+-- fails the produce: forwarding the record without the owner knowing the txn
+-- is unresolved would let read_committed readers on the owner see it early.
+function Coordinator:add_partition(txn_id, pid, epoch, topic, partition, remote)
     local t = self.txns[txn_id]
     if not t or t.state ~= S.ONGOING then
         return nil, "no transaction in progress", "state"
@@ -230,9 +254,18 @@ function Coordinator:add_partition(txn_id, pid, epoch, topic, partition)
     if t.participants[key] then return true end   -- already tracked
 
     local first_offset = 0
-    local tp = self.broker.topic_manager.topics[topic]
-    local part = tp and tp.partitions[partition]
-    if part then first_offset = part.offset or 0 end
+    if remote then
+        first_offset = remote.leo or 0
+        local rok, rerr = remote.peer:txn_enroll(txn_id, topic, partition, first_offset)
+        if not rok then
+            return nil, string.format("remote txn enrol on %s failed: %s",
+                tostring(remote.peer.id), tostring(rerr)), "state"
+        end
+    else
+        local tp = self.broker.topic_manager.topics[topic]
+        local part = tp and tp.partitions[partition]
+        if part then first_offset = part.offset or 0 end
+    end
 
     t.participants[key] =
         { topic = topic, partition = partition, first_offset = first_offset }
@@ -261,13 +294,58 @@ function Coordinator:add_offsets(txn_id, pid, epoch, group, offsets)
     return true
 end
 
--- Write a COMMIT/ABORT control marker to one participant partition. A missing
--- topic/partition (shouldn't happen — topic deletion isn't supported) is
--- logged and treated as success; an actual WRITE failure is returned so the
--- transaction is not marked complete with markers missing. Returns
--- (true, marker_offset_or_nil) or (nil, err) — the offset lets the abort path
--- record the aborted range's upper bound.
-function Coordinator:_write_marker(participant, marker, pid, epoch)
+-- Write a COMMIT/ABORT marker on the PEER that owns the participant
+-- partition, then resolve the transaction there (clears the owner's LSO
+-- floor; on abort, also records the aborted range in the owner's abort index
+-- — the owner's consumers are the ones that filter). Returns
+-- (true, marker_offset, true) or (nil, err). Idempotent: a recovery retry
+-- re-appends a duplicate marker (harmless — consumers skip control records)
+-- and remote_resolve dedups the abort range.
+function Coordinator:_write_remote_marker(peer, participant, marker, pid, epoch, txn_id)
+    local value = string.pack(CONTROL_VALUE_FMT, marker, pid, epoch)
+    local rec = msg_m.Message.new("", value, os.time() * 1000, msg_m.ATTR_CONTROL)
+    local bytes, serr = msg_m.serialize_message(rec)
+    if not bytes then return nil, tostring(serr) end
+
+    local leo, aerr = peer:append(participant.topic, participant.partition, bytes)
+    if not leo then
+        return nil, string.format("marker forward to %s for %s/partition-%d failed: %s",
+            tostring(peer.id), participant.topic, participant.partition, tostring(aerr))
+    end
+    local moffset = leo - #bytes
+
+    local rok, rerr = peer:txn_resolve(txn_id, participant.topic, participant.partition, {
+        aborted = (marker == MARKER_ABORT),
+        pid     = pid,
+        epoch   = epoch,
+        first   = participant.first_offset or 0,
+        upto    = moffset,
+    })
+    if not rok then
+        return nil, string.format("txn resolve on %s for %s/partition-%d failed: %s",
+            tostring(peer.id), participant.topic, participant.partition, tostring(rerr))
+    end
+    return true, moffset, true
+end
+
+-- Write a COMMIT/ABORT control marker to one participant partition. When a
+-- cluster router says a peer owns the partition (ownership is re-checked NOW,
+-- not at enrol time, in case it moved), the marker goes to the owner — see
+-- _write_remote_marker. A missing local topic/partition (shouldn't happen —
+-- topic deletion isn't supported) is logged and treated as success; an actual
+-- WRITE failure is returned so the transaction is not marked complete with
+-- markers missing. Returns (true, marker_offset_or_nil, is_remote) or
+-- (nil, err) — the offset lets the abort path record the aborted range's
+-- upper bound; is_remote tells _finish the owner already recorded that range.
+function Coordinator:_write_marker(participant, marker, pid, epoch, txn_id)
+    if self.router then
+        local peer, rerr = self.router:route(participant.topic, participant.partition)
+        if rerr then return nil, rerr end
+        if peer then
+            return self:_write_remote_marker(peer, participant, marker, pid, epoch, txn_id)
+        end
+    end
+
     local topic = self.broker.topic_manager.topics[participant.topic]
     if not topic then
         log:warn("participant topic %s vanished; skipping marker", participant.topic)
@@ -306,7 +384,8 @@ function Coordinator:_finish(txn_id, commit)
     local marker = commit and MARKER_COMMIT or MARKER_ABORT
 
     for _, p in pairs(t.participants) do
-        local ok, moffset_or_err = self:_write_marker(p, marker, t.pid, t.epoch)
+        local ok, moffset_or_err, is_remote =
+            self:_write_marker(p, marker, t.pid, t.epoch, txn_id)
         if not ok then
             log:error("txn %s: %s (left in %s for retry/recovery)",
                 txn_id, moffset_or_err, S_NAME[t.state])
@@ -316,7 +395,9 @@ function Coordinator:_finish(txn_id, commit)
         -- so read_committed consumers can filter this txn's data records.
         -- Failing to persist it must NOT complete the txn — the records would
         -- become permanently visible — so it's treated like a marker failure.
-        if not commit and moffset_or_err ~= nil then
+        -- Remote participants are excluded: the OWNER's abort index recorded
+        -- the range during txn_resolve (its consumers do the filtering).
+        if not commit and moffset_or_err ~= nil and not is_remote then
             local aok, aerr = self.aborts:add(p.topic, p.partition,
                 t.pid, t.epoch, p.first_offset or 0, moffset_or_err)
             if not aok then
@@ -387,6 +468,17 @@ end
 -- current exposes a txn's durable snapshot (for tests/observability).
 function Coordinator:current(txn_id) return self.txns[txn_id] end
 
+-- has_unresolved reports whether txn_id has a transaction that hasn't reached
+-- a COMPLETE_* state. Producer-state expiry uses it as a veto: expiring a
+-- producer mid-transaction would drop the epoch fencing that recovery relies
+-- on to resolve it.
+function Coordinator:has_unresolved(txn_id)
+    local t = self.txns[txn_id]
+    return t ~= nil
+        and t.state ~= S.COMPLETE_COMMIT
+        and t.state ~= S.COMPLETE_ABORT
+end
+
 -- ---- read_committed queries ------------------------------------------------
 
 -- lso returns the Last Stable Offset for (topic, partition): the smallest
@@ -407,7 +499,54 @@ function Coordinator:lso(topic, partition)
             end
         end
     end
+    -- Transactions driven by a PEER coordinator that enrolled this partition
+    -- (this broker owns it; the txn state lives elsewhere) floor the LSO too.
+    local rt = self.remote[key]
+    if rt then
+        for _, fo in pairs(rt) do
+            if min == nil or fo < min then min = fo end
+        end
+    end
     return min
+end
+
+-- ---- remote-coordinator hooks (owner side) ---------------------------------
+-- Called by the cluster server when a PEER broker coordinates a transaction
+-- that produces to a partition THIS broker owns.
+
+-- remote_enroll floors this partition's LSO at first_offset until the peer
+-- resolves the transaction. Idempotent per (txn_id, partition).
+function Coordinator:remote_enroll(txn_id, topic, partition, first_offset)
+    assert(type(txn_id) == "string" and #txn_id > 0, "txn_id required")
+    local key = topic .. "\0" .. partition
+    local t = self.remote[key]
+    if not t then t = {}; self.remote[key] = t end
+    -- Keep the lowest floor if the peer retries with a different LEO.
+    if t[txn_id] == nil or first_offset < t[txn_id] then
+        t[txn_id] = first_offset
+    end
+    return true
+end
+
+-- remote_resolve ends a peer-coordinated transaction's hold on this
+-- partition. On abort, the aborted range is recorded in OUR abort index
+-- FIRST (this broker's consumers filter with it) and only then is the LSO
+-- floor released — the other order would open a window where the aborted
+-- records are below the LSO but not yet filtered. Returns (true) or (nil, err).
+function Coordinator:remote_resolve(txn_id, topic, partition, opts)
+    opts = opts or {}
+    if opts.aborted then
+        local ok, err = self.aborts:add(topic, partition,
+            opts.pid or 0, opts.epoch or 0, opts.first or 0, opts.upto or 0)
+        if not ok then return nil, err end
+    end
+    local key = topic .. "\0" .. partition
+    local t = self.remote[key]
+    if t then
+        t[txn_id] = nil
+        if next(t) == nil then self.remote[key] = nil end
+    end
+    return true
 end
 
 -- is_aborted reports whether the transactional data record at `offset` of

@@ -16,6 +16,18 @@
 --       Per-partition disk bytes, feeding peers' autobalancer models.
 --   POST /cluster/controller/claim  json {epoch, broker_id}
 --       Record a controller claim                        → 200 {"accepted":bool,"highest":N}
+--   POST /cluster/txn/enroll  json {txn, topic, partition, first_offset}
+--       A peer-coordinated transaction produces to a partition we own:
+--       floor its LSO until resolved                     → 200 {"ok":true}
+--   POST /cluster/txn/resolve json {txn, topic, partition, aborted, pid, epoch, first, upto}
+--       Release the floor; on abort record the aborted
+--       range in our abort index                         → 200 {"ok":true}
+--   POST /cluster/group/join      json {group, member, topics, origin}
+--       Coordinator side of a forwarded JOIN_GROUP       → 200 {"ok":true,"assignment":{..}}
+--   POST /cluster/group/heartbeat json {group, member}
+--       Renew lease; reply carries current assignment    → 200 {"ok":true,"assignment":{..}}
+--   POST /cluster/group/leave     json {group, member}
+--       Forwarded LEAVE_GROUP (idempotent)               → 200 {"ok":true}
 --
 -- Mutating routes (append/ensure/owner/offsets) honour optional
 -- X-Controller-Epoch / X-Controller-Id headers: a request from a controller
@@ -62,6 +74,9 @@ function M.new(opts)
         port        = assert(opts.port, "port required"),
         token       = opts.token,
         fence       = fence,
+        -- The server's GroupCoordinator (optional): serves the coordinator
+        -- side of forwarded consumer-group requests (/cluster/group/*).
+        group_coordinator = opts.group_coordinator,
     }, M)
 end
 
@@ -234,6 +249,109 @@ function M:_offsets(body)
     return 200, { ok = true, applied = applied }
 end
 
+-- A peer broker coordinates a transaction producing to a partition WE own:
+-- floor the partition's LSO until the peer resolves it.
+function M:_txn_enroll(body)
+    local req = json.decode(body or "")
+    if type(req) ~= "table" or type(req.txn) ~= "string"
+        or type(req.topic) ~= "string" or type(req.partition) ~= "number"
+        or type(req.first_offset) ~= "number" then
+        return 400, "txn/enroll: need {txn, topic, partition, first_offset}"
+    end
+    local txns = self.broker.transactions
+    if not txns then return 500, "txn/enroll: no transaction coordinator" end
+    txns:remote_enroll(req.txn, req.topic, req.partition, req.first_offset)
+    return 200, { ok = true }
+end
+
+-- The peer resolved its transaction: release the LSO floor; on abort, record
+-- the aborted range in OUR abort index (our consumers filter with it).
+function M:_txn_resolve(body)
+    local req = json.decode(body or "")
+    if type(req) ~= "table" or type(req.txn) ~= "string"
+        or type(req.topic) ~= "string" or type(req.partition) ~= "number" then
+        return 400, "txn/resolve: need {txn, topic, partition}"
+    end
+    local txns = self.broker.transactions
+    if not txns then return 500, "txn/resolve: no transaction coordinator" end
+    local ok, err = txns:remote_resolve(req.txn, req.topic, req.partition, {
+        aborted = req.aborted == true,
+        pid     = req.pid,
+        epoch   = req.epoch,
+        first   = req.first,
+        upto    = req.upto,
+    })
+    if not ok then return 500, "txn/resolve: " .. tostring(err) end
+    return 200, { ok = true }
+end
+
+-- Coordinator side of a forwarded JOIN_GROUP: this broker was chosen by
+-- hash(group_id) over the cluster member ids, and `origin` tells the
+-- ownership-aware assignment which broker the member's connection lives on.
+-- Logical failures come back as 200 {ok=false, code, reason} so the origin
+-- can distinguish them from transport errors.
+function M:_group_join(body)
+    local req = json.decode(body or "")
+    if type(req) ~= "table" or type(req.group) ~= "string"
+        or type(req.member) ~= "string" or type(req.topics) ~= "table"
+        or type(req.origin) ~= "string" then
+        return 400, "group/join: need {group, member, topics, origin}"
+    end
+    for _, t in ipairs(req.topics) do
+        if type(t) ~= "string" then return 400, "group/join: topics must be strings" end
+    end
+    local gc = self.group_coordinator
+    if not gc then return 500, "group/join: no group coordinator" end
+
+    local group, gerr = gc:get_or_create(req.group)
+    if not group then
+        return 200, { ok = false, code = "limit", reason = gerr }
+    end
+    local assignment, jerr = group:join(req.member, req.topics, req.origin)
+    if not assignment then
+        local code = (jerr and jerr:find("get topic", 1, true)) and "topic" or "internal"
+        return 200, { ok = false, code = code, reason = jerr }
+    end
+    log:info("group %s: forwarded join of %s (origin %s)",
+        req.group, req.member, req.origin)
+    return 200, { ok = true, assignment = assignment }
+end
+
+-- Coordinator side of a forwarded GROUP_HEARTBEAT. Success responses carry
+-- the member's CURRENT assignment — that's how rebalances propagate to
+-- members connected via other brokers.
+function M:_group_heartbeat(body)
+    local req = json.decode(body or "")
+    if type(req) ~= "table" or type(req.group) ~= "string"
+        or type(req.member) ~= "string" then
+        return 400, "group/heartbeat: need {group, member}"
+    end
+    local gc = self.group_coordinator
+    if not gc then return 500, "group/heartbeat: no group coordinator" end
+
+    local group = gc:get(req.group)
+    if not group then return 200, { ok = false, reason = "unknown group" } end
+    local ok, herr = group:heartbeat(req.member)
+    if not ok then return 200, { ok = false, reason = herr or "unknown member" } end
+    local member = group.members[req.member]
+    return 200, { ok = true, assignment = (member and member.partitions) or {} }
+end
+
+-- Coordinator side of a forwarded LEAVE_GROUP. Idempotent.
+function M:_group_leave(body)
+    local req = json.decode(body or "")
+    if type(req) ~= "table" or type(req.group) ~= "string"
+        or type(req.member) ~= "string" then
+        return 400, "group/leave: need {group, member}"
+    end
+    local gc = self.group_coordinator
+    if not gc then return 500, "group/leave: no group coordinator" end
+
+    local group = gc:get(req.group)
+    if group then group:leave(req.member) end
+    return 200, { ok = true }
+end
+
 function M:_loads()
     local loads = {}
     local traffic = self.broker.traffic
@@ -273,10 +391,15 @@ function M:_handle(sock)
 
     -- Mutating routes are controller-fenced when the request carries an epoch.
     local MUTATING = {
-        ["/cluster/append"]  = true,
-        ["/cluster/ensure"]  = true,
-        ["/cluster/owner"]   = true,
-        ["/cluster/offsets"] = true,
+        ["/cluster/append"]      = true,
+        ["/cluster/ensure"]      = true,
+        ["/cluster/owner"]       = true,
+        ["/cluster/offsets"]     = true,
+        ["/cluster/txn/enroll"]  = true,
+        ["/cluster/txn/resolve"] = true,
+        ["/cluster/group/join"]      = true,
+        ["/cluster/group/heartbeat"] = true,
+        ["/cluster/group/leave"]     = true,
     }
 
     local status, out
@@ -305,7 +428,10 @@ function M:_handle(sock)
             end
         end
     elseif method == "POST" and (path == "/cluster/ensure" or path == "/cluster/owner"
-        or path == "/cluster/offsets" or path == "/cluster/controller/claim") then
+        or path == "/cluster/offsets" or path == "/cluster/controller/claim"
+        or path == "/cluster/txn/enroll" or path == "/cluster/txn/resolve"
+        or path == "/cluster/group/join" or path == "/cluster/group/heartbeat"
+        or path == "/cluster/group/leave") then
         local body, berr = httpk.read_body(
             self.reactor, sock, leftover, clen, deadline, MAX_BODY)
         if not body then
@@ -316,6 +442,16 @@ function M:_handle(sock)
             status, out = self:_offsets(body)
         elseif path == "/cluster/controller/claim" then
             status, out = self:_claim(body)
+        elseif path == "/cluster/txn/enroll" then
+            status, out = self:_txn_enroll(body)
+        elseif path == "/cluster/txn/resolve" then
+            status, out = self:_txn_resolve(body)
+        elseif path == "/cluster/group/join" then
+            status, out = self:_group_join(body)
+        elseif path == "/cluster/group/heartbeat" then
+            status, out = self:_group_heartbeat(body)
+        elseif path == "/cluster/group/leave" then
+            status, out = self:_group_leave(body)
         else
             status, out = self:_owner(body)
         end

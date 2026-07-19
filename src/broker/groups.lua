@@ -31,7 +31,7 @@ local STATES = {
 local GroupMember = {}
 GroupMember.__index = GroupMember
 
-function GroupMember.new(id, topics, partitions, last_heartbeat)
+function GroupMember.new(id, topics, partitions, last_heartbeat, origin)
     assert(type(id) == "string", "id must be a string")
     last_heartbeat = last_heartbeat or socket.gettime()
     assert(type(last_heartbeat) == "number", "last_heartbeat must be a number")
@@ -41,65 +41,101 @@ function GroupMember.new(id, topics, partitions, last_heartbeat)
         topics         = topics,         -- array of topic names
         partitions     = partitions,             -- topic_name -> array of partition ids
         last_heartbeat = last_heartbeat,
+        -- Broker the member's connection lives on (cluster mode). Assignment
+        -- only hands a member partitions its own broker serves, because
+        -- fetches are local — nil outside a cluster.
+        origin         = origin,
     }, GroupMember)
 end
 
 
-local function range_assignment_strategy(members, topics)
-    local assignments = {}
+-- Range-assign `partitions` of `topic` among the (sorted) `interested`
+-- member ids, appending into assignments[member_id][topic].
+local function assign_range(assignments, topic, partitions, interested)
+    if #interested == 0 then return end
+    table.sort(interested)
 
-    -- Seed each member with an empty array for every topic they subscribe to.
+    local num_partitions = #partitions
+    local num_members    = #interested
+    local per_member     = math.floor(num_partitions / num_members)
+    local remainder      = num_partitions % num_members
+
+    local start = 1
+    for i, member_id in ipairs(interested) do
+        local count = per_member
+
+        if i <= remainder then
+            count = count + 1
+        end
+
+        local stop = start + count - 1
+        if stop > num_partitions then
+            stop = num_partitions
+        end
+
+        for j = start, stop do
+            table.insert(assignments[member_id][topic], partitions[j])
+        end
+
+        start = stop + 1
+    end
+end
+
+-- Seed assignments (every member gets an empty list per subscribed topic) and
+-- build topic -> [member_id...] for subscribed members.
+local function seed_assignments(members, topics)
+    local assignments, topic_members = {}, {}
+    for topic in pairs(topics) do
+        topic_members[topic] = {}
+    end
     for member_id, member in pairs(members) do
         assignments[member_id] = {}
         for _, topic in ipairs(member.topics) do
             assignments[member_id][topic] = {}
-        end
-    end
-
-    -- Build topic -> [member_id, ...] for members subscribed to that topic.
-    local topic_members = {}
-    for topic in pairs(topics) do
-        topic_members[topic] = {}
-    end
-
-    for member_id, member in pairs(members) do
-        for _, topic in ipairs(member.topics) do
             if topics[topic] then
                 table.insert(topic_members[topic], member_id)
             end
         end
     end
+    return assignments, topic_members
+end
 
-    -- Assign partitions per topic.
+local function range_assignment_strategy(members, topics)
+    local assignments, topic_members = seed_assignments(members, topics)
     for topic, partitions in pairs(topics) do
-        local interested = topic_members[topic]
-        if #interested > 0 then
-            table.sort(interested)
+        assign_range(assignments, topic, partitions, topic_members[topic])
+    end
+    return assignments
+end
 
-            local num_partitions = #partitions
-            local num_members    = #interested
-            local per_member     = math.floor(num_partitions / num_members)
-            local remainder      = num_partitions % num_members
+-- Cluster-aware variant: fetches are local, so a partition may only be
+-- assigned to a member whose connection lives on the broker that OWNS it.
+-- Partitions are bucketed by owner (via `ownership(topic, partition)`), then
+-- each bucket is range-assigned among that owner's subscribed members. A
+-- partition whose owner has no subscribed member connected goes unassigned —
+-- consuming it requires a member on the owning broker (there is no cross-
+-- broker fetch forwarding).
+local function ownership_aware_range_strategy(members, topics, ownership)
+    local assignments, topic_members = seed_assignments(members, topics)
 
-            local start = 1
-            for i, member_id in ipairs(interested) do
-                local count = per_member
+    for topic, partitions in pairs(topics) do
+        -- owner broker id -> array of partition ids
+        local buckets = {}
+        for _, p in ipairs(partitions) do
+            local owner = ownership(topic, p)
+            local b = buckets[owner]
+            if not b then b = {}; buckets[owner] = b end
+            b[#b + 1] = p
+        end
 
-                if i <= remainder then
-                    count = count + 1
+        for owner, plist in pairs(buckets) do
+            local interested = {}
+            for _, member_id in ipairs(topic_members[topic]) do
+                if members[member_id].origin == owner then
+                    interested[#interested + 1] = member_id
                 end
-
-                local stop = start + count - 1
-                if stop > num_partitions then
-                    stop = num_partitions
-                end
-
-                for j = start, stop do
-                    table.insert(assignments[member_id][topic], partitions[j])
-                end
-
-                start = stop + 1
             end
+            assign_range(assignments, topic, plist, interested)
         end
     end
 
@@ -136,16 +172,30 @@ local function make_lifecycle_fsm(group_id)
     })
 end
 
-function ConsumerGroup.new(broker, group_id)
+-- opts (optional):
+--   ownership  fn(topic, partition) -> broker_id. When set (cluster mode),
+--              assignment is ownership-aware: a member only receives
+--              partitions owned by the broker its connection lives on
+--              (member.origin). Absent = single-broker range assignment.
+function ConsumerGroup.new(broker, group_id, opts)
     assert(getmetatable(broker) == broker_m.Broker, "broker must be Broker instance")
     assert(type(group_id) == "string", "group_id must be a string")
+    opts = opts or {}
+
+    local strategy = range_assignment_strategy
+    if opts.ownership then
+        local ownership = opts.ownership
+        strategy = function(members, topics)
+            return ownership_aware_range_strategy(members, topics, ownership)
+        end
+    end
 
     return setmetatable({
         broker   = broker,
         group_id = group_id,
         members  = {},                            -- member_id -> GroupMember
         topics   = {},                            -- topic_name -> array of partition ids
-        strategy = range_assignment_strategy,
+        strategy = strategy,
         fsm      = make_lifecycle_fsm(group_id),
     }, ConsumerGroup)
 end
@@ -174,10 +224,11 @@ function ConsumerGroup:_run_rebalance()
     return assignments
 end
 
--- Add a consumer to the group.
+-- Add a consumer to the group. `origin` (optional) is the broker id the
+-- member's connection lives on — used by ownership-aware assignment.
 -- Returns: (assigned_partitions, err)
 --   assigned_partitions = { [topic] = { partition_id, ... }, ... }
-function ConsumerGroup:join(member_id, topics)
+function ConsumerGroup:join(member_id, topics, origin)
     assert(type(member_id) == "string", "member_id must be a string")
     if self.fsm:is(STATES.DEAD) then
         return nil, "group is dead"
@@ -220,9 +271,10 @@ function ConsumerGroup:join(member_id, topics)
     local member = self.members[member_id]
     if member then
         member.topics = topics
+        member.origin = origin
         member.last_heartbeat = socket.gettime()
     else
-        self.members[member_id] = GroupMember.new(member_id, topics)
+        self.members[member_id] = GroupMember.new(member_id, topics, nil, nil, origin)
     end
 
     -- Membership/topics are settled; run completing -> stable. We're already
@@ -321,5 +373,6 @@ return {
     GroupMember = GroupMember,
     ConsumerGroup = ConsumerGroup,
     range_assignment_strategy = range_assignment_strategy,
+    ownership_aware_range_strategy = ownership_aware_range_strategy,
     STATES = STATES,
 }

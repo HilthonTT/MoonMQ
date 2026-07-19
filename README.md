@@ -353,7 +353,10 @@ ownership cutover, and produce forwarding included, with zero client changes.
 
 See **[docs/cluster.md](docs/cluster.md)** for the full design: what moves,
 what the cutover guarantees, configuration reference, and the current
-boundaries (consumer groups stay per-broker; committed offsets don't migrate).
+boundaries. Consumer groups span the cluster (each group hashes to one
+coordinator broker; JOIN/HEARTBEAT/LEAVE are forwarded over
+`/cluster/group/*` with ownership-aware assignment), committed offsets
+migrate with a partition, and transactional produce works across brokers.
 
 ## Code layout
 

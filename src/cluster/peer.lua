@@ -150,6 +150,76 @@ function Peer:push_offsets(topic, partition, offsets)
     return resp.applied or 0
 end
 
+-- Enrol a transaction this broker coordinates with the peer that OWNS one of
+-- its participant partitions: the peer floors that partition's LSO at
+-- first_offset so its read_committed consumers don't read the txn's records
+-- while it is unresolved. Returns (true, nil) or (nil, err).
+function Peer:txn_enroll(txn_id, topic, partition, first_offset)
+    local resp, err = self:_request("POST", "/cluster/txn/enroll",
+        { ["Content-Type"] = "application/json" },
+        json.encode({ txn = txn_id, topic = topic, partition = partition,
+                      first_offset = first_offset }))
+    if not resp then return nil, err end
+    return true
+end
+
+-- Resolve a previously enrolled transaction on the owner: releases the LSO
+-- floor, and when opts.aborted also records the aborted range
+-- [opts.first, opts.upto) for (opts.pid, opts.epoch) in the owner's abort
+-- index. Returns (true, nil) or (nil, err).
+function Peer:txn_resolve(txn_id, topic, partition, opts)
+    opts = opts or {}
+    local resp, err = self:_request("POST", "/cluster/txn/resolve",
+        { ["Content-Type"] = "application/json" },
+        json.encode({ txn = txn_id, topic = topic, partition = partition,
+                      aborted = opts.aborted or false,
+                      pid = opts.pid, epoch = opts.epoch,
+                      first = opts.first, upto = opts.upto }))
+    if not resp then return nil, err end
+    return true
+end
+
+-- Forward a JOIN_GROUP to the broker that coordinates the group. `origin` is
+-- OUR broker id — the coordinator uses it for ownership-aware assignment.
+-- Returns (assignment, nil, nil) or (nil, err, code) where code mirrors the
+-- coordinator's logical failure ("limit" | "topic" | "internal").
+function Peer:group_join(group_id, member_id, topics, origin)
+    local resp, err = self:_request("POST", "/cluster/group/join",
+        { ["Content-Type"] = "application/json" },
+        json.encode({ group = group_id, member = member_id,
+                      topics = topics, origin = origin }))
+    if not resp then return nil, err, "internal" end
+    if resp.ok == false then
+        return nil, resp.reason or "join refused", resp.code or "internal"
+    end
+    if type(resp.assignment) ~= "table" then
+        return nil, string.format("peer %s: response missing assignment", self.id),
+            "internal"
+    end
+    return resp.assignment
+end
+
+-- Forward a GROUP_HEARTBEAT. On success returns the member's CURRENT
+-- assignment (so the origin broker refreshes its cache); (nil, err) when the
+-- membership lapsed or the coordinator is unreachable.
+function Peer:group_heartbeat(group_id, member_id)
+    local resp, err = self:_request("POST", "/cluster/group/heartbeat",
+        { ["Content-Type"] = "application/json" },
+        json.encode({ group = group_id, member = member_id }))
+    if not resp then return nil, err end
+    if resp.ok == false then return nil, resp.reason or "membership lapsed" end
+    return resp.assignment or {}
+end
+
+-- Forward a LEAVE_GROUP. Returns (true, nil) or (nil, err).
+function Peer:group_leave(group_id, member_id)
+    local resp, err = self:_request("POST", "/cluster/group/leave",
+        { ["Content-Type"] = "application/json" },
+        json.encode({ group = group_id, member = member_id }))
+    if not resp then return nil, err end
+    return true
+end
+
 -- Per-partition load report for the autobalancer's cluster model. Returns
 -- (array of { topic, partition, disk_bytes }, nil) or (nil, err).
 function Peer:loads()

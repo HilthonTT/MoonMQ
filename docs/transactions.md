@@ -137,13 +137,28 @@ local replay = c:produce_at_seq("orders", "key-1", "value-1", 0)
 
 ## 2. Out of scope (today)
 
-Still deferred:
-
-- PID expiry / garbage-collecting idle producer state.
-- Transactional produce to a partition owned by a peer broker (cluster mode).
+Still deferred: nothing from the original design.
 
 Now implemented (were previously out of scope):
 
+- Transactional produce to a partition owned by a peer broker (2026-07-19).
+  The coordinator enrols the OWNER before the forwarded append
+  (`POST /cluster/txn/enroll` floors the owner's LSO at its pre-append LEO),
+  forwards the record, and on END_TXN writes the COMMIT/ABORT marker on the
+  owner and resolves there (`POST /cluster/txn/resolve` — on abort this also
+  records the aborted range in the owner's abort index, since the owner's
+  consumers do the read_committed filtering). Caveats: the owner's LSO floor
+  for a REMOTE transaction is in-memory — if the owner restarts while the
+  peer's transaction is unresolved, read_committed readers there may see the
+  transaction's records until the markers arrive; and reassigning a partition
+  away mid-transaction is unsupported (ownership is re-checked at marker time,
+  but offsets captured at enrol time are not migrated).
+- PID expiry / garbage-collecting idle producer state (2026-07-19): durable
+  producers idle for `Server.ProducerExpirySeconds` (default 1 day, 0 = off)
+  have their identity + memos tombstoned in `__producer_state`; compaction
+  drops the tombstones. Producers with an unresolved transaction or a live
+  connection are never expired, and a persisted allocator watermark
+  guarantees an expired PID is never re-issued.
 - COMMIT / ABORT control records in the log (v2 record format, control bit).
 - Cross-partition atomic commit via the transaction coordinator.
 - Transactional offset-commit (`TXN_OFFSET_COMMIT`, applied on commit).

@@ -128,6 +128,16 @@ local DEFAULT_MAX_GROUPS = 1024
 -- no-op until a partition's cleaner is actually due, so a tight-ish interval
 -- just keeps retention responsive without meaningful cost.
 local DEFAULT_CLEANER_TICK_INTERVAL_S = 5
+-- Producer-state expiry: durable producer identities (and their idempotent
+-- memos) idle longer than this are tombstoned from __producer_state. Matches
+-- Kafka's producer.id.expiration.ms default of one day. 0 disables expiry.
+-- Producers with an unresolved transaction or a live connection are never
+-- expired regardless of idleness.
+local DEFAULT_PRODUCER_EXPIRY_S       = 24 * 60 * 60
+-- How often the expiry sweep runs. Cheap (in-memory scan; writes only when
+-- something actually expires), and expiry granularity is measured in hours,
+-- so a few minutes is plenty.
+local DEFAULT_PRODUCER_EXPIRY_CHECK_INTERVAL_S = 300
 
 local Server = {}
 Server.__index = Server
@@ -158,6 +168,8 @@ function Server.new(opts)
     metrics.describe("moonmq_connections_open", "gauge", "Currently open connections.")
     metrics.describe("moonmq_produce_records_total", "counter", "Records produced.")
     metrics.describe("moonmq_fetch_records_total", "counter", "Records delivered to consumers.")
+    metrics.describe("moonmq_producers_expired_total", "counter",
+        "Idle durable producer identities expired from __producer_state.")
 
     local reactor = Reactor.new()
 
@@ -224,6 +236,13 @@ function Server.new(opts)
         router     = cluster and cluster.router or nil,
     })
 
+    -- The transaction coordinator routes COMMIT/ABORT markers for peer-owned
+    -- participant partitions through the same ownership table the produce
+    -- path uses (see Coordinator:_write_marker).
+    if cluster and broker.transactions then
+        broker.transactions:set_router(cluster.router)
+    end
+
     return setmetatable({
         broker      = broker,
         producer    = producer,
@@ -232,8 +251,14 @@ function Server.new(opts)
         replication = opts.replication,
         cluster     = cluster,
         autobalance = opts.autobalance,   -- see :start; nil = off
+        -- In cluster mode the coordinator hashes each group to ONE broker and
+        -- forwards membership there, so consumer groups span the cluster.
         coordinator = GroupCoordinator.new(broker, {
             max_groups = opts.max_groups or DEFAULT_MAX_GROUPS,
+            cluster    = cluster and {
+                self_id = cluster.broker_id,
+                peers   = cluster.peers,
+            } or nil,
         }),
         host        = opts.host or "0.0.0.0",
         port        = opts.port or 9092,
@@ -281,6 +306,11 @@ function Server.new(opts)
         -- unbounded on the default backend.
         cleaner_tick_interval = opts.cleaner_tick_interval
                                 or DEFAULT_CLEANER_TICK_INTERVAL_S,
+        -- Idle durable-producer expiry (0 = off) and its sweep cadence.
+        producer_expiry_s     = opts.producer_expiry_s
+                                or DEFAULT_PRODUCER_EXPIRY_S,
+        producer_expiry_check_interval = opts.producer_expiry_check_interval
+                                or DEFAULT_PRODUCER_EXPIRY_CHECK_INTERVAL_S,
         running               = false,
     }, Server)
 end
@@ -426,6 +456,36 @@ function Server:_run_cleaner_tick()
     end
 end
 
+-- Periodically expire idle durable producers from __producer_state. The
+-- broker vetoes producers with an unresolved transaction; the server adds
+-- the connection-level veto here — a pid bound to a live connection is in
+-- use no matter how long ago it last wrote (expiring it would silently
+-- reset the session's dedup state mid-connection).
+function Server:_run_producer_expiry()
+    local max_idle_ms = self.producer_expiry_s * 1000
+    while self.running do
+        self.reactor:sleep(self.producer_expiry_check_interval)
+        if not self.running then return end
+        local ok, expired, err = pcall(self.broker.expire_idle_producers,
+            self.broker, max_idle_ms, {
+                is_active = function(_name, pid)
+                    for _, conn in pairs(self.connections_by_id) do
+                        if conn.pid == pid then return true end
+                    end
+                    return false
+                end,
+            })
+        if not ok then
+            log:error("producer expiry sweep: %s", tostring(expired))
+        elseif err then
+            log:warn("producer expiry sweep incomplete (%d expired): %s",
+                expired or 0, tostring(err))
+        elseif expired and expired > 0 then
+            metrics.inc("moonmq_producers_expired_total", expired)
+        end
+    end
+end
+
 -- Install handlers for SIGINT, SIGTERM, and SIGTSTP (Ctrl+Z) so the
 -- reactor stops on the next tick. The handler must do as little as
 -- possible — just flip the flag. Real teardown happens after run()
@@ -484,6 +544,9 @@ function Server:start()
     self.running = true
     self.reactor:spawn(function() self:_run_group_reaper() end)
     self.reactor:spawn(function() self:_run_cleaner_tick() end)
+    if self.producer_expiry_s and self.producer_expiry_s > 0 then
+        self.reactor:spawn(function() self:_run_producer_expiry() end)
+    end
 
     log:info("listening on %s:%d (proto v%d, %s/%s)",
         self.host, self.port, proto.PROTOCOL_VERSION,
@@ -513,6 +576,9 @@ function Server:start()
             port        = self.cluster.port,
             token       = self.cluster.token,
             fence       = self.cluster.fence,
+            -- Serves the coordinator side of forwarded consumer-group
+            -- requests (/cluster/group/*) for groups hashed to this broker.
+            group_coordinator = self.coordinator,
         })
         cs:start()
     end

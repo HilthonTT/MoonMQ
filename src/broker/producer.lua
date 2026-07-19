@@ -173,15 +173,18 @@ function Producer.new(broker, acks, opts)
 end
 
 -- opts (optional):
---   pre_append  fn(topic_name, partition_id, partition) -> (ok, err), invoked
---               after partition selection but BEFORE the record is appended.
---               The transactional produce path uses it to enrol the partition
---               with the txn coordinator while the record's offset is still
---               the partition's LEO (see Coordinator:add_partition). A falsy
---               return aborts the produce. Only supported for locally-owned
---               partitions: a transactional produce that would be forwarded
---               to a peer broker is refused (markers could not be written on
---               the owner).
+--   pre_append  fn(topic_name, partition_id, partition, remote) -> (ok, err),
+--               invoked after partition selection but BEFORE the record is
+--               appended. The transactional produce path uses it to enrol the
+--               partition with the txn coordinator while the record's offset
+--               is still the partition's LEO (see Coordinator:add_partition).
+--               A falsy return aborts the produce. For a partition owned by a
+--               peer broker, `partition` is nil and `remote` is
+--               { peer = Peer, leo = owner's log-end offset } — captured
+--               BEFORE the forwarded append so it lower-bounds this record on
+--               the OWNER's log (conservative: another producer may append in
+--               between, but the abort filter also matches pid/epoch, so
+--               covering extra offsets is safe).
 function Producer:produce(topic_name, msg, opts)
     assert(type(topic_name) == "string", "topic_name must be a string")
     assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
@@ -220,10 +223,19 @@ function Producer:produce(topic_name, msg, opts)
         if rerr then return -1, -1, rerr end
         if peer then
             if opts and opts.pre_append then
-                return -1, -1, string.format(
-                    "%s/partition-%d is owned by peer %s: transactional produce "
-                    .. "to a remote partition is not supported",
-                    topic_name, partition_id, peer.id)
+                -- Transactional produce to a peer-owned partition: capture
+                -- the OWNER's LEO and enrol before forwarding, so the txn's
+                -- first offset there is recorded (and the owner's LSO
+                -- floored) before any of its records land.
+                local rleo, lerr = peer:leo(topic_name, partition_id)
+                if not rleo then
+                    return -1, -1, string.format(
+                        "leo of %s/partition-%d on peer %s: %s",
+                        topic_name, partition_id, peer.id, tostring(lerr))
+                end
+                local pok, perr = opts.pre_append(topic_name, partition_id, nil,
+                    { peer = peer, leo = rleo })
+                if not pok then return -1, -1, perr end
             end
             local roffset, ferr = self.router:forward(peer, topic_name, partition_id, msg)
             if not roffset then return -1, -1, ferr end

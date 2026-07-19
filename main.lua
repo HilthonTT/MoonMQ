@@ -170,6 +170,10 @@ if is_main(arg, ...) then
         heartbeat_miss_threshold = s.HeartbeatMissThreshold,
         max_topics             = s.MaxTopics,
         max_list_topics        = s.MaxListTopics,
+        -- Idle durable-producer expiry (seconds; 0 disables). Defaults to
+        -- one day, matching Kafka's producer.id.expiration.ms.
+        producer_expiry_s              = s.ProducerExpirySeconds,
+        producer_expiry_check_interval = s.ProducerExpiryCheckIntervalSeconds,
         metrics_host           = s.MetricsHost or "127.0.0.1",
         metrics_port           = s.MetricsPort or 9090,
         authenticator          = build_authenticator(cfg),
