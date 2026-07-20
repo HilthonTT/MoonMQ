@@ -613,6 +613,99 @@ function M.commit(server, conn, correl, payload)
     conn:send(proto.encode_ok(correl))
 end
 
+-- NACK: the consumer failed to process a delivered record. Below the
+-- configured maximum the group's offset is rewound to the record so it is
+-- redelivered; at the maximum the record moves to <topic>.dlq and the group
+-- advances past it (see src/broker/dlq.lua). The validation gauntlet is the
+-- same as COMMIT's — a NACK both rewinds and commits offsets, so everything
+-- that could corrupt offset state there applies here too.
+function M.nack(server, conn, correl, payload)
+    local n, err = proto.decode_nack(payload)
+    if not n then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+    if not conn.consumer then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            "nack requires prior subscribe/fetch"))
+        return
+    end
+    local topic, terr = server.broker:get_topic(n.topic)
+    if not topic then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
+            terr or "topic missing"))
+        return
+    end
+    if n.partition < 1 or n.partition > #topic.partitions then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
+            string.format("partition %d out of range (1..%d)",
+                n.partition, #topic.partitions)))
+        return
+    end
+    if not server.broker:serves_partition(n.topic, n.partition) then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            string.format("%s/partition-%d has moved to another broker; nack there",
+                n.topic, n.partition)))
+        return
+    end
+    if conn.group_id then
+        if not server.coordinator:member_alive(conn.group_id, conn.member_id) then
+            conn:send(proto.encode_error(correl, proto.ERR_GROUP_MEMBER_UNKNOWN,
+                "group membership lapsed; rejoin before nacking"))
+            return
+        end
+    end
+
+    local group = conn.consumer.group_id
+    local res, nerr = server.broker.dlq:record_failure(
+        group, n.topic, n.partition, n.offset, n.reason)
+    if not res then
+        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, nerr))
+        return
+    end
+    metrics.inc("moonmq_nack_total", 1, { topic = n.topic })
+
+    local offsets = conn.consumer.offsets[n.topic]
+    local cur = offsets and offsets[n.partition]
+
+    if res.dead_lettered then
+        -- Advance the group past the poison record — in-memory cursor and
+        -- durable offset both, so neither a live poll nor a restart
+        -- redelivers it. next_offset comes from the DLQ manager's read
+        -- (offsets are opaque per-backend cursors; offset+1 would be wrong
+        -- on the segmented backend).
+        if offsets and (cur == nil or cur < res.next_offset) then
+            offsets[n.partition] = res.next_offset
+        end
+        local cok, cerr = conn.consumer:commit_offset(
+            n.topic, n.partition, res.next_offset)
+        if not cok then
+            -- The record is already dead-lettered; a failed advance only
+            -- means redelivery of a record whose replacement exists in the
+            -- DLQ. Same log-not-fail contract as the fetch path's commit.
+            log:error("conn=%s nack advance %s/partition-%d: %s",
+                conn.id_short, n.topic, n.partition, cerr)
+        end
+        metrics.inc("moonmq_dlq_records_total", 1, { topic = n.topic })
+        conn:send(proto.encode_nack_ack(correl, true, res.attempts, res.dlq_topic))
+        return
+    end
+
+    -- Redelivery: rewind to the failed record. Delivery already committed
+    -- the offset past it (both fetch and push commit after send), so without
+    -- the rewind the record would never come back.
+    if offsets and (cur == nil or cur > n.offset) then
+        offsets[n.partition] = n.offset
+    end
+    local cok, cerr = conn.consumer:commit_offset(n.topic, n.partition, n.offset)
+    if not cok then
+        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL,
+            cerr or "nack rewind failed"))
+        return
+    end
+    conn:send(proto.encode_nack_ack(correl, false, res.attempts, nil))
+end
+
 function M.create_topic(server, conn, correl, payload)
     local c, err = proto.decode_create_topic(payload)
     if not c then
@@ -854,6 +947,7 @@ M.BY_OP = {
     [proto.OP_SUBSCRIBE]          = M.subscribe,
     [proto.OP_FETCH]              = M.fetch,
     [proto.OP_COMMIT]             = M.commit,
+    [proto.OP_NACK]               = M.nack,
     [proto.OP_CREATE_TOPIC]       = M.create_topic,
     [proto.OP_LIST_TOPICS]        = M.list_topics,
     [proto.OP_JOIN_GROUP]         = M.join_group,

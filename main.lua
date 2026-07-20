@@ -152,6 +152,11 @@ if is_main(arg, ...) then
         replication            = replication,
         cluster                = cluster,
         autobalance            = autobalance,
+        -- Dead-letter queue tuning (nil = defaults: ".dlq", 3 deliveries).
+        dlq                    = s.Dlq and {
+            suffix         = s.Dlq.Suffix,
+            max_deliveries = s.Dlq.MaxDeliveries,
+        } or nil,
         data_dir               = s.DataDir or "./data_server",
         -- Storage engine for topics that don't pin one themselves: "segmented"
         -- (default) or "commitlog". Per-topic config sidecars still win.

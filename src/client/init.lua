@@ -2,6 +2,7 @@ local socket = require("socket")
 local proto = require("src.wire.protocol")
 local uuid = require("src.core.uuid")
 local msg_m = require("src.record.message")
+local dlq_env = require("src.record.dlq_envelope")
 
 local DEFAULT_TIMEOUT = 30
 
@@ -395,6 +396,36 @@ function Client:commit(topic, partition, offset)
     end
     return true
 end
+
+-- nack reports a processing failure for a record this connection consumed.
+-- `offset` is the record's own offset as returned by fetch/next_record.
+-- Returns ({ dead_lettered, attempts, dlq_topic? }, nil) or (nil, err):
+-- dead_lettered=false means the broker rewound the group's offset and the
+-- record will be redelivered; true means it was moved to dlq_topic and the
+-- group has advanced past it (decode its value with Client.decode_dlq_value).
+function Client:nack(topic, partition, offset, reason)
+    assert(type(topic) == "string", "topic must be a string")
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_nack(correl, topic, partition, offset, reason))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_NACK_ACK then
+        return nil, string.format("expected NACK_ACK, got 0x%02x", op)
+    end
+    return proto.decode_nack_ack(payload)
+end
+
+-- decode_dlq_value unwraps the value of a record consumed from a dead-letter
+-- topic into { topic, partition, offset, timestamp, group, attempts, reason,
+-- value } — the original value plus the provenance of the failure. Call with
+-- a dot (Client.decode_dlq_value(rec.value)), it takes no self.
+Client.decode_dlq_value = dlq_env.decode
 
 function Client:create_topic(name, num_partitions)
     local correl = uuid.bytes()

@@ -63,6 +63,14 @@ M.OP_BEGIN_TXN        = 0x13
 M.OP_END_TXN          = 0x14
 M.OP_TXN_OFFSET_COMMIT = 0x15
 
+-- Dead-letter queue (see docs/dlq.md). NACK reports that the consumer failed
+-- to process a delivered record. The broker counts attempts per
+-- (group, topic, partition, offset): below the configured maximum it rewinds
+-- the group's committed offset so the record is redelivered; at the maximum
+-- it moves the record to the topic's dead-letter topic (<topic>.dlq) and
+-- advances the group past it. Acked with NACK_ACK either way.
+M.OP_NACK             = 0x16
+
 -- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
@@ -78,6 +86,7 @@ M.OP_OK            = 0x86
 M.OP_IDENTIFY_ACK  = 0x87
 M.OP_PRODUCER_ID   = 0x88
 M.OP_GROUP_ASSIGNMENT = 0x89
+M.OP_NACK_ACK      = 0x8A
 M.OP_ERROR         = 0xFE
 
 -- Correlation IDs are 16-byte UUIDs.
@@ -303,6 +312,23 @@ function M.encode_commit(correl_id, topic, partition, offset)
     return encode_frame(M.OP_COMMIT, correl_id, payload)
 end
 
+-- NACK: str topic | u32 partition | u64 offset | str reason. `offset` is the
+-- record's own offset as delivered in OP_RECORD (not the post-read cursor).
+function M.encode_nack(correl_id, topic, partition, offset, reason)
+    local payload = encode_string(topic)
+        .. string.pack(">I4I8", partition, offset)
+        .. encode_string(reason or "")
+    return encode_frame(M.OP_NACK, correl_id, payload)
+end
+
+-- NACK_ACK reply: u8 dead_lettered | u16 attempts | str dlq_topic (empty
+-- unless dead_lettered).
+function M.encode_nack_ack(correl_id, dead_lettered, attempts, dlq_topic)
+    local payload = string.pack(">BI2", dead_lettered and 1 or 0, attempts)
+        .. encode_string(dlq_topic or "")
+    return encode_frame(M.OP_NACK_ACK, correl_id, payload)
+end
+
 -- BEGIN_TXN carries no payload: the connection already holds the durable
 -- producer identity (pid/epoch/name) it transacts under.
 function M.encode_begin_txn(correl_id)
@@ -453,11 +479,15 @@ local MAX_GROUP_TOPICS  = 256
 -- Producer name (a.k.a. transactional_id): a stable, human-assigned identity.
 -- 256 is generous; it's the key into __producer_state.
 local MAX_PRODUCER_NAME = 256
+-- NACK failure reason: free-form client text that ends up stored inside the
+-- dead-letter envelope, so cap it well below the generic string bound.
+local MAX_NACK_REASON   = 1024
 M.MAX_TOPIC_NAME = MAX_TOPIC_NAME
 M.MAX_GROUP_ID   = MAX_GROUP_ID
 M.MAX_MEMBER_ID  = MAX_MEMBER_ID
 M.MAX_GROUP_TOPICS = MAX_GROUP_TOPICS
 M.MAX_PRODUCER_NAME = MAX_PRODUCER_NAME
+M.MAX_NACK_REASON   = MAX_NACK_REASON
 
 function M.decode_hello(payload)
     if #payload < 4 then return nil, "short hello" end
@@ -605,6 +635,31 @@ function M.decode_commit(payload)
 
     local partition, offset = string.unpack(">I4I8", payload, p)
     return { topic = topic, partition = partition, offset = offset }, nil
+end
+
+function M.decode_nack(payload)
+    local topic, p, err = decode_string(payload, 1, MAX_TOPIC_NAME)
+    if not topic then return nil, err or "truncated nack topic" end
+    if #payload - p + 1 < 12 then
+        return nil, "short nack"
+    end
+    local partition, offset, p2 = string.unpack(">I4I8", payload, p)
+    local reason, _, rerr = decode_string(payload, p2, MAX_NACK_REASON)
+    if not reason then return nil, rerr end
+    return { topic = topic, partition = partition, offset = offset,
+             reason = reason }, nil
+end
+
+function M.decode_nack_ack(payload)
+    if #payload < 3 then return nil, "short nack_ack" end
+    local dead, attempts, p = string.unpack(">BI2", payload, 1)
+    local dlq_topic, _, err = decode_string(payload, p, MAX_TOPIC_NAME)
+    if not dlq_topic then return nil, err end
+    return {
+        dead_lettered = dead ~= 0,
+        attempts      = attempts,
+        dlq_topic     = dlq_topic ~= "" and dlq_topic or nil,
+    }, nil
 end
 
 -- Cap offsets-per-txn-commit so one frame can't ask us to decode an

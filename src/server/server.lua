@@ -148,6 +148,7 @@ function Server.new(opts)
 
     local broker, berr = brk_m.Broker.new(opts.data_dir, {
         default_backend = opts.default_backend,
+        dlq             = opts.dlq,
     })
     if not broker then return nil, berr end
 
@@ -170,6 +171,10 @@ function Server.new(opts)
     metrics.describe("moonmq_fetch_records_total", "counter", "Records delivered to consumers.")
     metrics.describe("moonmq_producers_expired_total", "counter",
         "Idle durable producer identities expired from __producer_state.")
+    metrics.describe("moonmq_nack_total", "counter",
+        "Processing failures reported by consumers via NACK.")
+    metrics.describe("moonmq_dlq_records_total", "counter",
+        "Records moved to a dead-letter topic.")
 
     local reactor = Reactor.new()
 

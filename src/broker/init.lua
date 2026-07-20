@@ -5,6 +5,7 @@ local util_m     = require("src.core.util")
 local offmgr_m   = require("src.storage.offset_manager")
 local prodstate_m = require("src.storage.producer_state")
 local txn_m      = require("src.broker.txn_coordinator")
+local dlq_m      = require("src.broker.dlq")
 local traffic_m  = require("src.metrics.traffic")
 local uuid = require("src.core.uuid")
 
@@ -64,6 +65,11 @@ function Broker.new(data_dir, opts)
     if not txn then return nil, terr end
 
     broker.transactions = txn
+
+    -- Dead-letter queue manager (in-memory attempt counters + lazy
+    -- <topic>.dlq creation; see src/broker/dlq.lua). opts.dlq is an optional
+    -- { suffix, max_deliveries } from the server config.
+    broker.dlq = dlq_m.DlqManager.new(broker, opts.dlq)
 
     return broker, nil
 end
