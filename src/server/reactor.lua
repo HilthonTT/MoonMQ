@@ -177,20 +177,31 @@ function Reactor:run()
 
         -- 2. Fire expired timers.
         local now = socket.gettime()
-        local soonest = math.huge
         local fired = {}
 
         for co, wake_at in pairs(self.timer_waiters) do
             if wake_at <= now then
                 fired[#fired + 1] = co
-            elseif wake_at < soonest then
-                soonest = wake_at
             end
         end
 
         for i = 1, #fired do
             self.timer_waiters[fired[i]] = nil
             safe_resume(fired[i])
+        end
+
+        -- Compute the next wake AFTER firing, not during the scan above. A
+        -- coroutine we just resumed will usually register a fresh timer
+        -- (a sleep loop re-arms; auth's PBKDF2 yield_fn does reactor:sleep(0)
+        -- between iteration slices), and a deadline gathered before the resume
+        -- can't see it. The loop then blocked on select for the full 1s cap
+        -- with a runnable timer pending: every cooperative sleep(0) cost a
+        -- second, push-mode delivery ran at 1s instead of push_interval, and a
+        -- 600k-iteration AUTH needed ~73s — well past the handshake watchdog,
+        -- so authentication could never complete.
+        local soonest = math.huge
+        for _, wake_at in pairs(self.timer_waiters) do
+            if wake_at < soonest then soonest = wake_at end
         end
 
         -- 3. Build select sets.

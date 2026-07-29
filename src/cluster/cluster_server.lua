@@ -403,11 +403,19 @@ function M:_handle(sock)
     }
 
     local status, out
+    -- Authenticate BEFORE consulting the fence. ControllerFence:observe is not
+    -- a read: a higher epoch is adopted and durably persisted to
+    -- controller-epoch.json. Running it ahead of the token check let an
+    -- unauthenticated caller that merely reaches this port pin the epoch at an
+    -- arbitrary value (X-Controller-Epoch: 2147483647) and permanently fence
+    -- the real controller out of this broker — the 401 it got back was too
+    -- late, the damage was already on disk.
+    local authed = token_ok(self.token, httpk.header(headers, "X%-Cluster%-Token"))
     local fence_ok, fence_err = true, nil
-    if method == "POST" and MUTATING[path] then
+    if authed and method == "POST" and MUTATING[path] then
         fence_ok, fence_err = self:_check_fence(headers)
     end
-    if not token_ok(self.token, httpk.header(headers, "X%-Cluster%-Token")) then
+    if not authed then
         status, out = 401, "bad or missing X-Cluster-Token"
     elseif not fence_ok then
         status, out = 409, "fenced: " .. tostring(fence_err)

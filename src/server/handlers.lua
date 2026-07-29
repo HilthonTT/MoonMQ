@@ -109,7 +109,20 @@ function M.auth(server, conn, correl, payload)
         return
     end
 
-    local ok, auth_err = server.authenticator:verify(a.username, a.password, conn.ip)
+    -- Flag the derivation so the handshake watchdog doesn't count the broker's
+    -- own PBKDF2 work against the peer (see Connection:run_handshake_watchdog).
+    -- pcall so a throwing verify can't leave the flag stuck on, which would
+    -- disable the watchdog for this connection.
+    conn.auth_in_progress = true
+    local called, ok, auth_err =
+        pcall(server.authenticator.verify, server.authenticator,
+              a.username, a.password, conn.ip)
+    conn.auth_in_progress = false
+    if not called then
+        log:error("conn=%s auth verify failed: %s", conn.id_short, tostring(ok))
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_INTERNAL, "auth error")
+        return
+    end
     if not ok then
         -- Don't log the supplied username — it's attacker-controlled.
         conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,

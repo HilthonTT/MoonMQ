@@ -86,6 +86,10 @@ function Connection.new(server, sock, peer, ip)
 
         -- Application state (populated as handshake progresses)
         username = nil,
+        -- Set by the AUTH handler for the duration of the credential
+        -- verification. The handshake watchdog waits it out rather than
+        -- counting the broker's own PBKDF2 derivation against the peer.
+        auth_in_progress = false,
         client_name = nil,
         client_version = nil,
         consumer = nil,
@@ -406,13 +410,37 @@ function Connection:run_heartbeat()
     end
 end
 
+-- How often the watchdog re-checks while a credential verification is running.
+local AUTH_GRACE_TICK = 0.25
+
 function Connection:run_handshake_watchdog()
     self.server.reactor:sleep(self.server.handshake_deadline)
+
+    -- A verification the BROKER is still computing is not a stalled peer. The
+    -- PBKDF2 here is pure-Lua and cooperatively yields mid-derivation (see
+    -- src/server/auth.lua), so any reasonably strong stored hash outlasts
+    -- handshake_deadline — the broker's own recommended 600k iterations takes
+    -- minutes. Counting that against the deadline slammed the socket shut on
+    -- clients that had already sent CORRECT credentials, every single time
+    -- (reason=handshake_timeout). Wait the derivation out instead: it is
+    -- bounded by the stored hash's iteration count (capped at
+    -- auth.MAX_PBKDF2_ITERATIONS), and Auth's max_inflight gate bounds how
+    -- many can be running at once, so this can't be stretched by a peer.
+    while self.auth_in_progress and self.state ~= Connection.STATE_CLOSED do
+        self.server.reactor:sleep(AUTH_GRACE_TICK)
+    end
+
     if self.state ~= Connection.STATE_CLOSED
        and self.state ~= Connection.STATE_AUTHENTICATED then
+        -- %g, not %d: handshake_deadline comes from JSON config and may be
+        -- fractional. %d on a non-integer raises ("number has no integer
+        -- representation"), and since the format is evaluated as an argument
+        -- to close(), the raise killed the watchdog coroutine BEFORE it could
+        -- close anything — so a fractional deadline silently disabled
+        -- slowloris eviction entirely.
         self:close(Connection.REASON_HANDSHAKE_TIMEOUT,
             proto.ERR_BAD_PROTOCOL,
-            string.format("handshake not completed within %ds",
+            string.format("handshake not completed within %gs",
                 self.server.handshake_deadline))
     end
 end

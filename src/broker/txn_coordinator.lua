@@ -217,6 +217,18 @@ function Coordinator:begin(txn_id, pid, epoch)
     if t and t.state == S.ONGOING then
         return nil, "transaction already in progress", "state"
     end
+    -- A PREPARE_* transaction carries a DURABLE decision whose completion
+    -- failed partway (marker or offset write error). end_txn's retry path and
+    -- _recover both roll it forward; starting a new transaction over it would
+    -- overwrite the only record of that decision, so the participants' markers
+    -- would never be written, the aborted range never indexed, and the
+    -- buffered offsets never applied. The client's END_TXN returned an error,
+    -- so it must retry END_TXN with the SAME decision, not BEGIN a new txn.
+    if t and (t.state == S.PREPARE_COMMIT or t.state == S.PREPARE_ABORT) then
+        return nil, string.format(
+            "transaction is prepared to %s and not yet complete; retry END_TXN",
+            t.state == S.PREPARE_COMMIT and "commit" or "abort"), "state"
+    end
     self.txns[txn_id] = {
         pid = pid, epoch = epoch, state = S.ONGOING,
         participants = {}, pending_offsets = {},
