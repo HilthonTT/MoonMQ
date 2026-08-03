@@ -279,6 +279,74 @@ function Client:produce(topic, key, value)
     return { partition = partition, offset = offset, seq = seq_used }
 end
 
+-- produce_batch sends many records to one topic in a single frame and gets
+-- back one ack frame. Records is a list of { key = , value = } (key optional,
+-- defaults to ""); a plain list of strings is also accepted and treated as
+-- values with empty keys.
+--
+-- Returns (acks, err). `acks` is a list of { partition, offset, seq } aligned
+-- with the FIRST #acks entries of `records` — a batch that fails part-way
+-- through still durably appended that prefix, so the caller resends only the
+-- tail. On an idempotent client the sequence counter advances by #acks, which
+-- is what makes that resend land as fresh records rather than a duplicate.
+--
+-- A batch is NOT atomic: it is N appends that share a frame, a dispatch, and
+-- one fsync per partition. Wrap it in a transaction if you need all-or-nothing.
+function Client:produce_batch(topic, records)
+    assert(type(topic) == "string", "topic must be a string")
+    assert(type(records) == "table" and #records > 0,
+        "records must be a non-empty list")
+
+    local normalized = {}
+    for i = 1, #records do
+        local r = records[i]
+        if type(r) == "string" then
+            normalized[i] = { key = "", value = r }
+        else
+            normalized[i] = { key = r.key or "", value = r.value or "" }
+        end
+    end
+
+    local base_seq
+    local opts = { codec = self.compression }
+    if self.pid then
+        base_seq       = self.next_seq[topic] or 0
+        opts.pid       = self.pid
+        opts.base_seq  = base_seq
+        opts.epoch     = self.epoch or 0
+    end
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_produce_batch(correl, topic, normalized, opts))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR or not payload then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_PRODUCE_BATCH_ACK then
+        return nil, string.format("expected PRODUCE_BATCH_ACK, got 0x%02x", op)
+    end
+
+    local res, derr = proto.decode_produce_batch_ack(payload)
+    if not res then return nil, "decode produce_batch_ack: " .. tostring(derr) end
+
+    if base_seq ~= nil then
+        for i = 1, #res.acks do res.acks[i].seq = base_seq + i - 1 end
+        -- Advance by what actually landed. A failed tail leaves its sequence
+        -- numbers unused, so resending it is a fresh append, not a retry.
+        self.next_seq[topic] = base_seq + #res.acks
+    end
+
+    if res.code ~= 0 then
+        return res.acks, res.message ~= "" and res.message
+            or string.format("produce_batch failed after %d record(s)", #res.acks)
+    end
+    return res.acks, nil
+end
+
 -- Inject a duplicate (PID, topic, seq) into the next produce — testing
 -- helper that bypasses the next_seq counter, used by the example below
 -- to demonstrate broker-side dedup.
@@ -301,10 +369,18 @@ function Client:produce_at_seq(topic, key, value, seq)
     return { partition = partition, offset = offset, seq = seq }
 end
 
-function Client:fetch(topic, group, max_records)
+-- fetch pulls up to max_records records, spread across the partitions this
+-- client reads. By default it asks the broker for a batched reply (all records
+-- in one RECORD_BATCH frame instead of one frame each); a broker that predates
+-- batching ignores the request and answers with the per-record stream, which
+-- the loop below still handles. Pass batched = false to force the legacy shape.
+function Client:fetch(topic, group, max_records, batched)
     max_records = max_records or 100
+    if batched == nil then batched = true end
+
     local correl = uuid.bytes()
-    local data = proto.encode_fetch(correl, topic, group, max_records, self.isolation)
+    local data = proto.encode_fetch(correl, topic, group, max_records,
+        self.isolation, batched and proto.FETCH_FLAG_BATCHED or 0)
     local ok, err = self:_write(data)
     if not ok then return nil, err end
 
@@ -316,7 +392,11 @@ function Client:fetch(topic, group, max_records)
             return nil, (proto.decode_error(payload) or { message = "?" }).message
         end
         if op == proto.OP_OK then return records end
-        if op == proto.OP_RECORD then
+        if op == proto.OP_RECORD_BATCH then
+            local batch, derr = proto.decode_record_batch(payload)
+            if not batch then return nil, "decode record_batch: " .. tostring(derr) end
+            for i = 1, #batch do records[#records + 1] = batch[i] end
+        elseif op == proto.OP_RECORD then
             local r, derr = self:_decode_record(payload)
             if not r then return nil, "decode record: " .. tostring(derr) end
             records[#records + 1] = r

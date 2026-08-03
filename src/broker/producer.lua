@@ -304,6 +304,161 @@ function Producer:produce(topic_name, msg, opts)
     return partition_id, offset, nil
 end
 
+-- produce_batch appends many messages to one topic in a single pass.
+--
+-- The win over N calls to produce() is durability cost, not the appends
+-- themselves: acks>=1 issues ONE request_sync per distinct partition the batch
+-- touched, at the end, instead of one per record. A 500-record batch on a
+-- 4-partition topic goes from 500 fsyncs to 4. Appends are still per-record
+-- (both storage backends index per message), and partitioning is unchanged —
+-- each record is routed by its own key, so a batch may fan out across
+-- partitions.
+--
+-- Ordering is preserved: records are appended in list order, so two records
+-- landing on the same partition keep their relative order.
+--
+-- opts (optional):
+--   pre_append  as in produce(), but invoked ONCE PER DISTINCT PARTITION —
+--               on the first record routed there. The txn coordinator's
+--               enrolment is idempotent per partition and captures the LEO
+--               before any of the batch's records land, which is exactly the
+--               bound the LSO needs.
+--
+-- Returns (acks, err) where `acks` is a list of { partition, offset } for the
+-- records that were appended — always a PREFIX of `msgs`. On failure the acks
+-- collected so far are returned alongside the error, already fsynced: a
+-- partial batch is durable up to the failure, never silently dropped.
+function Producer:produce_batch(topic_name, msgs, opts)
+    assert(type(topic_name) == "string", "topic_name must be a string")
+    assert(type(msgs) == "table" and #msgs > 0, "msgs must be a non-empty list")
+
+    local acks = {}
+
+    if self.acks == AckMode.AckAll
+        and not (self.replicator and self.replicator:enabled()) then
+        return acks, ERR_ACKS_ALL_UNSUPPORTED
+    end
+
+    local valid, vErr = util.validate_topic_name(topic_name)
+    if not valid then return acks, vErr end
+
+    local topic, err = self.broker:get_topic(topic_name)
+    if not topic then
+        return acks, string.format("failed to get topic: %s", err)
+    end
+
+    local num_partitions = #topic.partitions
+
+    -- Partitions this batch appended to locally, in first-touch order, each
+    -- with the highest log-end offset the batch produced there. Both the
+    -- single fsync per partition and the acks=all wait key off this.
+    local touched, touched_order = {}, {}
+    local enrolled = {}
+    local batch_err
+
+    for i = 1, #msgs do
+        local msg = msgs[i]
+        assert(getmetatable(msg) == message.Message, "msgs must contain Messages")
+        if msg.timestamp == 0 then
+            msg.timestamp = now_ms()
+        end
+
+        local partition_id = pick_partition(self, topic_name, msg.key, num_partitions) + 1
+        local partition    = topic.partitions[partition_id]
+        if not partition then
+            batch_err = string.format("partition %d does not exist", partition_id)
+            break
+        end
+
+        -- Cluster routing, per record: a peer-owned partition's records are
+        -- forwarded to the owner one at a time. The batch's fsync amortisation
+        -- is a local-append property, so a forwarded record costs the same as
+        -- it does through produce() — the batch still saves the client N-1
+        -- round trips.
+        local peer
+        if self.router then
+            local rerr
+            peer, rerr = self.router:route(topic_name, partition_id)
+            if rerr then batch_err = rerr; break end
+        end
+
+        if peer then
+            if opts and opts.pre_append and not enrolled[partition_id] then
+                local rleo, lerr = peer:leo(topic_name, partition_id)
+                if not rleo then
+                    batch_err = string.format("leo of %s/partition-%d on peer %s: %s",
+                        topic_name, partition_id, peer.id, tostring(lerr))
+                    break
+                end
+                local pok, perr = opts.pre_append(topic_name, partition_id, nil,
+                    { peer = peer, leo = rleo })
+                if not pok then batch_err = perr; break end
+                enrolled[partition_id] = true
+            end
+            local roffset, ferr = self.router:forward(peer, topic_name, partition_id, msg)
+            if not roffset then batch_err = ferr; break end
+            acks[#acks + 1] = { partition = partition_id, offset = roffset }
+        else
+            if opts and opts.pre_append and not enrolled[partition_id] then
+                local pok, perr = opts.pre_append(topic_name, partition_id, partition)
+                if not pok then batch_err = perr; break end
+                enrolled[partition_id] = true
+            end
+
+            local offset, werr = partition:write_message(msg)
+            if werr then
+                batch_err = string.format("failed to write message: %s", werr)
+                break
+            end
+            acks[#acks + 1] = { partition = partition_id, offset = offset }
+
+            if self.broker.traffic then
+                self.broker.traffic:add_in(topic_name, partition_id, #msg.key + #msg.value)
+            end
+
+            -- Log-end offset covering this record, captured before any sync
+            -- can park this coroutine (see the same note in produce()).
+            if not touched[partition_id] then
+                touched_order[#touched_order + 1] = partition_id
+                touched[partition_id] = { partition = partition }
+            end
+            touched[partition_id].leo = partition.offset
+
+            if self.replicator and self.replicator:enabled() then
+                local bytes, berr = message.serialize_message(msg)
+                if bytes then
+                    self.replicator:replicate(topic_name, partition_id,
+                        partition.offset, bytes)
+                else
+                    log:error("replication skipped: serialize failed: %s", tostring(berr))
+                end
+            end
+        end
+    end
+
+    -- One fsync per partition for the whole batch. Runs even on a partial
+    -- failure so the prefix we're about to ack is genuinely durable.
+    if self.acks == AckMode.AckLeader or self.acks == AckMode.AckAll then
+        for _, partition_id in ipairs(touched_order) do
+            local sok, serr = touched[partition_id].partition:request_sync()
+            if not sok then
+                return acks, string.format("failed to sync partition %d: %s",
+                    partition_id, tostring(serr))
+            end
+        end
+    end
+
+    if self.acks == AckMode.AckAll then
+        for _, partition_id in ipairs(touched_order) do
+            local rok, rerr = self.replicator:wait_for(
+                topic_name, partition_id, touched[partition_id].leo)
+            if not rok then return acks, rerr end
+        end
+    end
+
+    return acks, batch_err
+end
+
 -- Async variant. Returns a Future that resolves to a ProduceResult.
 -- NOTE: with the trivial scheduler (synchronous coroutine.resume), this
 -- runs to completion on the calling resume — it does not actually overlap

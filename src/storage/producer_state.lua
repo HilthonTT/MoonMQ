@@ -59,6 +59,27 @@ local IDENTITY_VALUE_FMT = ">I8I2"        -- pid, epoch
 local MEMO_VALUE_FMT     = ">I4I8I4I2"    -- last_seq, last_offset, last_partition, epoch
 local MEMO_VALUE_FMT_V1  = ">I4I8I4"      -- pre-epoch memos (read-compat only)
 
+-- A memo written by PRODUCE_BATCH appends a tail to the v2 value:
+--
+--   <v2 value> | u32 base_seq | u32 count | (u32 partition | u64 offset)*
+--
+-- One record's ack is not enough to answer a duplicate BATCH: a batch spans
+-- partitions and offsets are opaque per-backend cursors (on the segmented
+-- backend they are byte positions), so offsets cannot be reconstructed from a
+-- base. The acks are therefore stored verbatim.
+--
+-- The tail is strictly additive: string.unpack ignores trailing bytes, so a
+-- reader that only knows v2 still parses last_seq/last_offset/last_partition/
+-- epoch out of a v3 value exactly as before. Single-record produces keep
+-- writing plain v2 values (no tail), which is what makes an interleaving of
+-- batch and single produces on one (pid, topic) work without special cases.
+local MEMO_BATCH_HDR_FMT = ">I4I4"        -- base_seq, count
+local MEMO_ACK_FMT       = ">I4I8"        -- partition, offset
+-- Matches proto.MAX_IDEMPOTENT_BATCH. Duplicated rather than required so the
+-- storage layer keeps no dependency on the wire module; the decoder uses it
+-- only to refuse an implausible count from a corrupt record.
+local MAX_MEMO_ACKS      = 1024
+
 -- The identity epoch packs as u16; the 65,536th session of one name would
 -- overflow string.pack mid-write. Fail the INIT instead (fresh name = fresh pid).
 local MAX_EPOCH = 0xFFFF
@@ -204,10 +225,27 @@ end
 -- record_produce persists (and memoizes) the sequence/offset for a freshly
 -- appended idempotent record, tagged with the epoch of the session that wrote
 -- it. Returns (true, nil) or (nil, err).
-function ProducerStateManager:record_produce(pid, topic, seq, offset, partition, epoch)
+--
+-- batch (optional) = { base_seq = , acks = { { partition, offset }, ... } }:
+-- set by the PRODUCE_BATCH path so a duplicate batch can be answered with the
+-- original per-record acks. `seq`/`offset`/`partition` must describe the
+-- batch's LAST record, which keeps a following single-record produce working
+-- off the same last_seq with no knowledge that a batch came before it.
+-- Omitting `batch` writes a plain v2 memo and clears any stored batch.
+function ProducerStateManager:record_produce(pid, topic, seq, offset, partition, epoch, batch)
     epoch = epoch or 0
     local key = K_MEMO .. string.pack(">I8", pid) .. topic
     local val = string.pack(MEMO_VALUE_FMT, seq, offset, partition, epoch)
+    if batch then
+        assert(#batch.acks <= MAX_MEMO_ACKS,
+            "batch too large to memoize for idempotent replay")
+        local parts = { val, string.pack(MEMO_BATCH_HDR_FMT, batch.base_seq, #batch.acks) }
+        for i = 1, #batch.acks do
+            local a = batch.acks[i]
+            parts[#parts + 1] = string.pack(MEMO_ACK_FMT, a.partition, a.offset)
+        end
+        val = table.concat(parts)
+    end
     local now = os.time() * 1000
     local ok, err = self:_write(key, val, now)
     if not ok then return nil, err end
@@ -215,9 +253,30 @@ function ProducerStateManager:record_produce(pid, topic, seq, offset, partition,
     local t = self.memo[pid]
     if not t then t = {}; self.memo[pid] = t end
     t[topic] = { last_seq = seq, last_offset = offset,
-                 last_partition = partition, epoch = epoch }
+                 last_partition = partition, epoch = epoch,
+                 base_seq = batch and batch.base_seq or nil,
+                 acks     = batch and batch.acks or nil }
     self.last_active[pid] = now
     return true, nil
+end
+
+-- Parse the optional batch tail of a v3 memo value. `pos` is the position
+-- string.unpack stopped at after the v2 prefix. Returns (base_seq, acks) or
+-- nil when there is no tail (v1/v2 value) or it is truncated — a corrupt tail
+-- degrades to "no batch memo", i.e. a duplicate batch is rejected as
+-- out-of-order rather than replayed with wrong offsets.
+local function decode_batch_tail(value, pos)
+    if #value - pos + 1 < 8 then return nil end
+    local ok, base_seq, count, p = pcall(string.unpack, MEMO_BATCH_HDR_FMT, value, pos)
+    if not ok or count == 0 or count > MAX_MEMO_ACKS then return nil end
+    if #value - p + 1 < count * 12 then return nil end
+    local acks = {}
+    for i = 1, count do
+        local partition, offset, np = string.unpack(MEMO_ACK_FMT, value, p)
+        acks[i] = { partition = partition, offset = offset }
+        p = np
+    end
+    return base_seq, acks
 end
 
 -- expire_idle garbage-collects durable producers whose last identity/memo
@@ -349,20 +408,25 @@ function ProducerStateManager:recover()
                         end
                         return
                     end
-                    local ok, s, off, prt, ep =
+                    local ok, s, off, prt, ep, vpos =
                         pcall(string.unpack, MEMO_VALUE_FMT, m.value)
                     if not ok then
                         -- Pre-epoch memo (v1 format). Epoch 0: any session
                         -- after a reconnect has epoch >= 1 and correctly
                         -- treats this memo as belonging to an older session.
                         ok, s, off, prt = pcall(string.unpack, MEMO_VALUE_FMT_V1, m.value)
-                        ep = 0
+                        ep, vpos = 0, nil
                     end
                     if ok then
+                        -- v3 batch tail, when present: the per-record acks a
+                        -- duplicate PRODUCE_BATCH replays.
+                        local base_seq, acks
+                        if vpos then base_seq, acks = decode_batch_tail(m.value, vpos) end
                         local t = self.memo[pid]
                         if not t then t = {}; self.memo[pid] = t end
                         t[topic] = { last_seq = s, last_offset = off,
-                                     last_partition = prt, epoch = ep }
+                                     last_partition = prt, epoch = ep,
+                                     base_seq = base_seq, acks = acks }
                         touch(pid, m.timestamp)
                         if pid > max_pid then max_pid = pid end
                         restored = restored + 1

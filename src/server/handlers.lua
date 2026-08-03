@@ -166,6 +166,212 @@ function M.produce(server, conn, correl, payload)
     conn:send(proto.encode_produce_ack(correl, part_id, offset))
 end
 
+-- Build every Message for a batch up front, so a codec that isn't available
+-- here fails the whole batch before anything is appended rather than halfway
+-- through. Returns (messages, nil) or (nil, err).
+local function build_batch_messages(records, codec, txn)
+    local msgs = {}
+    for i = 1, #records do
+        local r = records[i]
+        local msg, berr = build_stored_message(codec, r.key, r.value, txn)
+        if not msg then return nil, berr end
+        msgs[i] = msg
+    end
+    return msgs, nil
+end
+
+-- Read the dedup state for (pid, topic) — the durable memo for a named
+-- producer, per-connection state for an ephemeral one. Returns a table with
+-- last_seq (-1 when there is none), and for a memo written by a batch, the
+-- base_seq/acks that let an exact duplicate batch be replayed.
+local function seq_state_for(conn, ps, topic, durable)
+    if durable then
+        local m = ps:lookup_memo(conn.pid, topic)
+        -- Only THIS session's memo counts: a reconnect bumps the epoch and
+        -- restarts sequences at 0 (KIP-360), so an older session's memo must
+        -- not swallow the new session's first records as retries.
+        if m and (m.epoch or 0) == conn.epoch then return m end
+        return { last_seq = -1 }
+    end
+    return conn.seq_state[topic] or { last_seq = -1 }
+end
+
+-- PRODUCE_BATCH: N records for one topic in one frame, answered by one
+-- PRODUCE_BATCH_ACK carrying N (partition, offset) pairs.
+--
+-- The batch is not atomic — it is N ordinary appends that share a frame, a
+-- dispatch, and (via Producer:produce_batch) one fsync per partition touched.
+-- A failure part-way through acks the durable prefix and reports the error;
+-- the client resends the tail. Use transactions when you need all-or-nothing.
+--
+-- Idempotent batches (flags & IDEMPOTENT) extend the single-record contract:
+-- record i carries sequence base_seq + i, so the per-(pid, topic) counter
+-- advances by `count`. Dedup is at BATCH granularity — an exact resend of the
+-- last batch replays its memoized acks, anything else that overlaps the
+-- consumed sequence space is ERR_OUT_OF_ORDER_SEQUENCE.
+function M.produce_batch(server, conn, correl, payload)
+    local b, err = proto.decode_produce_batch(payload)
+    if not b then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+    local count = #b.records
+
+    -- One token per record: a batch is N records' worth of work, and charging
+    -- it as one would make PRODUCE_BATCH a trivial bypass of the limiter.
+    if conn.rate_limiter and not conn.rate_limiter:take(count) then
+        conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
+            "produce rate exceeded"))
+        return
+    end
+
+    -- Plain (non-idempotent) batch: append and ack.
+    if not b.idempotent then
+        local msgs, berr = build_batch_messages(b.records, b.codec)
+        if not msgs then
+            conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, berr))
+            return
+        end
+        local acks, perr = server.producer:produce_batch(b.topic, msgs)
+        if perr and #acks == 0 then
+            local code = perr:find("does not exist", 1, true)
+                and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
+            conn:send(proto.encode_error(correl, code, perr))
+            return
+        end
+        if #acks > 0 then
+            metrics.inc("moonmq_produce_records_total", #acks, { topic = b.topic })
+            metrics.inc("moonmq_produce_batches_total", 1, { topic = b.topic })
+        end
+        conn:send(proto.encode_produce_batch_ack(correl, acks,
+            perr and proto.ERR_INTERNAL or 0, perr))
+        return
+    end
+
+    -- ---- Idempotent batch ------------------------------------------------
+    if not conn.pid then
+        conn:send(proto.encode_error(correl, proto.ERR_NO_PRODUCER_ID,
+            "INIT_PRODUCER_ID required before an idempotent PRODUCE_BATCH"))
+        return
+    end
+    if b.pid ~= conn.pid then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL,
+            string.format("pid mismatch: frame=%d conn=%d", b.pid, conn.pid)))
+        return
+    end
+    -- The acks of an idempotent batch are persisted so a duplicate can replay
+    -- them; refuse a batch whose memo would be unreasonably large. Nothing has
+    -- been appended at this point, so the client can simply split and resend.
+    if count > proto.MAX_IDEMPOTENT_BATCH then
+        conn:send(proto.encode_error(correl, proto.ERR_BATCH_TOO_LARGE,
+            string.format("idempotent batch of %d exceeds the %d-record limit; split it",
+                count, proto.MAX_IDEMPOTENT_BATCH)))
+        return
+    end
+
+    local ps      = server.broker.producer_state
+    local durable = conn.producer_name ~= nil
+
+    if durable then
+        local cur = ps:current_epoch(conn.pid)
+        if cur ~= nil and b.epoch ~= cur then
+            conn:send(proto.encode_error(correl, proto.ERR_PRODUCER_FENCED,
+                string.format("producer fenced: frame epoch %d != current %d",
+                    b.epoch, cur)))
+            return
+        end
+    end
+
+    local state    = seq_state_for(conn, ps, b.topic, durable)
+    local last_seq = state.last_seq
+    local base     = b.base_seq
+    local last     = base + count - 1
+
+    -- Exact duplicate of the previous batch: replay its acks, append nothing.
+    -- Checked before the fresh case; the two can't both hold for count >= 1.
+    if state.acks and state.base_seq == base and last_seq == last then
+        conn:send(proto.encode_produce_batch_ack(correl, state.acks, 0, nil))
+        return
+    end
+    if base ~= last_seq + 1 then
+        conn:send(proto.encode_error(correl, proto.ERR_OUT_OF_ORDER_SEQUENCE,
+            string.format("expected base seq %d, got %d..%d (pid=%d %s)",
+                last_seq + 1, base, last, conn.pid, b.topic)))
+        return
+    end
+
+    local in_txn = conn.in_txn and conn.producer_name ~= nil
+    local msgs, berr = build_batch_messages(b.records, b.codec,
+        in_txn and { pid = conn.pid, epoch = conn.epoch } or nil)
+    if not msgs then
+        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, berr))
+        return
+    end
+
+    local produce_opts
+    local enrol_err, enrol_code
+    if in_txn then
+        produce_opts = {
+            pre_append = function(topic_name, partition_id, _partition, remote)
+                local pok, perr, pcode = server.broker.transactions:add_partition(
+                    conn.producer_name, conn.pid, conn.epoch, topic_name, partition_id,
+                    remote)
+                if not pok then
+                    enrol_err, enrol_code = perr, pcode
+                    return nil, "failed to enrol partition in txn: " .. tostring(perr)
+                end
+                return true
+            end,
+        }
+    end
+
+    local acks, perr = server.producer:produce_batch(b.topic, msgs, produce_opts)
+
+    if perr and #acks == 0 then
+        if enrol_err then
+            conn:send(proto.encode_error(correl, txn_err_code(enrol_code), perr))
+            return
+        end
+        local code = perr:find("does not exist", 1, true)
+            and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
+        conn:send(proto.encode_error(correl, code, perr))
+        return
+    end
+
+    -- Memoize what actually landed. On a partial append the memo describes the
+    -- prefix, so the client's resend of the tail starts at last_seq + 1 and is
+    -- treated as fresh rather than as an out-of-order duplicate.
+    local applied  = #acks
+    local last_ack = acks[applied]
+    local memo     = { base_seq = base, acks = acks }
+    if durable then
+        local ok, rerr = ps:record_produce(conn.pid, b.topic, base + applied - 1,
+            last_ack.offset, last_ack.partition, conn.epoch, memo)
+        if not ok then
+            -- The records are durable; only the replay memo failed, so a later
+            -- retry could duplicate. Surface that rather than acking clean.
+            conn:send(proto.encode_produce_batch_ack(correl, acks, proto.ERR_INTERNAL,
+                "produced but failed to persist producer state: " .. tostring(rerr)))
+            return
+        end
+    else
+        conn.seq_state[b.topic] = {
+            last_seq       = base + applied - 1,
+            last_offset    = last_ack.offset,
+            last_partition = last_ack.partition,
+            base_seq       = base,
+            acks           = acks,
+        }
+    end
+
+    metrics.inc("moonmq_produce_records_total", applied, { topic = b.topic })
+    metrics.inc("moonmq_idempotent_produce_total", applied, { topic = b.topic })
+    metrics.inc("moonmq_produce_batches_total", 1, { topic = b.topic })
+
+    conn:send(proto.encode_produce_batch_ack(correl, acks,
+        perr and proto.ERR_INTERNAL or 0, perr))
+end
+
 -- INIT_PRODUCER_ID: assign a producer ID (+ epoch) to this connection.
 --
 -- Empty producer_name → an ephemeral, session-scoped PID (today's behaviour):
@@ -276,24 +482,12 @@ function M.produce_idempotent(server, conn, correl, payload)
     -- records as "retries" (KIP-360 semantics). Idempotent-retry protection
     -- therefore spans a session — including a broker restart mid-session —
     -- but not a producer reconnect, which starts a fresh sequence space.
-    local last_seq, last_offset, last_partition
-    if durable then
-        local m = ps:lookup_memo(conn.pid, p.topic)
-        if m and (m.epoch or 0) == conn.epoch then
-            last_seq, last_offset, last_partition =
-                m.last_seq, m.last_offset, m.last_partition
-        else
-            last_seq = -1
-        end
-    else
-        local slot = conn.seq_state[p.topic]
-        if slot then
-            last_seq, last_offset, last_partition =
-                slot.last_seq, slot.last_offset, slot.last_partition
-        else
-            last_seq = -1
-        end
-    end
+    -- A memo left by PRODUCE_BATCH describes the batch's LAST record, so this
+    -- path reads it exactly like a single-record memo: seq == last_seq replays
+    -- that record's ack, and the next fresh seq is last_seq + 1.
+    local state = seq_state_for(conn, ps, p.topic, durable)
+    local last_seq, last_offset, last_partition =
+        state.last_seq, state.last_offset, state.last_partition
 
     if p.seq == last_seq and last_offset ~= nil then
         -- Idempotent retry: replay the original ack without re-appending.
@@ -407,7 +601,11 @@ local function subscriber_loop(server, conn)
         -- Re-scope to the current assignment each pass so a rebalance (another
         -- member joining/leaving) takes effect on the next poll.
         server.coordinator:apply_assignment(conn)
-        local records, err = conn.consumer:poll()
+        -- Drain up to push_batch records per pass rather than one per
+        -- partition. Frames are unchanged (one RECORD per record, which is
+        -- what every subscriber already expects) — what this saves is the
+        -- push_interval sleep between records on a backlogged partition.
+        local records, err = conn.consumer:poll({ max_records = server.push_batch })
         if err then
             push_log:error("conn=%s poll: %s", conn.id_short, err)
             return
@@ -519,7 +717,9 @@ function M.fetch(server, conn, correl, payload)
     -- Restrict to this member's assigned partitions (no-op unless joined).
     server.coordinator:apply_assignment(conn)
 
-    local records, perr = consumer:poll()
+    -- max_records is the real batch size now: poll() spreads it across the
+    -- partitions this member reads instead of stopping at one record each.
+    local records, perr = consumer:poll({ max_records = f.max_records })
     if perr then
         conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, perr))
         return
@@ -528,40 +728,92 @@ function M.fetch(server, conn, correl, payload)
         local limit = math.min(#records, f.max_records or #records)
 
         -- Rewind the in-memory cursor for everything we are NOT sending, so
-        -- the next FETCH re-reads it. poll() returns at most one record per
-        -- partition, so each rewind target is exact.
-        for i = limit + 1, #records do
+        -- the next FETCH re-reads it. Walk BACKWARDS: a partition can appear
+        -- several times in one poll now, and the correct rewind target is its
+        -- FIRST undelivered record (records are collected in read order, so
+        -- the lowest offset is the last assignment a backwards walk makes).
+        for i = #records, limit + 1, -1 do
             local r = records[i]
             consumer.offsets[r.topic][r.partition] = r.offset
         end
 
-        for i = 1, limit do
-            local r = records[i]
-            local frame = proto.encode_record(correl,
-                r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
-            if not conn:send(frame) then
-                -- Send layer refused (connection closing): rewind the rest of
-                -- the batch too; nothing sent from here on was committed.
-                for j = i, limit do
-                    local rr = records[j]
-                    consumer.offsets[rr.topic][rr.partition] = rr.offset
+        -- Deliver. Batched clients get one RECORD_BATCH frame; everyone else
+        -- gets the historical one-RECORD-frame-per-record stream.
+        local delivered = limit
+        if f.batched then
+            local batch = {}
+            for i = 1, limit do batch[i] = records[i] end
+            if limit > 0 and not conn:send(proto.encode_record_batch(correl, batch)) then
+                -- Nothing was delivered: rewind the whole batch so the next
+                -- FETCH re-reads it, and skip the commits below.
+                for i = limit, 1, -1 do
+                    local r = records[i]
+                    consumer.offsets[r.topic][r.partition] = r.offset
                 end
                 return
             end
-            server.broker.traffic:add_out(r.topic, r.partition, #r.key + #r.value)
-            -- Commit only after the record is accepted by the send layer —
-            -- at-least-once, same contract as the push path. A commit failure
-            -- is logged but doesn't abort the response: the record was
-            -- delivered, and an uncommitted offset merely means redelivery.
-            local adv = consumer.offsets[r.topic][r.partition]
-            local cok, commit_err = consumer:commit_offset(r.topic, r.partition, adv)
-            if not cok then
-                log:error("conn=%s fetch commit %s/partition-%d: %s",
-                    conn.id_short, r.topic, r.partition, commit_err)
+            for i = 1, limit do
+                local r = records[i]
+                server.broker.traffic:add_out(r.topic, r.partition, #r.key + #r.value)
+            end
+        else
+            for i = 1, limit do
+                local r = records[i]
+                local frame = proto.encode_record(correl,
+                    r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
+                if not conn:send(frame) then
+                    -- Send layer refused (connection closing): rewind this
+                    -- record and everything after it — nothing from here on
+                    -- was delivered, so nothing from here on gets committed.
+                    for j = limit, i, -1 do
+                        local rr = records[j]
+                        consumer.offsets[rr.topic][rr.partition] = rr.offset
+                    end
+                    delivered = i - 1
+                    break
+                end
+                server.broker.traffic:add_out(r.topic, r.partition, #r.key + #r.value)
             end
         end
-        if limit > 0 then
-            metrics.inc("moonmq_fetch_records_total", limit, { topic = f.topic })
+
+        -- Commit ONCE PER PARTITION, after delivery — at-least-once, same
+        -- contract as before (commit strictly after the send layer accepted
+        -- the record), but one durable offset write per partition instead of
+        -- one per record.
+        --
+        -- The committed value is read from consumer.offsets AFTER every rewind
+        -- above has been applied, which is what makes it exact: a partition
+        -- with undelivered records has been rewound to the first of them, and
+        -- a partition that was fully delivered still holds the cursor poll()
+        -- left. Either way it names the first record this group has not been
+        -- handed, so nothing is skipped and only delivered records are marked
+        -- consumed.
+        local advanced, order = {}, {}
+        for i = 1, delivered do
+            local r = records[i]
+            local by_topic = advanced[r.topic]
+            if not by_topic then
+                by_topic = {}
+                advanced[r.topic] = by_topic
+            end
+            if by_topic[r.partition] == nil then
+                order[#order + 1] = { topic = r.topic, partition = r.partition }
+            end
+            by_topic[r.partition] = consumer.offsets[r.topic][r.partition]
+        end
+        for _, k in ipairs(order) do
+            local cok, commit_err = consumer:commit_offset(
+                k.topic, k.partition, advanced[k.topic][k.partition])
+            if not cok then
+                -- Logged, not fatal: the records were delivered, and an
+                -- uncommitted offset only means redelivery.
+                log:error("conn=%s fetch commit %s/partition-%d: %s",
+                    conn.id_short, k.topic, k.partition, commit_err)
+            end
+        end
+
+        if delivered > 0 then
+            metrics.inc("moonmq_fetch_records_total", delivered, { topic = f.topic })
         end
     end
     conn:send(proto.encode_ok(correl))
@@ -955,6 +1207,7 @@ M.BY_OP = {
     [proto.OP_AUTH]               = M.auth,
     [proto.OP_IDENTIFY_CLIENT]    = M.identify_client,
     [proto.OP_PRODUCE]            = M.produce,
+    [proto.OP_PRODUCE_BATCH]      = M.produce_batch,
     [proto.OP_INIT_PRODUCER_ID]   = M.init_producer_id,
     [proto.OP_PRODUCE_IDEMPOTENT] = M.produce_idempotent,
     [proto.OP_SUBSCRIBE]          = M.subscribe,

@@ -123,14 +123,54 @@ function Consumer:owns(topic_name, partition_id)
     return owned ~= nil and owned[partition_id] == true
 end
 
--- Poll reads at most one message PER partition across all subscribed topics.
+-- Poll reads messages from every subscribed partition this member owns.
 -- Returns (records, nil) on success, (nil, err) on failure.
+--
+-- opts (optional):
+--   max_per_partition  records to take from ONE partition before moving on
+--                      (default 1 — the historical behaviour, which every
+--                      caller that passes no opts keeps).
+--   max_records        total cap for the poll. When given without
+--                      max_per_partition, the per-partition allowance is
+--                      derived as an even share across the partitions this
+--                      poll would consider, so a busy partition can't starve
+--                      its peers of a fixed-size batch.
 local function is_eof_error(read_err)
     return read_err ~= nil and read_err:find("EOF", 1, true) ~= nil
 end
 
-function Consumer:poll()
+-- How many (topic, partition) pairs this poll would actually read from —
+-- subscribed, owned under the current assignment, and still served locally.
+-- Used only to divide max_records fairly.
+function Consumer:_pollable_partition_count()
+    local n = 0
+    for topic_name, partition_offsets in pairs(self.offsets) do
+        for partition_id in pairs(partition_offsets) do
+            if self:owns(topic_name, partition_id)
+                and self.broker:serves_partition(topic_name, partition_id) then
+                n = n + 1
+            end
+        end
+    end
+    return n
+end
+
+function Consumer:poll(opts)
+    opts = opts or {}
     local records = {}
+
+    local max_records       = opts.max_records
+    local max_per_partition = opts.max_per_partition
+    if not max_per_partition then
+        if max_records then
+            local n = self:_pollable_partition_count()
+            max_per_partition = n > 0
+                and math.max(1, math.ceil(max_records / n))
+                or max_records
+        else
+            max_per_partition = 1
+        end
+    end
 
     for topic_name, partition_offsets in pairs(self.offsets) do
         -- Use the cached topic ref from subscribe(); fall back to
@@ -162,11 +202,13 @@ function Consumer:poll()
             -- the CLUSTER moved to another broker (stale local copy), that
             -- vanished, or that we've consumed up to the tail. The inner loop
             -- steps over non-application records (control markers, and aborted
-            -- transactional data under read_committed) until it delivers ONE
-            -- data record for this partition or reaches the ceiling — without
-            -- it, every skipped record would cost the caller a whole poll()
-            -- that returns nothing, which looks like end-of-stream.
-            while self:owns(topic_name, partition_id)
+            -- transactional data under read_committed) until it has delivered
+            -- max_per_partition data records or reached the ceiling — skipped
+            -- records don't count against the allowance, so a run of control
+            -- markers can't make a poll look like end-of-stream.
+            local taken = 0
+            while taken < max_per_partition
+                and self:owns(topic_name, partition_id)
                 and self.broker:serves_partition(topic_name, partition_id)
                 and partition and offset < hi do
                 local msg, next_offset, read_err = partition:read_message(offset)
@@ -237,7 +279,15 @@ function Consumer:poll()
                         value,
                         msg.timestamp
                     )
-                    break   -- one data record per partition per poll
+                    taken  = taken + 1
+                    offset = next_offset
+                    -- Total cap reached: stop the whole poll here. Everything
+                    -- collected is consistent (each record's offset was
+                    -- advanced, and committed if auto_commit is on), and the
+                    -- untouched partitions are simply read on the next poll.
+                    if max_records and #records >= max_records then
+                        return records, nil
+                    end
                 else
                     if is_eof_error(read_err) then
                         -- Two distinct EOF-flavoured situations:

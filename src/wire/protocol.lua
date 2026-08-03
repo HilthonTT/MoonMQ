@@ -71,6 +71,14 @@ M.OP_TXN_OFFSET_COMMIT = 0x15
 -- advances the group past it. Acked with NACK_ACK either way.
 M.OP_NACK             = 0x16
 
+-- Batching. One PRODUCE_BATCH frame carries N records for a topic and is
+-- answered by one PRODUCE_BATCH_ACK carrying N (partition, offset) pairs —
+-- amortising framing, dispatch, and (crucially) the acks=1 fsync across the
+-- whole batch instead of paying all three per record. FETCH asks for a batched
+-- reply via its flags byte and gets one RECORD_BATCH instead of N RECORD
+-- frames. See docs/batching.md.
+M.OP_PRODUCE_BATCH    = 0x17
+
 -- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
@@ -87,6 +95,8 @@ M.OP_IDENTIFY_ACK  = 0x87
 M.OP_PRODUCER_ID   = 0x88
 M.OP_GROUP_ASSIGNMENT = 0x89
 M.OP_NACK_ACK      = 0x8A
+M.OP_PRODUCE_BATCH_ACK = 0x8B
+M.OP_RECORD_BATCH  = 0x8C
 M.OP_ERROR         = 0xFE
 
 -- Correlation IDs are 16-byte UUIDs.
@@ -99,6 +109,17 @@ M.CORREL_ID_LEN = CORREL_ID_LEN
 -- records of aborted transactions — see docs/transactions.md.
 M.ISOLATION_READ_UNCOMMITTED = 0
 M.ISOLATION_READ_COMMITTED   = 1
+
+-- Optional trailing flags byte on FETCH, after the isolation byte. A broker
+-- that predates batching stops decoding at isolation and answers with the
+-- legacy one-RECORD-frame-per-record stream, so setting the bit is safe
+-- against any broker version.
+M.FETCH_FLAG_BATCHED = 0x01
+
+-- PRODUCE_BATCH flags byte. IDEMPOTENT means the frame carries the
+-- (pid, base_seq, epoch) triple and the batch participates in producer-state
+-- dedup; without it the batch is a plain multi-record append.
+M.BATCH_FLAG_IDEMPOTENT = 0x01
 
 -- Error codes. Keep numeric so non-Lua clients can switch on them.
 M.ERR_BAD_FRAME            = 1
@@ -125,6 +146,9 @@ M.ERR_OUT_OF_ORDER_SEQUENCE = 11
 --   one connection maps to at most one group membership.
 M.ERR_GROUP_MEMBER_UNKNOWN = 12
 M.ERR_GROUP_CONFLICT       = 13
+-- BATCH_TOO_LARGE: more records in one PRODUCE_BATCH than the broker will
+-- accept. Split and resend — the batch was NOT partially applied.
+M.ERR_BATCH_TOO_LARGE      = 14
 -- Transactional / durable-producer error codes (see docs/transactions.md).
 -- PRODUCER_FENCED: a produce/transaction op arrived with an epoch older than
 --   the current one for this producer id — a newer session (same
@@ -214,6 +238,76 @@ function M.encode_produce_ack(correl_id, partition, offset)
     return encode_frame(M.OP_PRODUCE_ACK, correl_id, payload)
 end
 
+-- PRODUCE_BATCH payload:
+--   u8 flags | u8 codec | str topic
+--     | [u64 pid | u32 base_seq | u16 epoch]   (only when flags has IDEMPOTENT)
+--     | u32 count | (str key | str value)*
+--
+-- All records go to one topic; the broker still partitions each record
+-- individually (same key-hash / sticky partitioner as PRODUCE), so a batch may
+-- span partitions. Under IDEMPOTENT the i-th record carries sequence
+-- base_seq + i, which keeps the existing per-(pid, topic) monotonic contract.
+--
+-- `records` is a list of { key = , value = } (key defaults to "").
+function M.encode_produce_batch(correl_id, topic, records, opts)
+    assert(type(records) == "table", "records must be a list")
+    opts = opts or {}
+    local idempotent = opts.pid ~= nil
+
+    local parts = {
+        string.pack(">BB",
+            idempotent and M.BATCH_FLAG_IDEMPOTENT or 0,
+            opts.codec or 0),
+        encode_string(topic),
+    }
+    if idempotent then
+        parts[#parts + 1] = string.pack(">I8I4I2",
+            opts.pid, opts.base_seq or 0, opts.epoch or 0)
+    end
+    parts[#parts + 1] = string.pack(">I4", #records)
+    for i = 1, #records do
+        local r = records[i]
+        parts[#parts + 1] = encode_string(r.key or "")
+        parts[#parts + 1] = encode_string(r.value or "")
+    end
+    return encode_frame(M.OP_PRODUCE_BATCH, correl_id, table.concat(parts))
+end
+
+-- PRODUCE_BATCH_ACK payload:
+--   u32 count | (u32 partition | u64 offset)* | u16 err_code | str err_message
+--
+-- `count` is how many records were actually appended, always a PREFIX of the
+-- request: records past it were not written. err_code 0 means the whole batch
+-- landed. A non-zero code with count > 0 is a partial append — the client may
+-- resend the tail (under IDEMPOTENT the sequence space lines up so the resend
+-- is treated as fresh, not as a duplicate).
+function M.encode_produce_batch_ack(correl_id, acks, err_code, err_message)
+    local parts = { string.pack(">I4", #acks) }
+    for i = 1, #acks do
+        parts[#parts + 1] = string.pack(">I4I8", acks[i].partition, acks[i].offset)
+    end
+    parts[#parts + 1] = string.pack(">I2", err_code or 0)
+    parts[#parts + 1] = encode_string(err_message or "")
+    return encode_frame(M.OP_PRODUCE_BATCH_ACK, correl_id, table.concat(parts))
+end
+
+-- RECORD_BATCH payload:
+--   u32 count | (str topic | u32 partition | u64 offset | u64 timestamp
+--                | str key | str value)*
+-- Same per-record fields as OP_RECORD, minus the per-record frame header.
+function M.encode_record_batch(correl_id, records)
+    local parts = { string.pack(">I4", #records) }
+    for i = 1, #records do
+        local r = records[i]
+        parts[#parts + 1] = encode_string(r.topic)
+        parts[#parts + 1] = string.pack(">I4I8I8",
+            r.partition, r.offset, r.timestamp or 0)
+        parts[#parts + 1] = encode_string(r.key or "")
+        parts[#parts + 1] = encode_string(r.value or "")
+    end
+    return encode_frame(M.OP_RECORD_BATCH, correl_id, table.concat(parts))
+end
+
 -- Idempotent producer wire format.
 -- INIT_PRODUCER_ID request: empty payload (reserved for future
 -- transaction timeout / transactional_id fields).
@@ -271,10 +365,13 @@ end
 -- references to `local` bindings don't work, hence the placement.
 
 -- isolation (optional) is an ISOLATION_* byte; omitted/0 = read_uncommitted.
-function M.encode_fetch(correl_id, topic, group_id, max_records, isolation)
+-- flags (optional) trails isolation; set FETCH_FLAG_BATCHED to ask for one
+-- RECORD_BATCH reply instead of a RECORD frame per record.
+function M.encode_fetch(correl_id, topic, group_id, max_records, isolation, flags)
     local payload = encode_string(topic) .. encode_string(group_id)
         .. string.pack(">I4", max_records)
         .. string.pack(">B", isolation or M.ISOLATION_READ_UNCOMMITTED)
+        .. string.pack(">B", flags or 0)
     return encode_frame(M.OP_FETCH, correl_id, payload)
 end
 
@@ -534,16 +631,24 @@ function M.decode_fetch(payload)
     if not group then return nil, gerr end
     if #payload - p2 + 1 < 4 then return nil, "short fetch" end
     local max_records, p3 = string.unpack(">I4", payload, p2)
-    -- Optional trailing isolation byte (older clients don't send it).
+    -- Optional trailing isolation byte (older clients don't send it), then an
+    -- optional flags byte after it (clients older than batching send neither).
     local isolation = M.ISOLATION_READ_UNCOMMITTED
+    local flags     = 0
     if #payload - p3 + 1 >= 1 then
-        isolation = string.unpack(">B", payload, p3)
+        local iso, p4 = string.unpack(">B", payload, p3)
+        isolation = iso
+        if #payload - p4 + 1 >= 1 then
+            flags = string.unpack(">B", payload, p4)
+        end
     end
     return {
         topic       = topic,
         group_id    = group,
         max_records = max_records,
         isolation   = isolation,
+        flags       = flags,
+        batched     = (flags & M.FETCH_FLAG_BATCHED) ~= 0,
     }, nil
 end
 
@@ -660,6 +765,119 @@ function M.decode_nack_ack(payload)
         attempts      = attempts,
         dlq_topic     = dlq_topic ~= "" and dlq_topic or nil,
     }, nil
+end
+
+-- Cap records-per-produce-batch so one frame can't ask us to decode an
+-- attacker-chosen number of key/value pairs. The real bound on a batch is
+-- MaxFrameSize (the framer rejects the frame before we ever get here); this
+-- is the belt-and-braces count bound, checked before any allocation.
+--
+-- MAX_IDEMPOTENT_BATCH is tighter because an idempotent batch's per-record
+-- acks are persisted in the producer-state memo so an exact retry can replay
+-- them (see src/storage/producer_state.lua) — 1024 records is a ~12 KB memo
+-- record, which is the most we're willing to write per batch.
+local MAX_BATCH_RECORDS     = 10000
+local MAX_IDEMPOTENT_BATCH  = 1024
+M.MAX_BATCH_RECORDS    = MAX_BATCH_RECORDS
+M.MAX_IDEMPOTENT_BATCH = MAX_IDEMPOTENT_BATCH
+
+function M.decode_produce_batch(payload)
+    if #payload < 2 then return nil, "short produce_batch header" end
+    local flags, codec, p = string.unpack(">BB", payload, 1)
+    local topic, p2, terr = decode_string(payload, p, MAX_TOPIC_NAME)
+    if not topic then return nil, terr end
+
+    local idempotent = (flags & M.BATCH_FLAG_IDEMPOTENT) ~= 0
+    local pid, base_seq, epoch
+    if idempotent then
+        if #payload - p2 + 1 < 14 then return nil, "short produce_batch producer header" end
+        pid, base_seq, epoch, p2 = string.unpack(">I8I4I2", payload, p2)
+    end
+
+    if #payload - p2 + 1 < 4 then return nil, "short produce_batch count" end
+    local count, pos = string.unpack(">I4", payload, p2)
+    if count == 0 then return nil, "produce_batch with no records" end
+    if count > MAX_BATCH_RECORDS then
+        return nil, string.format("too many records (%d > %d)", count, MAX_BATCH_RECORDS)
+    end
+    -- Cheapest possible record is two empty length prefixes; reject a count
+    -- that the remaining bytes cannot possibly satisfy before we start
+    -- allocating a table sized for it.
+    if count * 8 > #payload - pos + 1 then
+        return nil, string.format("produce_batch count %d exceeds payload", count)
+    end
+
+    local records = {}
+    for i = 1, count do
+        local key, np, kerr = decode_string(payload, pos)
+        if not key then return nil, kerr end
+        local value, np2, verr = decode_string(payload, np)
+        if not value then return nil, verr end
+        records[i] = { key = key, value = value }
+        pos = np2
+    end
+
+    return {
+        flags      = flags,
+        idempotent = idempotent,
+        codec      = codec,
+        topic      = topic,
+        pid        = pid,
+        base_seq   = base_seq,
+        epoch      = epoch,
+        records    = records,
+    }, nil
+end
+
+function M.decode_produce_batch_ack(payload)
+    if #payload < 4 then return nil, "short produce_batch_ack" end
+    local count, pos = string.unpack(">I4", payload, 1)
+    if count > MAX_BATCH_RECORDS then
+        return nil, string.format("too many acks (%d > %d)", count, MAX_BATCH_RECORDS)
+    end
+    if count * 12 > #payload - pos + 1 then
+        return nil, "produce_batch_ack count exceeds payload"
+    end
+    local acks = {}
+    for i = 1, count do
+        local partition, offset, np = string.unpack(">I4I8", payload, pos)
+        acks[i] = { partition = partition, offset = offset }
+        pos = np
+    end
+    if #payload - pos + 1 < 2 then return nil, "short produce_batch_ack status" end
+    local code, cp = string.unpack(">I2", payload, pos)
+    local message, _, merr = decode_string(payload, cp)
+    if not message then return nil, merr end
+    return { acks = acks, code = code, message = message }, nil
+end
+
+function M.decode_record_batch(payload)
+    if #payload < 4 then return nil, "short record_batch" end
+    local count, pos = string.unpack(">I4", payload, 1)
+    if count > MAX_BATCH_RECORDS then
+        return nil, string.format("too many records (%d > %d)", count, MAX_BATCH_RECORDS)
+    end
+    local records = {}
+    for i = 1, count do
+        local topic, p, terr = decode_string(payload, pos, MAX_TOPIC_NAME)
+        if not topic then return nil, terr end
+        if #payload - p + 1 < 20 then return nil, "short record_batch entry" end
+        local partition, offset, timestamp, p2 = string.unpack(">I4I8I8", payload, p)
+        local key, p3, kerr = decode_string(payload, p2)
+        if not key then return nil, kerr end
+        local value, p4, verr = decode_string(payload, p3)
+        if not value then return nil, verr end
+        records[i] = {
+            topic     = topic,
+            partition = partition,
+            offset    = offset,
+            timestamp = timestamp,
+            key       = key,
+            value     = value,
+        }
+        pos = p4
+    end
+    return records, nil
 end
 
 -- Cap offsets-per-txn-commit so one frame can't ask us to decode an

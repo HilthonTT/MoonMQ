@@ -25,6 +25,7 @@ records.
 | --- | --- |
 | **Storage** | Segmented log with time + offset indexes, group-commit fsync, retention, crash recovery. Alternative jocko-style commitlog backend with key compaction. |
 | **Delivery** | Pull (`FETCH`) or push (`SUBSCRIBE`), consumer groups with a range assignor and durable offsets, DLQ with NACK. |
+| **Throughput** | Record batching on both sides: one frame for N records, one fsync per partition instead of per record. |
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
 | **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
@@ -32,7 +33,8 @@ records.
 **New here?** Read [docs/architecture.md](docs/architecture.md) (module map +
 data flow), then [CONTRIBUTING.md](CONTRIBUTING.md). Deep dives:
 [cluster](docs/cluster.md) · [transactions](docs/transactions.md) ·
-[DLQ](docs/dlq.md) · [roadmap](docs/roadmap-security-consensus.md).
+[batching](docs/batching.md) · [DLQ](docs/dlq.md) ·
+[roadmap](docs/roadmap-security-consensus.md).
 
 ## Quick start
 
@@ -138,7 +140,7 @@ Two HTTP endpoints on `MetricsHost:MetricsPort` (default `127.0.0.1:9090`).
   | `moonmq_frames_received_total` | counter | `op` |
   | `moonmq_send_duration_seconds` | histogram | — |
   | `moonmq_dispatch_duration_seconds` | histogram | `op` |
-  | `moonmq_produce_records_total` · `moonmq_idempotent_produce_total` · `moonmq_fetch_records_total` · `moonmq_segment_rolls_total` | counter | `topic` |
+  | `moonmq_produce_records_total` · `moonmq_idempotent_produce_total` · `moonmq_produce_batches_total` · `moonmq_fetch_records_total` · `moonmq_segment_rolls_total` | counter | `topic` |
   | `moonmq_fsync_duration_seconds` | histogram | `topic` |
   | `moonmq_topic_count` | gauge | — |
   | `moonmq_partition_log_bytes` | gauge | `topic`, `partition` |
@@ -150,6 +152,35 @@ Two HTTP endpoints on `MetricsHost:MetricsPort` (default `127.0.0.1:9090`).
 - **`GET /stats`** — bounded JSON snapshot (version, open connections, topic
   count, top 10 topics by bytes on disk) for `curl | jq` inspection. Use
   `/metrics` for monitoring agents.
+
+## Batching
+
+One record used to cost one frame, one dispatch, one round trip, and — under
+`acks=1` — one fsync. `produce_batch` amortises all four: N records travel in
+one frame and pay **one fsync per partition the batch touched**.
+
+```lua
+local acks = assert(c:produce_batch("orders", {
+    { key = "k1", value = "v1" },
+    { key = "k2", value = "v2" },
+}))
+-- acks[i] = { partition, offset, seq? }, aligned with the records sent.
+```
+
+A batch is N ordinary appends sharing a frame, not an atomic unit: records are
+partitioned individually, and a failure part-way through durably keeps the
+prefix and reports the error, so the client resends only the tail. Wrap it in a
+transaction if you need all-or-nothing.
+
+On the read side, `fetch` asks for its records in a single `RECORD_BATCH` frame
+and the broker now drains several records per partition per poll — previously
+`max_records=100` on a 4-partition topic returned at most 4 records.
+
+Idempotent batches extend the single-record contract: record *i* carries
+sequence `base_seq + i`, and an exact resend replays the batch's memoized acks
+instead of appending duplicates — across a broker restart, for durable
+producers. Full design, wire formats, and limits:
+**[docs/batching.md](docs/batching.md)**.
 
 ## Idempotent producer
 
@@ -364,7 +395,8 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | Client → server | Purpose |
 | --- | --- |
 | `HELLO` · `AUTH` | Protocol-version handshake · authentication |
-| `PRODUCE` · `FETCH` · `SUBSCRIBE` | Append · pull a batch · stream on arrival |
+| `PRODUCE` · `PRODUCE_BATCH` | Append one record · append N in one frame |
+| `FETCH` · `SUBSCRIBE` | Pull a batch · stream on arrival |
 | `COMMIT` · `NACK` | Commit a group offset · reject a record (→ DLQ) |
 | `CREATE_TOPIC` · `LIST_TOPICS` | Topic admin |
 | `PING` · `GOODBYE` | Liveness · clean disconnect |
@@ -375,8 +407,9 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | Server → client | Purpose |
 | --- | --- |
 | `WELCOME` · `AUTH_OK` | Handshake / auth acceptance |
-| `PRODUCE_ACK` · `PRODUCER_ID` | Partition + offset · assigned u64 PID |
-| `GROUP_ASSIGNMENT` · `RECORD` | Member id + partitions · a delivered record |
+| `PRODUCE_ACK` · `PRODUCE_BATCH_ACK` | Partition + offset · one pair per batched record |
+| `PRODUCER_ID` · `GROUP_ASSIGNMENT` | Assigned u64 PID · member id + partitions |
+| `RECORD` · `RECORD_BATCH` | A delivered record · N of them in one frame |
 | `TOPIC_LIST` · `PONG` · `OK` · `NACK_ACK` | Query results / acks |
 | `ERROR` | Numeric error code + message |
 

@@ -98,6 +98,10 @@ local DEFAULT_IDLE_DEADLINE          = 60
 local DEFAULT_HEARTBEAT_INTERVAL  = 30
 local DEFAULT_HEARTBEAT_MISS      = 3
 local DEFAULT_PUSH_INTERVAL       = 0.05
+-- Records a push-mode subscriber drains per pass before it sleeps again.
+-- Without a batch the loop delivers one record per partition and then waits
+-- push_interval, so a backlogged partition drains at 20 records/second.
+local DEFAULT_PUSH_BATCH          = 256
 -- Cap on the number of topics the broker will accept. Without this a
 -- client (authenticated or not, depending on config) could call
 -- CREATE_TOPIC in a loop and exhaust both in-memory state and the
@@ -169,6 +173,8 @@ function Server.new(opts)
     metrics.describe("moonmq_connections_open", "gauge", "Currently open connections.")
     metrics.describe("moonmq_produce_records_total", "counter", "Records produced.")
     metrics.describe("moonmq_fetch_records_total", "counter", "Records delivered to consumers.")
+    metrics.describe("moonmq_produce_batches_total", "counter",
+        "PRODUCE_BATCH frames accepted (records land in moonmq_produce_records_total).")
     metrics.describe("moonmq_producers_expired_total", "counter",
         "Idle durable producer identities expired from __producer_state.")
     metrics.describe("moonmq_nack_total", "counter",
@@ -282,6 +288,7 @@ function Server.new(opts)
         heartbeat_interval       = opts.heartbeat_interval       or DEFAULT_HEARTBEAT_INTERVAL,
         heartbeat_miss_threshold = opts.heartbeat_miss_threshold or DEFAULT_HEARTBEAT_MISS,
         push_interval            = opts.push_interval            or DEFAULT_PUSH_INTERVAL,
+        push_batch               = opts.push_batch               or DEFAULT_PUSH_BATCH,
         max_topics               = opts.max_topics               or DEFAULT_MAX_TOPICS,
         max_list_topics          = opts.max_list_topics          or DEFAULT_MAX_LIST_TOPICS,
 
