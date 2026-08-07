@@ -1017,6 +1017,73 @@ function M.list_topics(server, conn, correl, _payload)
     conn:send(proto.encode_topic_list(correl, all))
 end
 
+-- LIST_OFFSETS: report the readable offset range of every partition of a
+-- topic. `earliest` is whatever retention has left behind, `latest` the offset
+-- the next append will get — both are in-memory counters on the partition
+-- (`.offset` and `:oldest_offset()`, which the segmented and commitlog
+-- backends both expose), so this handler does no disk I/O and needs no
+-- backend-specific branch.
+--
+-- Two further bounds ride along when they mean something, each gated by its
+-- flag bit in the reply:
+--
+--   * high_watermark — min LEO across in-sync followers. Observability only
+--     today: the read path ceilings on the log end, not on this (see the note
+--     at replicator.lua:114). With no followers configured every record is as
+--     replicated as it will ever be, so the log end IS the watermark; with
+--     followers configured but none in sync there is no minimum to report and
+--     the flag goes clear.
+--   * lso — the Last Stable Offset, which unlike the watermark is a real
+--     ceiling: a read_committed consumer is never handed anything above it.
+--     Lag for such a consumer is lso - committed, not latest - committed.
+--     On a partition with no transaction in flight this equals the log end,
+--     which is a known answer, not a missing one — see below.
+function M.list_offsets(server, conn, correl, payload)
+    local q, err = proto.decode_list_offsets(payload)
+    if not q then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    local topic, terr = server.broker:get_topic(q.topic)
+    if not topic then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
+            terr or "topic missing"))
+        return
+    end
+
+    local replicator = server.replicator
+    local txns       = server.broker.transactions
+
+    local entries = {}
+    for id, partition in ipairs(topic.partitions) do
+        local latest = partition.offset
+
+        local hwm = latest
+        if replicator and replicator:enabled() then
+            hwm = replicator:high_watermark(q.topic, id)
+        end
+
+        -- A nil from the coordinator is NOT "unknown": it means no unresolved
+        -- transaction touches this partition, so the stable point is the log
+        -- end (exactly what consumer.poll falls back to). Only a broker with
+        -- no coordinator at all leaves this genuinely unanswerable.
+        local lso
+        if txns then lso = txns:lso(q.topic, id) or latest end
+
+        entries[#entries + 1] = {
+            partition      = id,
+            earliest       = partition:oldest_offset(),
+            latest         = latest,
+            high_watermark = hwm,
+            lso            = lso,
+            local_leader   = server.broker:serves_partition(q.topic, id),
+        }
+    end
+
+    conn:send(proto.encode_offsets(correl, entries))
+end
+
 -- JOIN_GROUP: register this connection as a member of a group subscribing
 -- to one or more topics, and reply with the partitions assigned to it.
 -- An empty member_id means "first join, assign me one" — we use the
@@ -1216,6 +1283,7 @@ M.BY_OP = {
     [proto.OP_NACK]               = M.nack,
     [proto.OP_CREATE_TOPIC]       = M.create_topic,
     [proto.OP_LIST_TOPICS]        = M.list_topics,
+    [proto.OP_LIST_OFFSETS]       = M.list_offsets,
     [proto.OP_JOIN_GROUP]         = M.join_group,
     [proto.OP_LEAVE_GROUP]        = M.leave_group,
     [proto.OP_GROUP_HEARTBEAT]    = M.group_heartbeat,

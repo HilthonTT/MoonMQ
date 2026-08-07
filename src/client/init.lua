@@ -534,6 +534,39 @@ function Client:list_topics()
     return proto.decode_topic_list(payload)
 end
 
+-- list_offsets returns the readable offset range of every partition of
+-- `topic`, in partition order:
+--
+--   { { partition = 1, earliest = 0, latest = 42,
+--       high_watermark = 42, lso = 42,
+--       hwm_exact = true, lso_known = true, leader = true }, ... }
+--
+-- `latest` is the offset the next append gets, so a consumer sitting at
+-- `committed` is (latest - committed) records behind and an empty partition
+-- reports earliest == latest. Under read_committed measure against `lso`
+-- instead: that is the ceiling the broker will actually deliver up to, so
+-- `latest` would count records no consumer can reach yet as lag.
+--
+-- `earliest` is not always 0 — retention and compaction move it forward, and
+-- a consumer whose committed offset has fallen below it has been lapped.
+function Client:list_offsets(topic)
+    assert(type(topic) == "string", "topic must be a string")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_list_offsets(correl, topic))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_OFFSETS then
+        return nil, string.format("expected OFFSETS, got 0x%02x", op)
+    end
+    return proto.decode_offsets(payload)
+end
+
 -- join_group registers this client as a member of `group_id` subscribing to
 -- `topics` (a topic name or array of names) and returns the broker's
 -- assignment: { member_id = "...", assignment = { [topic] = { part_id, ... } } }.

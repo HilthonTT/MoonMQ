@@ -60,7 +60,13 @@ local acks  = assert(c:produce_batch("orders", {              -- one frame, one 
     { key = "k2", value = "v2" },
 }))
 local res   = assert(c:join_group("billing", { "orders" }))    -- {member_id, assignment}
+local ends  = assert(c:list_offsets("orders"))                 -- per partition {earliest, latest, …}
 ```
+
+`list_offsets` reports where each partition starts and ends, which is what
+makes lag (`latest - committed`) computable and what lets a consumer seek to
+either end. Under `read_committed` measure against `lso` instead — that is the
+offset the broker will actually deliver up to.
 
 Runnable examples: `src/examples/tcp_client.lua`,
 `src/examples/consumer_group.lua`.

@@ -265,7 +265,7 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | `PRODUCE` · `PRODUCE_BATCH` | Append one record · append N in one frame |
 | `FETCH` · `SUBSCRIBE` | Pull a batch · stream on arrival |
 | `COMMIT` · `NACK` | Commit a group offset · reject a record (→ DLQ) |
-| `CREATE_TOPIC` · `LIST_TOPICS` | Topic admin |
+| `CREATE_TOPIC` · `LIST_TOPICS` · `LIST_OFFSETS` | Topic admin · per-partition offset bounds |
 | `INIT_PRODUCER_ID` · `PRODUCE_IDEMPOTENT` | Request a u64 PID · append `(PID, seq, …)` |
 | `BEGIN_TXN` · `END_TXN` · `TXN_OFFSET_COMMIT` | Transaction lifecycle |
 | `JOIN_GROUP` · `GROUP_HEARTBEAT` · `LEAVE_GROUP` | Consumer-group membership |
@@ -278,7 +278,7 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | `PRODUCE_ACK` · `PRODUCE_BATCH_ACK` | Partition + offset · one pair per batched record |
 | `PRODUCER_ID` · `GROUP_ASSIGNMENT` | Assigned u64 PID · member id + partitions |
 | `RECORD` · `RECORD_BATCH` | A delivered record · N of them in one frame |
-| `TOPIC_LIST` · `OK` · `NACK_ACK` | Query results / acks |
+| `TOPIC_LIST` · `OFFSETS` · `OK` · `NACK_ACK` | Query results / acks |
 | `ERROR` | Numeric error code + message |
 
 A connection must `HELLO` then `AUTH` before anything else; only handshake

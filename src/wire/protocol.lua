@@ -80,6 +80,15 @@ M.OP_NACK             = 0x16
 -- frames. See docs/batching.md.
 M.OP_PRODUCE_BATCH    = 0x17
 
+-- Offset introspection. LIST_OFFSETS asks for the readable offset range of
+-- every partition of one topic and is answered by a single OFFSETS frame.
+-- Nothing before it could express "where does this log start and end", which
+-- made two ordinary things impossible: seeking to the head or tail of a
+-- partition, and computing consumer lag (latest - committed) client-side.
+-- Both bounds are already tracked in memory by every storage backend, so the
+-- broker answers without touching disk.
+M.OP_LIST_OFFSETS     = 0x18
+
 -- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
@@ -98,6 +107,7 @@ M.OP_GROUP_ASSIGNMENT = 0x89
 M.OP_NACK_ACK      = 0x8A
 M.OP_PRODUCE_BATCH_ACK = 0x8B
 M.OP_RECORD_BATCH  = 0x8C
+M.OP_OFFSETS       = 0x8D
 M.OP_ERROR         = 0xFE
 
 -- Correlation IDs are 16-byte UUIDs.
@@ -121,6 +131,26 @@ M.FETCH_FLAG_BATCHED = 0x01
 -- (pid, base_seq, epoch) triple and the batch participates in producer-state
 -- dedup; without it the batch is a plain multi-record append.
 M.BATCH_FLAG_IDEMPOTENT = 0x01
+
+-- Per-partition flags on an OFFSETS entry. `earliest` and `latest` are always
+-- exact; the other two bounds are not always knowable, so each carries a bit
+-- saying whether the number next to it means anything. When a bit is clear the
+-- encoder has substituted `latest`, which keeps a flags-ignoring client honest
+-- (it reads a real offset, just a conservative one) without a sentinel value.
+--
+--   HWM_EXACT — the high watermark is a real min-LEO-across-in-sync-followers
+--               reading. Clear when replication is configured but no follower
+--               is currently in sync, so there is no meaningful minimum.
+--   LSO_KNOWN — the Last Stable Offset is a real read ceiling. Set whenever a
+--               transaction coordinator answered, INCLUDING the ordinary case
+--               of no transaction in flight, where the stable point simply is
+--               the log end. Clear only on a broker built without one.
+--   LOCAL     — this broker serves the partition. Clear means the cluster has
+--               moved it elsewhere and the bounds are from a stale local copy;
+--               ask the owning broker for authoritative numbers.
+M.OFFSETS_FLAG_HWM_EXACT = 0x01
+M.OFFSETS_FLAG_LSO_KNOWN = 0x02
+M.OFFSETS_FLAG_LOCAL     = 0x04
 
 -- Error codes. Keep numeric so non-Lua clients can switch on them.
 M.ERR_BAD_FRAME            = 1
@@ -462,6 +492,47 @@ end
 
 function M.encode_list_topics(correl_id)
     return encode_frame(M.OP_LIST_TOPICS, correl_id, "")
+end
+
+-- LIST_OFFSETS request: str topic. The reply covers every partition, so there
+-- is nothing else to ask for yet.
+--
+-- Offset-for-timestamp will extend this the way FETCH grew isolation and
+-- flags: an optional trailing u8 mode plus a u64 timestamp, absent here and
+-- therefore skipped by a broker that doesn't implement it. Deliberately not
+-- shipped in this pass — the two bounds below are in-memory counters, while a
+-- timestamp query means walking segments through the time index.
+function M.encode_list_offsets(correl_id, topic)
+    return encode_frame(M.OP_LIST_OFFSETS, correl_id, encode_string(topic))
+end
+
+-- OFFSETS reply:
+--   u32 count
+--     | (u32 partition | u64 earliest | u64 latest
+--        | u64 high_watermark | u64 lso | u8 flags)*
+--
+-- Entries are emitted in partition order. `earliest` is the oldest offset
+-- still readable after retention, `latest` the offset the next append will
+-- get, so an empty partition reports earliest == latest.
+--
+-- Callers pass nil for high_watermark / lso when the value isn't available and
+-- this substitutes `latest` with the corresponding flag cleared — see the
+-- OFFSETS_FLAG_* comments for why a substituted value beats a sentinel.
+function M.encode_offsets(correl_id, entries)
+    assert(type(entries) == "table", "entries must be a list")
+
+    local parts = { string.pack(">I4", #entries) }
+    for i = 1, #entries do
+        local e = entries[i]
+        local flags = 0
+        local hwm, lso = e.high_watermark, e.lso
+        if hwm then flags = flags | M.OFFSETS_FLAG_HWM_EXACT else hwm = e.latest end
+        if lso then flags = flags | M.OFFSETS_FLAG_LSO_KNOWN else lso = e.latest end
+        if e.local_leader then flags = flags | M.OFFSETS_FLAG_LOCAL end
+        parts[#parts + 1] = string.pack(">I4I8I8I8I8B",
+            e.partition, e.earliest, e.latest, hwm, lso, flags)
+    end
+    return encode_frame(M.OP_OFFSETS, correl_id, table.concat(parts))
 end
 
 -- Consumer-group wire formats.
@@ -902,6 +973,52 @@ function M.decode_txn_offset_commit(payload)
         pos = np + 12
     end
     return { group = group, offsets = offsets }, nil
+end
+
+-- Upper bound on partitions in one OFFSETS reply, mirroring the num_partitions
+-- ceiling CREATE_TOPIC enforces. Caps how much a single count field can make a
+-- client allocate.
+local MAX_PARTITIONS = 1024
+M.MAX_PARTITIONS = MAX_PARTITIONS
+
+function M.decode_list_offsets(payload)
+    local topic, _, terr = decode_string(payload, 1, MAX_TOPIC_NAME)
+    if not topic then return nil, terr end
+    return { topic = topic }, nil
+end
+
+-- Returns the entry list described on encode_offsets, partition order
+-- preserved. The flag bits come back as booleans: `hwm_exact` and `lso_known`
+-- say whether those two fields are real readings or the `latest` stand-in,
+-- and `leader` says the answering broker serves the partition.
+function M.decode_offsets(payload)
+    if #payload < 4 then return nil, "short offsets" end
+    local count, pos = string.unpack(">I4", payload, 1)
+    if count > MAX_PARTITIONS then
+        return nil, string.format(
+            "too many partitions (%d > %d)", count, MAX_PARTITIONS)
+    end
+
+    -- partition(4) + earliest(8) + latest(8) + hwm(8) + lso(8) + flags(1)
+    local ENTRY_SIZE = 37
+    local entries = {}
+    for i = 1, count do
+        if #payload - pos + 1 < ENTRY_SIZE then return nil, "short offsets entry" end
+        local partition, earliest, latest, hwm, lso, flags, np =
+            string.unpack(">I4I8I8I8I8B", payload, pos)
+        entries[i] = {
+            partition      = partition,
+            earliest       = earliest,
+            latest         = latest,
+            high_watermark = hwm,
+            lso            = lso,
+            hwm_exact      = (flags & M.OFFSETS_FLAG_HWM_EXACT) ~= 0,
+            lso_known      = (flags & M.OFFSETS_FLAG_LSO_KNOWN) ~= 0,
+            leader         = (flags & M.OFFSETS_FLAG_LOCAL) ~= 0,
+        }
+        pos = np
+    end
+    return entries, nil
 end
 
 function M.decode_topic_list(payload)
