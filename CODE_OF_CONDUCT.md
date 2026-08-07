@@ -60,7 +60,7 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the maintainers by opening a
-[private security advisory](https://github.com/HilthonTT/Nuntius/security/advisories/new)
+[private security advisory](https://github.com/HilthonTT/MoonMQ/security/advisories/new)
 (it is the only private channel this repository has) or by contacting
 [@HilthonTT](https://github.com/HilthonTT) directly. Conduct that violates
 GitHub's own terms can additionally be reported through

@@ -5,7 +5,7 @@
 **Please do not open a public issue for a security problem.**
 
 Use GitHub's private vulnerability reporting:
-[**Report a vulnerability**](https://github.com/HilthonTT/Nuntius/security/advisories/new).
+[**Report a vulnerability**](https://github.com/HilthonTT/MoonMQ/security/advisories/new).
 That opens a private advisory visible only to the maintainers.
 
 Useful things to include:

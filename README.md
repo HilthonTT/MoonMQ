@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/HilthonTT/Nuntius/actions/workflows/ci.yml"><img src="https://github.com/HilthonTT/Nuntius/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/HilthonTT/MoonMQ/actions/workflows/ci.yml"><img src="https://github.com/HilthonTT/MoonMQ/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/Lua-5.4-2C2D72?logo=lua&logoColor=white" alt="Lua 5.4" />
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT" />
 </p>
