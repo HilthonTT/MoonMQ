@@ -16,7 +16,7 @@ jobs:
     name: lint + test + smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Lua 5.4, LuaRocks, and zlib headers
         run: |
