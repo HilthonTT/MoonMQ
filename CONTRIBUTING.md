@@ -3,6 +3,10 @@
 Thanks for taking a look! This document covers environment setup, the
 checks every change must pass, and the conventions the codebase follows.
 
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+Found a security issue? Don't open an issue — follow
+[SECURITY.md](SECURITY.md).
+
 ## Setup
 
 Linux (or WSL on Windows) with Lua 5.4:
@@ -79,12 +83,15 @@ The codebase is deliberately consistent; match what's around you.
   endpoint: document the compatibility story in the PR description (clean
   break vs. read-compat), and update `docs/`.
 * New config keys: wire them through `main.lua` from `appsettings.json`,
-  document them in the README, and give them safe defaults (features off,
-  loopback binds).
+  document them in the README's Configuration table, and give them safe
+  defaults (features off, loopback binds).
 
 ## Docs map
 
-* [README](README.md) — running, configuring, protocol overview
-* [docs/architecture.md](docs/architecture.md) — module map and data flow
+* [README](README.md) — running, configuring, feature overview
+* [DESIGN.md](DESIGN.md) — layering, module map, data flow, wire protocol
 * [docs/cluster.md](docs/cluster.md) — clustering, reassignment, autobalancer
 * [docs/transactions.md](docs/transactions.md) — transaction semantics
+* [docs/batching.md](docs/batching.md) — batch wire formats and guarantees
+* [docs/dlq.md](docs/dlq.md) — dead-letter queue and NACK semantics
+* [docs/mql.md](docs/mql.md) — the interactive console's grammar

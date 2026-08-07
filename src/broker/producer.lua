@@ -1,7 +1,6 @@
 local message = require("src.record.message")
 local socket  = require("socket")
 local brk     = require("src.broker")
-local Future  = require("src.core.future")
 local util    = require("src.core.util")
 local log     = require("src.log.logger").get("producer")
 
@@ -113,30 +112,6 @@ end
 -- is more than enough for ordering messages within a partition.
 local function now_ms()
     return math.floor(socket.gettime() * 1000)
-end
-
-local ProduceOptions = {}
-ProduceOptions.__index = ProduceOptions
-
-function ProduceOptions.new(ack_mode, timeout_in_seconds)
-    return setmetatable({
-        ack_mode           = ack_mode or AckMode.AckNone,
-        timeout_in_seconds = timeout_in_seconds,    -- nil = no limit
-    }, ProduceOptions)
-end
-
-local ProduceResult = {}
-ProduceResult.__index = ProduceResult
-
-function ProduceResult.new(topic, partition, offset, err)
-    assert(type(topic) == "string", "topic must be a string")
-
-    return setmetatable({
-        topic     = topic,
-        partition = partition,
-        offset    = offset,
-        error     = err,
-    }, ProduceResult)
 end
 
 local Producer = {}
@@ -459,93 +434,7 @@ function Producer:produce_batch(topic_name, msgs, opts)
     return acks, batch_err
 end
 
--- Async variant. Returns a Future that resolves to a ProduceResult.
--- NOTE: with the trivial scheduler (synchronous coroutine.resume), this
--- runs to completion on the calling resume — it does not actually overlap
--- with other I/O. Use it for the caller-friendly Future API, not for
--- concurrency gains.
-function Producer:produce_async(scheduler, topic_name, msg, opts)
-    assert(type(topic_name) == "string", "topic_name must be a string")
-    assert(getmetatable(msg) == message.Message, "msg must be a Message instance")
-    opts = opts or {}
-    local ack_mode = opts.ack_mode or self.acks
-    local timeout  = opts.timeout_in_seconds   -- nil = no limit
-
-    -- Reject acks=all at the API boundary rather than silently degrading
-    -- to acks=0 (the old `ack_mode == AckLeader` branch skipped the sync
-    -- for AckAll == -1, so callers got no durability at all).
-    if ack_mode == AckMode.AckAll then
-        local f = Future.new(scheduler)
-        f:resolve(ProduceResult.new(topic_name, -1, -1, ERR_ACKS_ALL_UNSUPPORTED))
-        return f
-    end
-
-    if msg.timestamp == 0 then
-        msg.timestamp = now_ms()
-    end
-
-    local future = Future.new(scheduler)
-
-    local co = coroutine.create(function()
-        local started = socket.gettime()
-
-        local valid, vErr = util.validate_topic_name(topic_name)
-        if not valid then
-            future:resolve(ProduceResult.new(topic_name, -1, -1, vErr))
-            return
-        end
-
-        local topic, err = self.broker:get_topic(topic_name)
-        if not topic then
-            future:resolve(ProduceResult.new(topic_name, -1, -1,
-                string.format("failed to get topic: %s", err)))
-            return
-        end
-
-        local num_partitions = #topic.partitions
-        local partition_id   = pick_partition(self, topic_name, msg.key, num_partitions) + 1
-        local partition      = topic.partitions[partition_id]
-        if not partition then
-            future:resolve(ProduceResult.new(topic_name, partition_id, -1,
-                string.format("partition %d does not exist", partition_id)))
-            return
-        end
-
-        local offset, werr = partition:write_message(msg)
-        if werr then
-            future:resolve(ProduceResult.new(topic_name, partition_id, -1,
-                string.format("failed to write message: %s", werr)))
-            return
-        end
-
-        if ack_mode == AckMode.AckLeader then
-            local sok, serr = partition:request_sync()
-            if not sok then
-                future:resolve(ProduceResult.new(topic_name, partition_id, -1,
-                    string.format("failed to sync partition: %s", serr)))
-                return
-            end
-        end
-
-        -- Soft timeout: the write itself isn't cancellable. The write has
-        -- already succeeded; resolve with the offset and no error so the
-        -- caller doesn't retry and duplicate. Caller can compare elapsed
-        -- vs timeout themselves if monitoring is needed.
-        local elapsed = socket.gettime() - started
-        if timeout and elapsed > timeout then
-            log:warn("produce exceeded timeout: %.3fs > %.3fs", elapsed, timeout)
-        end
-
-        future:resolve(ProduceResult.new(topic_name, partition_id, offset, nil))
-    end)
-
-    scheduler.resume(co)
-    return future
-end
-
 return {
-    AckMode        = AckMode,
-    ProduceOptions = ProduceOptions,
-    ProduceResult  = ProduceResult,
-    Producer       = Producer,
+    AckMode  = AckMode,
+    Producer = Producer,
 }

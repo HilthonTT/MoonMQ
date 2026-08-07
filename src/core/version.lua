@@ -98,22 +98,8 @@ function M.GetVersionInfo()
 	}, Info)
 end
 
-function M.GetVersionString()
-	return string.format("Version: %s, GitCommit: %s, BuildTime: %s",
-		M.Version, M.GitCommit, M.BuildTime)
-end
-
 function M.GetVersionJSON()
 	return M.GetVersionInfo():JSON()
-end
-
-function M.IsDev()
-	return M.Version == "dev"
-end
-
-function M.IsDirty()
-	local suffix = "-dirty"
-	return M.Version:sub(-#suffix) == suffix
 end
 
 return M

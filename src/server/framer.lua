@@ -1,5 +1,6 @@
 -- Length-prefixed message framer. Pure I/O concern: takes a byte stream,
--- yields complete frames; takes a payload, prefixes a u32 length.
+-- yields complete frames. (The write side lives in src/wire/protocol.lua,
+-- whose encoders emit an already length-prefixed frame.)
 --
 -- Wire format:  [FrameLen:u32 BE] [FrameBody:FrameLen bytes]
 --
@@ -37,11 +38,6 @@ function M.read_frame(reactor, sock, max_frame, deadline)
     if not body then return nil, berr end
 
     return body, nil
-end
-
--- Wraps a payload with a u32 BE length prefix.
-function M.wrap_frame(payload)
-    return string.pack(">I4", #payload) .. payload
 end
 
 return M

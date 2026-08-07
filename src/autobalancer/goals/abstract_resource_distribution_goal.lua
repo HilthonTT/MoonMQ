@@ -43,21 +43,6 @@ function G:distribution_stats(cluster)
     return mean, math.sqrt(sq / #ids)
 end
 
--- Are all active brokers already inside the band? Lets the detector report
--- convergence without proposing moves.
-function G:is_balanced(cluster)
-    local ids = cluster:active_broker_ids()
-    if #ids < 2 then return true end
-    local mean = select(1, self:distribution_stats(cluster))
-    if mean < self.detect_threshold then return true end
-    local upper, lower = mean * (1 + self.avg_deviation), mean * (1 - self.avg_deviation)
-    for _, id in ipairs(ids) do
-        local l = cluster:broker_load(id, self.resource)
-        if l > upper or l < lower then return false end
-    end
-    return true
-end
-
 -- Candidate destinations for a replica of load `rep_load`, coldest first: a
 -- broker below the mean that won't blow past the upper bound once it takes the
 -- replica. Ordering coldest-first spreads load toward the emptiest brokers.

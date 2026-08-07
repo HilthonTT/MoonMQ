@@ -38,11 +38,6 @@ function ClusterModel:register_broker(id, opts)
     return self.brokers[id]
 end
 
-function ClusterModel:unregister_broker(id)
-    self.brokers[id] = nil
-    self.replicas[id] = nil
-end
-
 function ClusterModel:set_broker_active(id, active)
     local b = self.brokers[id]
     if b then b:set_active(active) end
@@ -62,11 +57,6 @@ function ClusterModel:register_replica(broker_id, topic, partition)
         bucket[key] = ReplicaUpdater.new(topic, partition, broker_id, self.sample_opts)
     end
     return bucket[key]
-end
-
-function ClusterModel:unregister_replica(broker_id, topic_name, partition)
-    local bucket = self.replicas[broker_id]
-    if bucket then bucket[replica_key(topic_name, partition)] = nil end
 end
 
 -- Record one measured-resource sample for a replica. Silently ignores samples

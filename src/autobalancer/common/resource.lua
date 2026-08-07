@@ -29,10 +29,6 @@ function Resource.name(r)
     return NAMES[r] or ("UNKNOWN(" .. tostring(r) .. ")")
 end
 
-function Resource.is_valid(r)
-    return NAMES[r] ~= nil
-end
-
 -- PARTITION_COUNT is synthesized (always 1 per replica) rather than sampled from
 -- a metric, so callers that feed real measurements can skip it.
 function Resource.is_measured(r)

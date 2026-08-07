@@ -45,14 +45,6 @@ function Action.new(action_type, src_topic, src_broker_id, dest_broker_id, dest_
     }, Action)
 end
 
--- The one mutable field, mirroring Java's setDestBrokerId. (You can also just
--- assign action.dest_broker_id directly; this exists to document the intent
--- that it's the only field meant to change after construction.)
-function Action:set_dest_broker_id(dest_broker_id)
-    assert(type(dest_broker_id) == "string", "dest_broker_id must be a string")
-    self.dest_broker_id = dest_broker_id
-end
-
 -- Return the inverse action. For MOVE, the same topic moves back (broker roles
 -- swapped, no dest topic). For SWAP, each topic-partition returns to where it
 -- started: after applying the SWAP, src_topic sits on dest_broker and

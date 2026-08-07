@@ -1,0 +1,14 @@
+# Default owner for everything in the repository.
+* @HilthonTT
+
+# Surfaces with a compatibility story — a change here needs the PR to state
+# clean-break vs. read-compat (see CONTRIBUTING.md § PRs).
+/src/wire/       @HilthonTT
+/src/record/     @HilthonTT
+/src/commitlog/  @HilthonTT
+/src/storage/    @HilthonTT
+
+# Build, CI, and security policy.
+/Makefile        @HilthonTT
+/.github/        @HilthonTT
+/SECURITY.md     @HilthonTT

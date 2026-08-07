@@ -54,14 +54,6 @@ function Parser:accept_kw(kw)
     return false
 end
 
--- Consume keyword `kw` or fail with a helpful message.
-function Parser:expect_kw(kw)
-    if self:at_kw(kw) then
-        return self:next()
-    end
-    return self:fail(string.format("expected '%s'", kw:upper()))
-end
-
 -- A name is either a bare identifier or a quoted string (so topics/groups with
 -- unusual characters can still be addressed). Numbers are also accepted as
 -- names because a purely numeric topic name is legal.

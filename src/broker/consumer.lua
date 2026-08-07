@@ -316,20 +316,6 @@ function Consumer:poll(opts)
     return records, nil
 end
 
--- CommitOffsets flushes all current offsets to storage.
--- Returns (true, nil) on success, (nil, err) on failure.
-function Consumer:commit_offsets()
-    for topic_name, partition_offsets in pairs(self.offsets) do
-        for partition_id, offset in pairs(partition_offsets) do
-            local ok, err = self:commit_offset(topic_name, partition_id, offset)
-            if not ok then
-                return nil, err
-            end
-        end
-    end
-    return true, nil
-end
-
 -- commit_offset persists a single offset via the broker's OffsetManager
 -- (durable, keyed by this consumer's group). Returns (true, nil) or (nil, err).
 function Consumer:commit_offset(topic_name, partition_id, offset)

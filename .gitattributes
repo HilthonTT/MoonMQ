@@ -1,0 +1,30 @@
+# Normalize line endings so a Windows checkout doesn't produce phantom CRLF
+# diffs against CI (Ubuntu) — see CONTRIBUTING.md § Setup.
+#
+# The tree predates this file and still holds mixed endings. To fix that in a
+# single, reviewable commit of its own:
+#
+#     git add --renormalize .
+#     git commit -m "chore: normalize line endings to LF"
+#
+* text=auto eol=lf
+
+*.lua  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+Makefile text eol=lf
+
+# Never touched by normalization.
+*.jpg  binary
+*.png  binary
+*.log  binary
+
+# Vendored / ported third-party code: excluded from GitHub's language stats and
+# diffed collapsed by default.
+src/vendor/**        linguist-vendored
+src/fsm/state_machine.lua linguist-vendored
+src/repl/luaprompt.lua    linguist-vendored
+src/repl/conf.lua         linguist-vendored

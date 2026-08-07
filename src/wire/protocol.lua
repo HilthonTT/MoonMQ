@@ -31,7 +31,8 @@ M.OP_SUBSCRIBE    = 0x05
 M.OP_COMMIT       = 0x06
 M.OP_CREATE_TOPIC = 0x07
 M.OP_LIST_TOPICS  = 0x08
-M.OP_PING         = 0x09
+-- 0x09 is retired (was PING; connection liveness is HEARTBEAT_REQ/RESP below).
+-- Do not reuse — old clients may still emit it and must fail as UNKNOWN_OP.
 M.OP_GOODBYE      = 0x0A
 
 M.OP_IDENTIFY_CLIENT  = 0x0D
@@ -89,7 +90,7 @@ M.OP_AUTH_OK       = 0x81
 M.OP_PRODUCE_ACK   = 0x82
 M.OP_RECORD        = 0x83
 M.OP_TOPIC_LIST    = 0x84
-M.OP_PONG          = 0x85
+-- 0x85 is retired (was PONG). See the note on 0x09.
 M.OP_OK            = 0x86
 M.OP_IDENTIFY_ACK  = 0x87
 M.OP_PRODUCER_ID   = 0x88
@@ -518,9 +519,7 @@ function M.encode_goodbye(correl_id)
     return encode_frame(M.OP_GOODBYE, correl_id, "")
 end
 
-function M.encode_ping(correl_id) return encode_frame(M.OP_PING, correl_id, "") end
-function M.encode_pong(correl_id) return encode_frame(M.OP_PONG, correl_id, "") end
-function M.encode_ok(correl_id)   return encode_frame(M.OP_OK,   correl_id, "") end
+function M.encode_ok(correl_id) return encode_frame(M.OP_OK, correl_id, "") end
 
 -- Default cap on any single length-prefixed string. Individual decoders
 -- can pass a tighter `max_len` when they know the field's domain (e.g.
