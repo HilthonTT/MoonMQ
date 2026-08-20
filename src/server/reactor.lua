@@ -6,13 +6,29 @@
 -- either, so beware blocking syscalls (disk I/O, os.execute) on hot
 -- paths.
 
-local socket = require("socket")
-local log    = require("src.log.logger").get("reactor")
+local socket   = require("socket")
+local os_utils = require("src.core.os")
+local metrics  = require("src.metrics")
+local log      = require("src.log.logger").get("reactor")
 
 local Reactor = {}
 Reactor.__index = Reactor
 
-function Reactor.new()
+-- select(2) can only watch descriptors numbered below FD_SETSIZE (1024 on
+-- Linux), and luasocket does not degrade gracefully at that boundary: it
+-- raises "descriptor too large for set size" from socket.select. That error
+-- comes out of run()'s own stack frame, past every per-coroutine
+-- safe_resume, so before this guard existed a broker that reached its
+-- configured MaxConnections (1024, the shipped default) died outright —
+-- reproduced end-to-end at exactly 1024 accepted connections.
+--
+-- LuaSocket 3.x publishes the compiled-in limit as socket._SETSIZE.
+Reactor.SELECT_LIMIT = socket._SETSIZE or 1024
+
+-- opts (optional):
+--   fd_limit — highest watchable descriptor + 1. Defaults to the select
+--              limit; the specs lower it to exercise the rejection path.
+function Reactor.new(opts)
     return setmetatable({
         running        = false,
         read_waiters   = {},   -- sock -> coroutine
@@ -20,7 +36,32 @@ function Reactor.new()
         timer_waiters  = {},   -- coroutine -> wake_at_timestamp
         ready          = {},   -- coroutines to resume on next tick
         listeners      = {},   -- sock -> accept_handler(client_sock, peer)
+
+        fd_limit       = (opts and opts.fd_limit) or Reactor.SELECT_LIMIT,
+        -- Count of accepts refused for being unwatchable. Surfaced by the
+        -- server as a metric; a nonzero value means the fd budget is too
+        -- tight for the configured connection cap.
+        fd_rejected    = 0,
     }, Reactor)
+end
+
+-- True when `sock` can go into a select set. getfd() is the descriptor number
+-- on POSIX; on Windows it is a SOCKET handle, which is not an index into the
+-- fd set, so the number carries no meaning there and every socket passes (the
+-- server's connection cap is what bounds Windows).
+--
+-- Sockets that report no descriptor (-1, e.g. an unconnected TCP object) pass
+-- too: there is nothing to compare, and select will reject them on its own
+-- terms if they are genuinely unusable.
+function Reactor:can_watch(sock)
+    if os_utils.IS_WINDOWS then return true end
+    if type(sock) ~= "table" and type(sock) ~= "userdata" then return true end
+    local getfd = sock.getfd
+    if type(getfd) ~= "function" then return true end
+
+    local ok, fd = pcall(getfd, sock)
+    if not ok or type(fd) ~= "number" or fd < 0 then return true end
+    return fd < self.fd_limit
 end
 
 function Reactor:spawn(fn, ...)
@@ -149,6 +190,22 @@ function Reactor:listen(host, port, on_accept)
                 if not self.running then break end
                 log:error("accept: %s", aerr)
                 self:sleep(0.1)
+            elseif not self:can_watch(client) then
+                -- Above the select ceiling: this socket could never be
+                -- multiplexed, and handing it to on_accept would park a
+                -- coroutine on a descriptor that takes the whole event loop
+                -- down on the next tick. Drop it here instead. The peer sees
+                -- an immediate close, which is what any capacity rejection
+                -- looks like from the other end.
+                self.fd_rejected = self.fd_rejected + 1
+                metrics.inc("moonmq_connections_refused_fd_total", 1)
+                if self.fd_rejected == 1 or self.fd_rejected % 100 == 0 then
+                    log:error("refusing connection: descriptor at or above the "
+                        .. "select limit (%d); %d refused so far. Lower "
+                        .. "MaxConnections or raise the fd budget.",
+                        self.fd_limit, self.fd_rejected)
+                end
+                pcall(function() client:close() end)
             else
                 local ip, peer_port = client:getpeername()
                 ip = ip or "?"
@@ -230,7 +287,21 @@ function Reactor:run()
         if #read_set == 0 and #write_set == 0 then
             socket.sleep(timeout)
         else
-            local readable, writable = socket.select(read_set, write_set, timeout)
+            -- pcall, not a bare call: socket.select RAISES on a descriptor it
+            -- cannot represent. The accept path above keeps those out of the
+            -- waiter sets, but sockets the reactor didn't accept (replication
+            -- peers, cluster clients, anything a future caller parks here) can
+            -- still cross the limit — and an unguarded raise here kills the
+            -- broker rather than one connection. Drop the offenders and keep
+            -- serving everyone else.
+            local sel_ok, readable, writable =
+                pcall(socket.select, read_set, write_set, timeout)
+            if not sel_ok then
+                log:error("select failed (%s); dropping unwatchable sockets",
+                    tostring(readable))
+                self:_drop_unwatchable()
+                goto continue
+            end
             for _, sock in ipairs(readable or {}) do
                 local co = self.read_waiters[sock]
                 if co then
@@ -246,7 +317,44 @@ function Reactor:run()
                 end
             end
         end
+        ::continue::
     end
+end
+
+-- Remove every waiter whose descriptor is outside the select set, closing the
+-- socket and resuming its coroutine so the owner unwinds through its normal
+-- error path (a closed socket surfaces as a read/write error, which every
+-- caller already handles) rather than parking forever.
+function Reactor:_drop_unwatchable()
+    local dropped = 0
+
+    for _, waiters in ipairs({ self.read_waiters, self.write_waiters }) do
+        local doomed = {}
+        for sock in pairs(waiters) do
+            if not self:can_watch(sock) then doomed[#doomed + 1] = sock end
+        end
+        for i = 1, #doomed do
+            local sock = doomed[i]
+            local co   = waiters[sock]
+            waiters[sock] = nil
+            pcall(function() sock:close() end)
+            if co then safe_resume(co) end
+            dropped = dropped + 1
+        end
+    end
+
+    if dropped == 0 then
+        -- select failed for some other reason and we have no offender to
+        -- blame. Returning here still beats propagating: the loop retries,
+        -- and a persistent failure shows up as a repeating log line instead
+        -- of a dead broker.
+        log:error("select failed but every watched socket looks valid")
+    else
+        self.fd_rejected = self.fd_rejected + dropped
+        metrics.inc("moonmq_connections_refused_fd_total", dropped)
+        log:error("dropped %d unwatchable socket(s)", dropped)
+    end
+    return dropped
 end
 
 function Reactor:stop()

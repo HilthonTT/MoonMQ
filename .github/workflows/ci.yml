@@ -18,11 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Lua 5.4, LuaRocks, and zlib headers
+      - name: Install Lua 5.4, LuaRocks, and native library headers
         run: |
           sudo apt-get update
           # zlib1g-dev: lua-zlib builds against it. liblua5.4-dev: rock C modules.
-          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks zlib1g-dev
+          # libssl-dev: luaossl (native PBKDF2) builds against it.
+          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks zlib1g-dev libssl-dev
 
       - name: Install Lua dependencies
         # luarocks-5.4, NOT plain luarocks: the Debian/Ubuntu `luarocks`
@@ -36,6 +37,7 @@ jobs:
           sudo luarocks-5.4 install dkjson
           sudo luarocks-5.4 install lua-zlib
           sudo luarocks-5.4 install luaposix
+          sudo luarocks-5.4 install luaossl
           sudo luarocks-5.4 install luacheck
 
       - name: Verify toolchain targets Lua 5.4
@@ -48,6 +50,33 @@ jobs:
           busted --version
           grep -q '5\.4' "$(command -v busted)" \
             || { echo "::error::busted is not bound to Lua 5.4"; exit 1; }
+
+      - name: Verify the native fast paths are actually active
+        # The bug this guards against: src/core/crc32.lua used to probe only
+        # LuaJIT's FFI for a native zlib, so on PUC Lua 5.4 — this job, the
+        # Makefile, every spec run — it silently fell back to a pure-Lua loop
+        # ~46x slower, with lua-zlib installed the whole time. A fast path
+        # nobody asserts on is a fast path that quietly stops being taken.
+        # Same for luaposix (file I/O without forking) and luaossl (PBKDF2
+        # without minutes of reactor time per login).
+        run: |
+          lua5.4 -e '
+            local fs   = require("src.io.fs")
+            local auth = require("src.server.auth")
+            assert(fs.backend == "posix",
+              "fs backend is " .. fs.backend .. ", expected posix (luaposix missing?)")
+            assert(auth.kdf_backend() == "openssl",
+              "PBKDF2 backend is " .. auth.kdf_backend() .. ", expected openssl (luaossl missing?)")
+            local crc32 = require("src.core.crc32")
+            local blob, t0 = ("moonmq"):rep(700000), os.clock()
+            crc32(blob)
+            local elapsed = os.clock() - t0
+            assert(elapsed < 0.05, string.format(
+              "crc32 took %.3fs for %d bytes - that is the pure-Lua fallback, not zlib",
+              elapsed, #blob))
+            print(string.format("fs=%s kdf=%s crc32=%.4fs/%dB",
+              fs.backend, auth.kdf_backend(), elapsed, #blob))
+          '
 
       - name: Lint (luacheck)
         run: luacheck src bin main.lua spec

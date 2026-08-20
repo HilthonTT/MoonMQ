@@ -23,6 +23,7 @@
 --   - Pre-auth opcode whitelist (only HELLO/AUTH/IDENTIFY/HEARTBEAT allowed)
 
 local Reactor          = require("src.server.reactor")
+local fs_m             = require("src.io.fs")
 local proto            = require("src.wire.protocol")
 local Connection       = require("src.server.connection")
 local handlers         = require("src.server.handlers")
@@ -102,6 +103,16 @@ local DEFAULT_PUSH_INTERVAL       = 0.05
 -- Without a batch the loop delivers one record per partition and then waits
 -- push_interval, so a backlogged partition drains at 20 records/second.
 local DEFAULT_PUSH_BATCH          = 256
+-- Concurrent client connections. The effective value is additionally clamped
+-- to what the reactor's select set can watch (see Server.new).
+local DEFAULT_MAX_CONNECTIONS = 1024
+-- Descriptors held back from the connection budget for everything that is not
+-- a client socket: the listener, the metrics endpoint, replication/cluster
+-- sockets, stdio, and the log + timeindex file each open partition keeps. A
+-- broker with hundreds of partitions should raise this (Server opt fd_reserve)
+-- rather than discover the ceiling under load.
+local DEFAULT_FD_RESERVE = 64
+
 -- Cap on the number of topics the broker will accept. Without this a
 -- client (authenticated or not, depending on config) could call
 -- CREATE_TOPIC in a loop and exhaust both in-memory state and the
@@ -171,6 +182,8 @@ function Server.new(opts)
         { version = vinfo.version, commit = vinfo.git_commit })
     metrics.describe("moonmq_topic_count", "gauge", "Number of user topics.")
     metrics.describe("moonmq_connections_open", "gauge", "Currently open connections.")
+    metrics.describe("moonmq_connections_refused_fd_total", "counter",
+        "Connections refused because their descriptor exceeded the select limit.")
     metrics.describe("moonmq_produce_records_total", "counter", "Records produced.")
     metrics.describe("moonmq_fetch_records_total", "counter", "Records delivered to consumers.")
     metrics.describe("moonmq_produce_batches_total", "counter",
@@ -182,7 +195,28 @@ function Server.new(opts)
     metrics.describe("moonmq_dlq_records_total", "counter",
         "Records moved to a dead-letter topic.")
 
-    local reactor = Reactor.new()
+    local reactor = Reactor.new({ fd_limit = opts.fd_limit })
+
+    -- Every connection costs a descriptor, and select(2) can only watch
+    -- descriptors below its FD_SETSIZE. Accepting more than that used to kill
+    -- the event loop outright, so the configured cap is clamped to what the
+    -- reactor can actually multiplex. The reserve covers the descriptors the
+    -- broker holds that are NOT client connections: listeners, the metrics
+    -- endpoint, replication and cluster sockets, and one open log file (plus
+    -- timeindex) per partition. It is a heuristic — the reactor's per-accept
+    -- descriptor check is the actual guarantee — but it turns "crash at the
+    -- limit" into "reject before the limit" for the common case.
+    local fd_reserve = opts.fd_reserve or DEFAULT_FD_RESERVE
+    local watchable  = math.max(1, reactor.fd_limit - fd_reserve)
+    local requested_connections = opts.max_connections or DEFAULT_MAX_CONNECTIONS
+    local max_connections       = requested_connections
+    if max_connections > watchable then
+        max_connections = watchable
+        log:warn("max_connections %d exceeds what select can watch "
+            .. "(fd limit %d, reserving %d for listeners/log files); "
+            .. "capping at %d",
+            requested_connections, reactor.fd_limit, fd_reserve, max_connections)
+    end
 
     -- Replication (single-leader, static config). On a leader, the Replicator
     -- ships every produced record to the configured followers; acks=all blocks
@@ -292,7 +326,7 @@ function Server.new(opts)
         max_topics               = opts.max_topics               or DEFAULT_MAX_TOPICS,
         max_list_topics          = opts.max_list_topics          or DEFAULT_MAX_LIST_TOPICS,
 
-        max_connections        = opts.max_connections        or 1024,
+        max_connections        = max_connections,
         max_connections_per_ip = opts.max_connections_per_ip or 32,
         connections            = 0,
         conn_by_ip             = {},
@@ -563,6 +597,19 @@ function Server:start()
     log:info("listening on %s:%d (proto v%d, %s/%s)",
         self.host, self.port, proto.PROTOCOL_VERSION,
         proto.SERVER_NAME, proto.SERVER_VERSION)
+
+    -- Say which filesystem backend is live. The shell fallback forks a process
+    -- per stat/readdir on this very thread (measured: 23ms per `test -d`
+    -- against 2.5us for a stat syscall), which reads as mysterious latency
+    -- and a slow boot unless the log names it.
+    if fs_m.backend == "shell" then
+        log:warn("filesystem backend=shell: every directory check forks a "
+            .. "process on the reactor thread. Install luaposix "
+            .. "(luarocks install luaposix) for syscall-based file I/O.")
+    else
+        log:info("filesystem backend=%s, connection cap=%d (fd limit %d)",
+            fs_m.backend, self.max_connections, self.reactor.fd_limit)
+    end
 
     if self.metrics_port then
         local mh = MetricsHttp.new({
