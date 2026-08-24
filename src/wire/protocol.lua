@@ -89,6 +89,31 @@ M.OP_PRODUCE_BATCH    = 0x17
 -- broker answers without touching disk.
 M.OP_LIST_OFFSETS     = 0x18
 
+-- Topic administration beyond CREATE/LIST. Until these, a topic's config was
+-- write-once at creation: topic_config.lua persisted retention, cleanup policy
+-- and segment sizing to a sidecar, and the cleaners acted on it, but no client
+-- could read it back, change it, or remove a topic at all — you edited the
+-- sidecar by hand and restarted the broker.
+--
+-- DELETE_TOPIC is refused for internal topics (the `__` prefix) because
+-- __consumer_offsets and __producer_state are broker state, not user data.
+M.OP_DELETE_TOPIC       = 0x19
+M.OP_DESCRIBE_TOPIC     = 0x1A
+M.OP_ALTER_TOPIC_CONFIG = 0x1B
+
+-- Consumer-group introspection. The coordinator already holds members,
+-- assignments and (via OffsetManager) committed offsets; none of it was
+-- reachable, which is why lag had to be reconstructed out-of-band by
+-- scripts/lag_monitor.py. DESCRIBE_GROUP answers all three from the
+-- coordinator's own state, so lag becomes a broker-side fact.
+--
+-- DELETE_GROUP only succeeds on a group with no live members — the same rule
+-- Kafka applies, and for the same reason: deleting under an active member
+-- leaves it holding an assignment nothing will ever rebalance.
+M.OP_LIST_GROUPS      = 0x1C
+M.OP_DESCRIBE_GROUP   = 0x1D
+M.OP_DELETE_GROUP     = 0x1E
+
 -- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
@@ -108,6 +133,9 @@ M.OP_NACK_ACK      = 0x8A
 M.OP_PRODUCE_BATCH_ACK = 0x8B
 M.OP_RECORD_BATCH  = 0x8C
 M.OP_OFFSETS       = 0x8D
+M.OP_TOPIC_DESCRIPTION = 0x8E
+M.OP_GROUP_LIST        = 0x8F
+M.OP_GROUP_DESCRIPTION = 0x90
 M.OP_ERROR         = 0xFE
 
 -- Correlation IDs are 16-byte UUIDs.
@@ -152,6 +180,27 @@ M.OFFSETS_FLAG_HWM_EXACT = 0x01
 M.OFFSETS_FLAG_LSO_KNOWN = 0x02
 M.OFFSETS_FLAG_LOCAL     = 0x04
 
+-- LIST_OFFSETS query modes, carried as an optional trailing byte exactly the
+-- way FETCH grew isolation and flags. Absent = BOUNDS, so a client that
+-- predates this sends the old one-string body and a broker that predates it
+-- stops decoding after the topic and answers with bounds only.
+--
+--   BOUNDS    — the earliest/latest/hwm/lso reply that LIST_OFFSETS has always
+--               given. No extra fields follow the mode byte.
+--   TIMESTAMP — a u64 millisecond timestamp follows. The reply carries the
+--               ordinary bounds AND a trailing per-partition section giving
+--               the earliest offset whose record timestamp is >= the query,
+--               which is Kafka's offsetForTimes semantics.
+M.LIST_OFFSETS_MODE_BOUNDS    = 0
+M.LIST_OFFSETS_MODE_TIMESTAMP = 1
+
+-- Set on a FOR_TIMES entry when the partition actually had a record at or
+-- after the requested timestamp. Clear means "no such record" — the partition
+-- is empty, or every record predates the query — and the offset field is then
+-- the partition's `latest`, i.e. where such a record would eventually land.
+-- Same substitute-don't-sentinel rule as the OFFSETS_FLAG_* fields above.
+M.FOR_TIMES_FLAG_FOUND = 0x01
+
 -- Error codes. Keep numeric so non-Lua clients can switch on them.
 M.ERR_BAD_FRAME            = 1
 M.ERR_UNKNOWN_OP           = 2
@@ -180,6 +229,17 @@ M.ERR_GROUP_CONFLICT       = 13
 -- BATCH_TOO_LARGE: more records in one PRODUCE_BATCH than the broker will
 -- accept. Split and resend — the batch was NOT partially applied.
 M.ERR_BATCH_TOO_LARGE      = 14
+-- Topic/group administration error codes.
+-- GROUP_MISSING: DESCRIBE_GROUP / DELETE_GROUP naming a group this
+--   coordinator has no record of.
+-- GROUP_NOT_EMPTY: DELETE_GROUP on a group that still has live members.
+-- INVALID_CONFIG: ALTER_TOPIC_CONFIG with an unknown key, an unparseable
+--   value, or a key that cannot be changed after creation (`backend`).
+-- TOPIC_FORBIDDEN: an admin op aimed at an internal topic (`__` prefix).
+M.ERR_GROUP_MISSING        = 15
+M.ERR_GROUP_NOT_EMPTY      = 16
+M.ERR_INVALID_CONFIG       = 17
+M.ERR_TOPIC_FORBIDDEN      = 18
 -- Transactional / durable-producer error codes (see docs/transactions.md).
 -- PRODUCER_FENCED: a produce/transaction op arrived with an epoch older than
 --   the current one for this producer id — a newer session (same
@@ -494,16 +554,28 @@ function M.encode_list_topics(correl_id)
     return encode_frame(M.OP_LIST_TOPICS, correl_id, "")
 end
 
--- LIST_OFFSETS request: str topic. The reply covers every partition, so there
--- is nothing else to ask for yet.
+-- LIST_OFFSETS request:
+--   str topic [| u8 mode | u64 timestamp_ms]
 --
--- Offset-for-timestamp will extend this the way FETCH grew isolation and
--- flags: an optional trailing u8 mode plus a u64 timestamp, absent here and
--- therefore skipped by a broker that doesn't implement it. Deliberately not
--- shipped in this pass — the two bounds below are in-memory counters, while a
--- timestamp query means walking segments through the time index.
-function M.encode_list_offsets(correl_id, topic)
-    return encode_frame(M.OP_LIST_OFFSETS, correl_id, encode_string(topic))
+-- `timestamp_ms` nil asks for bounds only and emits the bare one-string body
+-- older brokers expect. Passing one appends the TIMESTAMP mode byte and the
+-- query, and the reply gains its FOR_TIMES section — the extension shape this
+-- function's comment reserved when LIST_OFFSETS first shipped.
+--
+-- Unlike the bounds (in-memory counters), a timestamp query walks the log: the
+-- segmented backend binary-searches the sparse .timeindex to a nearby file
+-- position and linear-scans one index interval from there, and the commitlog
+-- backend, which keeps no time index, scans from its oldest retained offset.
+-- Cheap enough for a seek, not something to put in a poll loop.
+function M.encode_list_offsets(correl_id, topic, timestamp_ms)
+    local payload = encode_string(topic)
+    if timestamp_ms ~= nil then
+        assert(math.type(timestamp_ms) == "integer" and timestamp_ms >= 0,
+            "timestamp_ms must be a non-negative integer")
+        payload = payload ..
+            string.pack(">BI8", M.LIST_OFFSETS_MODE_TIMESTAMP, timestamp_ms)
+    end
+    return encode_frame(M.OP_LIST_OFFSETS, correl_id, payload)
 end
 
 -- OFFSETS reply:
@@ -518,7 +590,16 @@ end
 -- Callers pass nil for high_watermark / lso when the value isn't available and
 -- this substitutes `latest` with the corresponding flag cleared — see the
 -- OFFSETS_FLAG_* comments for why a substituted value beats a sentinel.
-function M.encode_offsets(correl_id, entries)
+-- `for_times` (optional) appends a trailing section answering a TIMESTAMP
+-- query:
+--
+--   u32 count | (u32 partition | u64 offset | u8 flags)*
+--
+-- It is appended only when the request asked for it. That placement is what
+-- makes the extension safe: decode_offsets reads exactly `count` fixed-width
+-- entries and returns, so a client built before this existed stops at the end
+-- of the bounds section and never sees the extra bytes.
+function M.encode_offsets(correl_id, entries, for_times)
     assert(type(entries) == "table", "entries must be a list")
 
     local parts = { string.pack(">I4", #entries) }
@@ -532,7 +613,150 @@ function M.encode_offsets(correl_id, entries)
         parts[#parts + 1] = string.pack(">I4I8I8I8I8B",
             e.partition, e.earliest, e.latest, hwm, lso, flags)
     end
+
+    if for_times then
+        parts[#parts + 1] = string.pack(">I4", #for_times)
+        for i = 1, #for_times do
+            local t = for_times[i]
+            parts[#parts + 1] = string.pack(">I4I8B", t.partition, t.offset,
+                t.found and M.FOR_TIMES_FLAG_FOUND or 0)
+        end
+    end
+
     return encode_frame(M.OP_OFFSETS, correl_id, table.concat(parts))
+end
+
+-- Topic administration.
+--
+-- DELETE_TOPIC / DESCRIBE_TOPIC request: str name. DELETE is acked with OP_OK.
+function M.encode_delete_topic(correl_id, name)
+    return encode_frame(M.OP_DELETE_TOPIC, correl_id, encode_string(name))
+end
+
+function M.encode_describe_topic(correl_id, name)
+    return encode_frame(M.OP_DESCRIBE_TOPIC, correl_id, encode_string(name))
+end
+
+-- TOPIC_DESCRIPTION reply:
+--   str name | u32 partition_count | u32 config_count | (str key | str value)*
+--
+-- Config values are strings even for the numeric keys. The sidecar mixes
+-- numbers (retention, max_segment_size) with strings (backend,
+-- cleanup_policy), and a client that just prints them or round-trips them into
+-- ALTER_TOPIC_CONFIG should not have to carry a per-key type table to do it.
+-- Only keys actually set on the topic are emitted — an absent key means the
+-- partition default is in force, which is not the same as a set value that
+-- happens to equal the default.
+function M.encode_topic_description(correl_id, name, num_partitions, config)
+    local keys = {}
+    for k in pairs(config) do keys[#keys + 1] = k end
+    table.sort(keys)
+
+    local parts = {
+        encode_string(name),
+        string.pack(">I4", num_partitions),
+        string.pack(">I4", #keys),
+    }
+    for _, k in ipairs(keys) do
+        parts[#parts + 1] = encode_string(k)
+        parts[#parts + 1] = encode_string(tostring(config[k]))
+    end
+    return encode_frame(M.OP_TOPIC_DESCRIPTION, correl_id, table.concat(parts))
+end
+
+-- ALTER_TOPIC_CONFIG request:
+--   str name | u32 count | (str key | str value)*
+-- Acked with OP_OK. Values travel as strings and the broker parses them
+-- against the key's declared type, so the wire format does not need to change
+-- when a new config key is added.
+function M.encode_alter_topic_config(correl_id, name, config)
+    local keys = {}
+    for k in pairs(config) do keys[#keys + 1] = k end
+    table.sort(keys)
+
+    local parts = { encode_string(name), string.pack(">I4", #keys) }
+    for _, k in ipairs(keys) do
+        parts[#parts + 1] = encode_string(k)
+        parts[#parts + 1] = encode_string(tostring(config[k]))
+    end
+    return encode_frame(M.OP_ALTER_TOPIC_CONFIG, correl_id, table.concat(parts))
+end
+
+-- Consumer-group administration.
+--
+-- LIST_GROUPS request: empty body.
+function M.encode_list_groups(correl_id)
+    return encode_frame(M.OP_LIST_GROUPS, correl_id, "")
+end
+
+-- GROUP_LIST reply:
+--   u32 count | (str group_id | str state | u32 member_count)*
+-- Groups are emitted in sorted id order so the bytes are deterministic.
+function M.encode_group_list(correl_id, groups)
+    local parts = { string.pack(">I4", #groups) }
+    for i = 1, #groups do
+        local g = groups[i]
+        parts[#parts + 1] = encode_string(g.group_id)
+        parts[#parts + 1] = encode_string(g.state)
+        parts[#parts + 1] = string.pack(">I4", g.member_count)
+    end
+    return encode_frame(M.OP_GROUP_LIST, correl_id, table.concat(parts))
+end
+
+function M.encode_describe_group(correl_id, group_id)
+    return encode_frame(M.OP_DESCRIBE_GROUP, correl_id, encode_string(group_id))
+end
+
+-- GROUP_DESCRIPTION reply:
+--   str group_id | str state
+--   | u32 member_count
+--       | (str member_id | u32 topic_count
+--            | (str topic | u32 part_count | (u32 partition_id)*)*)*
+--   | u32 offset_count | (str topic | u32 partition | u64 committed)*
+--
+-- The offsets section is the group's DURABLE committed positions from
+-- __consumer_offsets, not the members' in-flight cursors, and it is
+-- independent of membership: a group with no live members still has offsets,
+-- which is exactly the state you want to inspect before deleting it. Pairing
+-- these with LIST_OFFSETS `latest` (or `lso` under read_committed) is what
+-- makes lag computable without the broker having to define it.
+function M.encode_group_description(correl_id, desc)
+    local parts = { encode_string(desc.group_id), encode_string(desc.state) }
+
+    local members = desc.members or {}
+    parts[#parts + 1] = string.pack(">I4", #members)
+    for i = 1, #members do
+        local m = members[i]
+        parts[#parts + 1] = encode_string(m.member_id)
+
+        local topics = {}
+        for t in pairs(m.assignment or {}) do topics[#topics + 1] = t end
+        table.sort(topics)
+
+        parts[#parts + 1] = string.pack(">I4", #topics)
+        for _, topic in ipairs(topics) do
+            local ids = m.assignment[topic]
+            parts[#parts + 1] = encode_string(topic)
+            parts[#parts + 1] = string.pack(">I4", #ids)
+            for j = 1, #ids do
+                parts[#parts + 1] = string.pack(">I4", ids[j])
+            end
+        end
+    end
+
+    local offsets = desc.offsets or {}
+    parts[#parts + 1] = string.pack(">I4", #offsets)
+    for i = 1, #offsets do
+        local o = offsets[i]
+        parts[#parts + 1] = encode_string(o.topic)
+        parts[#parts + 1] = string.pack(">I4I8", o.partition, o.offset)
+    end
+
+    return encode_frame(M.OP_GROUP_DESCRIPTION, correl_id, table.concat(parts))
+end
+
+function M.encode_delete_group(correl_id, group_id)
+    return encode_frame(M.OP_DELETE_GROUP, correl_id, encode_string(group_id))
 end
 
 -- Consumer-group wire formats.
@@ -639,6 +863,14 @@ local MAX_CLIENT_VERSION = 64
 -- username/password approaches 1 KiB.
 local MAX_USERNAME      = 256
 local MAX_PASSWORD      = 1024
+-- Upper bound on partitions in one OFFSETS reply, mirroring the num_partitions
+-- ceiling CREATE_TOPIC enforces. Caps how much a single count field can make a
+-- client allocate. Declared up here with the other field caps because the
+-- group-description decoder needs it too, and that one sits above the OFFSETS
+-- decoders -- a `local` referenced before its declaration would silently read
+-- a nil global instead.
+local MAX_PARTITIONS = 1024
+M.MAX_PARTITIONS = MAX_PARTITIONS
 -- Cap topics-per-join so a single JOIN_GROUP frame can't ask us to
 -- decode an attacker-chosen number of length-prefixed strings. 256 is
 -- far above any realistic subscription set.
@@ -798,6 +1030,188 @@ function M.decode_create_topic(payload)
     if not name then return nil, err end
     if #payload - p + 1 < 4 then return nil, "short create_topic" end
     return { name = name, num_partitions = string.unpack(">I4", payload, p) }, nil
+end
+
+-- DELETE_TOPIC / DESCRIBE_TOPIC / DELETE_GROUP / DESCRIBE_GROUP all carry a
+-- single length-prefixed name, so they share a decoder factory rather than
+-- four near-identical functions.
+local function single_name_decoder(field, max_len)
+    return function(payload)
+        local name, _, err = decode_string(payload, 1, max_len)
+        if not name then return nil, err end
+        return { [field] = name }, nil
+    end
+end
+
+M.decode_delete_topic   = single_name_decoder("name", MAX_TOPIC_NAME)
+M.decode_describe_topic = single_name_decoder("name", MAX_TOPIC_NAME)
+M.decode_describe_group = single_name_decoder("group_id", MAX_GROUP_ID)
+M.decode_delete_group   = single_name_decoder("group_id", MAX_GROUP_ID)
+
+-- Cap on config entries in one ALTER_TOPIC_CONFIG frame. The recognised key
+-- set is six entries (topic_config.lua NUMBER_KEYS + STRING_KEYS); 64 leaves
+-- room to grow while still bounding how many length-prefixed pairs a single
+-- frame can make us decode.
+local MAX_CONFIG_ENTRIES = 64
+M.MAX_CONFIG_ENTRIES = MAX_CONFIG_ENTRIES
+-- Config keys and values are short identifiers and numbers. Capping them well
+-- under the 64 KiB default keeps a malformed frame from allocating on our
+-- behalf, the same reason the credential fields are capped.
+local MAX_CONFIG_KEY   = 64
+local MAX_CONFIG_VALUE = 256
+
+function M.decode_alter_topic_config(payload)
+    local name, p, nerr = decode_string(payload, 1, MAX_TOPIC_NAME)
+    if not name then return nil, nerr end
+    if #payload - p + 1 < 4 then return nil, "short alter_topic_config count" end
+
+    local count, pos = string.unpack(">I4", payload, p)
+    if count > MAX_CONFIG_ENTRIES then
+        return nil, string.format(
+            "too many config entries (%d > %d)", count, MAX_CONFIG_ENTRIES)
+    end
+
+    local config = {}
+    for _ = 1, count do
+        local key, np, kerr = decode_string(payload, pos, MAX_CONFIG_KEY)
+        if not key then return nil, kerr end
+        local val, np2, verr = decode_string(payload, np, MAX_CONFIG_VALUE)
+        if not val then return nil, verr end
+        config[key] = val
+        pos = np2
+    end
+
+    return { name = name, config = config }, nil
+end
+
+-- Inverse of encode_topic_description.
+function M.decode_topic_description(payload)
+    local name, p, nerr = decode_string(payload, 1, MAX_TOPIC_NAME)
+    if not name then return nil, nerr end
+    if #payload - p + 1 < 8 then return nil, "short topic description" end
+
+    local num_partitions, p2 = string.unpack(">I4", payload, p)
+    local count, pos = string.unpack(">I4", payload, p2)
+    if count > MAX_CONFIG_ENTRIES then
+        return nil, string.format(
+            "too many config entries (%d > %d)", count, MAX_CONFIG_ENTRIES)
+    end
+
+    local config = {}
+    for _ = 1, count do
+        local key, np, kerr = decode_string(payload, pos, MAX_CONFIG_KEY)
+        if not key then return nil, kerr end
+        local val, np2, verr = decode_string(payload, np, MAX_CONFIG_VALUE)
+        if not val then return nil, verr end
+        config[key] = val
+        pos = np2
+    end
+
+    return { name = name, num_partitions = num_partitions, config = config }, nil
+end
+
+-- Cap on groups in one GROUP_LIST reply, mirroring the max_groups ceiling the
+-- coordinator enforces on live groups.
+local MAX_GROUPS_LISTED = 4096
+M.MAX_GROUPS_LISTED = MAX_GROUPS_LISTED
+
+function M.decode_group_list(payload)
+    if #payload < 4 then return nil, "short group list" end
+    local count, pos = string.unpack(">I4", payload, 1)
+    if count > MAX_GROUPS_LISTED then
+        return nil, string.format(
+            "too many groups (%d > %d)", count, MAX_GROUPS_LISTED)
+    end
+
+    local groups = {}
+    for i = 1, count do
+        local gid, np, gerr = decode_string(payload, pos, MAX_GROUP_ID)
+        if not gid then return nil, gerr end
+        local state, np2, serr = decode_string(payload, np, MAX_GROUP_ID)
+        if not state then return nil, serr end
+        if #payload - np2 + 1 < 4 then return nil, "short group list entry" end
+        local members, np3 = string.unpack(">I4", payload, np2)
+        groups[i] = { group_id = gid, state = state, member_count = members }
+        pos = np3
+    end
+    return groups, nil
+end
+
+-- Inverse of encode_group_description.
+function M.decode_group_description(payload)
+    local gid, p, gerr = decode_string(payload, 1, MAX_GROUP_ID)
+    if not gid then return nil, gerr end
+    local state, pos, serr = decode_string(payload, p, MAX_GROUP_ID)
+    if not state then return nil, serr end
+
+    if #payload - pos + 1 < 4 then return nil, "short group description" end
+    local mcount, mp = string.unpack(">I4", payload, pos)
+    if mcount > MAX_GROUP_TOPICS then
+        return nil, string.format("too many members (%d)", mcount)
+    end
+    pos = mp
+
+    local members = {}
+    for i = 1, mcount do
+        local mid, np, merr = decode_string(payload, pos, MAX_MEMBER_ID)
+        if not mid then return nil, merr end
+        pos = np
+
+        if #payload - pos + 1 < 4 then return nil, "short member topic count" end
+        local tcount, tp = string.unpack(">I4", payload, pos)
+        if tcount > MAX_GROUP_TOPICS then
+            return nil, string.format("too many topics (%d)", tcount)
+        end
+        pos = tp
+
+        local assignment = {}
+        for _ = 1, tcount do
+            local topic, tnp, terr = decode_string(payload, pos, MAX_TOPIC_NAME)
+            if not topic then return nil, terr end
+            pos = tnp
+
+            if #payload - pos + 1 < 4 then return nil, "short assignment count" end
+            local pcount, pp = string.unpack(">I4", payload, pos)
+            if pcount > MAX_PARTITIONS then
+                return nil, string.format("too many partitions (%d)", pcount)
+            end
+            pos = pp
+
+            local ids = {}
+            for j = 1, pcount do
+                if #payload - pos + 1 < 4 then return nil, "short partition id" end
+                local id, npp = string.unpack(">I4", payload, pos)
+                ids[j] = id
+                pos = npp
+            end
+            assignment[topic] = ids
+        end
+        members[i] = { member_id = mid, assignment = assignment }
+    end
+
+    if #payload - pos + 1 < 4 then return nil, "short offset count" end
+    local ocount, op = string.unpack(">I4", payload, pos)
+    if ocount > MAX_PARTITIONS then
+        return nil, string.format("too many offsets (%d)", ocount)
+    end
+    pos = op
+
+    local offsets = {}
+    for i = 1, ocount do
+        local topic, np, terr = decode_string(payload, pos, MAX_TOPIC_NAME)
+        if not topic then return nil, terr end
+        if #payload - np + 1 < 12 then return nil, "short offset entry" end
+        local partition, offset, npp = string.unpack(">I4I8", payload, np)
+        offsets[i] = { topic = topic, partition = partition, offset = offset }
+        pos = npp
+    end
+
+    return {
+        group_id = gid,
+        state    = state,
+        members  = members,
+        offsets  = offsets,
+    }, nil
 end
 
 function M.decode_commit(payload)
@@ -975,16 +1389,32 @@ function M.decode_txn_offset_commit(payload)
     return { group = group, offsets = offsets }, nil
 end
 
--- Upper bound on partitions in one OFFSETS reply, mirroring the num_partitions
--- ceiling CREATE_TOPIC enforces. Caps how much a single count field can make a
--- client allocate.
-local MAX_PARTITIONS = 1024
-M.MAX_PARTITIONS = MAX_PARTITIONS
-
 function M.decode_list_offsets(payload)
-    local topic, _, terr = decode_string(payload, 1, MAX_TOPIC_NAME)
+    local topic, p, terr = decode_string(payload, 1, MAX_TOPIC_NAME)
     if not topic then return nil, terr end
-    return { topic = topic }, nil
+
+    -- Optional trailing mode byte; clients older than offset-for-timestamp
+    -- send nothing after the topic.
+    local mode = M.LIST_OFFSETS_MODE_BOUNDS
+    local timestamp
+    if #payload - p + 1 >= 1 then
+        local m, p2 = string.unpack(">B", payload, p)
+        mode = m
+        if mode == M.LIST_OFFSETS_MODE_TIMESTAMP then
+            -- A TIMESTAMP mode byte with no timestamp behind it is a malformed
+            -- frame, not an old client: an old client never sends the byte at
+            -- all. Reject rather than silently degrading to a bounds query,
+            -- which would answer a question nobody asked.
+            if #payload - p2 + 1 < 8 then
+                return nil, "list_offsets: timestamp mode without a timestamp"
+            end
+            timestamp = string.unpack(">I8", payload, p2)
+        elseif mode ~= M.LIST_OFFSETS_MODE_BOUNDS then
+            return nil, string.format("list_offsets: unknown mode %d", mode)
+        end
+    end
+
+    return { topic = topic, mode = mode, timestamp = timestamp }, nil
 end
 
 -- Returns the entry list described on encode_offsets, partition order
@@ -1018,6 +1448,36 @@ function M.decode_offsets(payload)
         }
         pos = np
     end
+
+    -- Optional FOR_TIMES section (see encode_offsets). Absent on a bounds
+    -- reply and on any broker built before offset-for-timestamp, so its
+    -- absence is normal, not an error. Attached as a named field on the
+    -- entries list: `#entries` and ipairs() still see only the bounds
+    -- entries, so every existing caller is unaffected.
+    if #payload - pos + 1 >= 4 then
+        local tcount, tpos = string.unpack(">I4", payload, pos)
+        if tcount > MAX_PARTITIONS then
+            return nil, string.format(
+                "too many for_times entries (%d > %d)", tcount, MAX_PARTITIONS)
+        end
+        -- partition(4) + offset(8) + flags(1)
+        local TIME_ENTRY_SIZE = 13
+        local times = {}
+        for i = 1, tcount do
+            if #payload - tpos + 1 < TIME_ENTRY_SIZE then
+                return nil, "short for_times entry"
+            end
+            local partition, offset, flags, np = string.unpack(">I4I8B", payload, tpos)
+            times[i] = {
+                partition = partition,
+                offset    = offset,
+                found     = (flags & M.FOR_TIMES_FLAG_FOUND) ~= 0,
+            }
+            tpos = np
+        end
+        entries.for_times = times
+    end
+
     return entries, nil
 end
 

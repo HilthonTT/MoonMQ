@@ -288,7 +288,7 @@ function Server.new(opts)
         broker.transactions:set_router(cluster.router)
     end
 
-    return setmetatable({
+    local server = setmetatable({
         broker      = broker,
         producer    = producer,
         reactor     = reactor,
@@ -359,6 +359,14 @@ function Server.new(opts)
                                 or DEFAULT_PRODUCER_EXPIRY_CHECK_INTERVAL_S,
         running               = false,
     }, Server)
+
+    -- Back-reference so broker-level operations can reach consumer-group
+    -- state. Broker:delete_topic needs it to evict a deleted topic from live
+    -- groups before the log goes away; the broker treats it as optional, which
+    -- is what keeps bare-broker tests (no Server) working.
+    broker.group_coordinator = server.coordinator
+
+    return server
 end
 
 function Server:_register_conn(ip)

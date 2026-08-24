@@ -275,6 +275,139 @@ end
 -- The server ticks this on group_reaper_interval. Only groups this broker
 -- coordinates are reaped — forwarded members are reaped by THEIR coordinator
 -- when the forwarded heartbeats stop.
+-- list returns { { group_id, state, member_count }, ... } sorted by id, for
+-- LIST_GROUPS.
+--
+-- The listing merges two sources, because "which groups exist" has two
+-- different answers and an operator needs both:
+--   * self.groups -- groups with a live coordinator on this broker (members,
+--     assignments, an FSM state).
+--   * OffsetManager:groups() -- groups with DURABLE committed offsets but no
+--     live members. These are the abandoned ones you actually go looking for,
+--     and they are invisible to the coordinator registry because reap() drops
+--     emptied groups.
+-- A group in the second set only is reported with state "empty" and zero
+-- members, which is exactly what it is.
+--
+-- CLUSTER CAVEAT: this is one broker's view. Groups hash to a coordinator
+-- (see :coordinator_for), so in a cluster each broker knows the live state of
+-- only its own share. The offsets half is likewise local. Listing every group
+-- cluster-wide means asking every broker and unioning the replies.
+function GroupCoordinator:list()
+    local seen = {}
+    local out  = {}
+
+    for group_id, group in pairs(self.groups) do
+        seen[group_id] = true
+        out[#out + 1] = {
+            group_id     = group_id,
+            state        = group:state(),
+            member_count = group:member_count(),
+        }
+    end
+
+    local offsets = self.broker.offsets
+    if offsets then
+        for _, group_id in ipairs(offsets:groups()) do
+            if not seen[group_id] then
+                out[#out + 1] = {
+                    group_id = group_id, state = "empty", member_count = 0,
+                }
+            end
+        end
+    end
+
+    table.sort(out, function(a, b) return a.group_id < b.group_id end)
+    return out
+end
+
+-- describe returns the full DESCRIBE_GROUP snapshot for one group, or
+-- (nil, err) when neither a live coordinator nor any committed offset knows
+-- the name.
+--
+-- A group with committed offsets but no live members is NOT an error: it
+-- describes as state "empty" with no members and its durable offsets intact.
+-- That combination -- offsets without members -- is the single most useful
+-- thing this call reports, since it is what an abandoned or between-deploys
+-- consumer group looks like.
+function GroupCoordinator:describe(group_id)
+    assert(type(group_id) == "string", "group_id must be a string")
+
+    local offsets = self.broker.offsets
+    local committed = offsets and offsets:offsets_for_group(group_id) or {}
+
+    local group = self.groups[group_id]
+    if not group and #committed == 0 then
+        return nil, string.format("group '%s' does not exist", group_id)
+    end
+
+    local desc
+    if group then
+        desc = group:describe()
+    else
+        desc = { group_id = group_id, state = "empty", members = {} }
+    end
+    desc.offsets = committed
+    return desc, nil
+end
+
+-- delete removes a group: its coordinator entry and every durable committed
+-- offset it holds.
+--
+-- Refused while the group still has live members, matching Kafka. Deleting
+-- under an active member would leave that member holding an assignment no
+-- rebalance will ever revise, still fetching, still committing -- and its next
+-- commit would immediately recreate the offsets we just tombstoned. Callers
+-- should make consumers leave first.
+--
+-- Returns (deleted_offset_count, nil) or (nil, err, err_is_not_empty).
+function GroupCoordinator:delete(group_id)
+    assert(type(group_id) == "string", "group_id must be a string")
+
+    local group = self.groups[group_id]
+    if group and group:member_count() > 0 then
+        return nil, string.format(
+            "group '%s' still has %d member(s)", group_id, group:member_count()), true
+    end
+
+    local offsets = self.broker.offsets
+    local committed = offsets and offsets:offsets_for_group(group_id) or {}
+    if not group and #committed == 0 then
+        return nil, string.format("group '%s' does not exist", group_id)
+    end
+
+    -- Tombstone the durable offsets FIRST. If that fails we have not yet torn
+    -- down the coordinator, so the group is still coherent and the call is
+    -- safe to retry.
+    local n = 0
+    if offsets then
+        local deleted, derr = offsets:delete_group(group_id)
+        if not deleted then return nil, derr end
+        n = deleted
+    end
+
+    if group then
+        group:close()
+        self.groups[group_id] = nil
+    end
+    self.remote_members[group_id] = nil
+
+    return n, nil
+end
+
+-- forget_topic drops a deleted topic out of every group this broker
+-- coordinates (see ConsumerGroup:forget_topic). Returns the number of groups
+-- that actually held it.
+function GroupCoordinator:forget_topic(topic_name)
+    assert(type(topic_name) == "string", "topic_name must be a string")
+
+    local n = 0
+    for _, group in pairs(self.groups) do
+        if group:forget_topic(topic_name) then n = n + 1 end
+    end
+    return n
+end
+
 function GroupCoordinator:reap()
     for gid, group in pairs(self.groups) do
         group:check_heartbeats()

@@ -230,6 +230,30 @@ function DlqManager:_dead_letter(group, topic, topic_name, partition_id, offset,
     return dlq_name, dlq_part.id, dlq_offset, nil
 end
 
+-- forget_topic drops every attempt counter belonging to `topic_name`. Called
+-- when the topic is deleted, so a delete/recreate cycle within one broker
+-- lifetime does not start with inherited NACK counts against offsets that mean
+-- something different now.
+--
+-- The key packs (group, topic, partition, offset) with length-prefixed strings
+-- (see attempt_key), so the topic is recovered by unpacking rather than by
+-- pattern-matching the packed bytes.
+function DlqManager:forget_topic(topic_name)
+    assert(type(topic_name) == "string", "topic_name must be a string")
+
+    local doomed = {}
+    for k in pairs(self.attempts) do
+        local ok, _, topic = pcall(string.unpack, ">s2s2I4I8", k)
+        if ok and topic == topic_name then doomed[#doomed + 1] = k end
+    end
+
+    for _, k in ipairs(doomed) do
+        self.attempts[k] = nil
+        self.tracked = self.tracked - 1
+    end
+    return #doomed
+end
+
 -- Bound the counter map. Evicting the stalest entry is safe: losing a counter
 -- only means that record survives max_deliveries more NACKs before
 -- dead-lettering.

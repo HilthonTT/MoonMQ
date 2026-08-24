@@ -1081,7 +1081,182 @@ function M.list_offsets(server, conn, correl, payload)
         }
     end
 
-    conn:send(proto.encode_offsets(correl, entries))
+    -- TIMESTAMP mode: resolve, per partition, the earliest offset whose record
+    -- timestamp is >= the query. Both storage backends implement
+    -- offset_for_timestamp (the segmented one through its sparse .timeindex,
+    -- the commitlog one by scanning), so there is no backend branch here.
+    --
+    -- A nil answer means no record qualifies -- the partition is empty, or the
+    -- query is past every record. We report `latest` with the found bit clear,
+    -- which is where such a record would land: a consumer that seeks there
+    -- waits for new data instead of re-reading the whole log, which is the
+    -- behaviour you want and what a sentinel would have to be translated into
+    -- by every client anyway.
+    local for_times
+    if q.mode == proto.LIST_OFFSETS_MODE_TIMESTAMP then
+        for_times = {}
+        for i = 1, #entries do
+            local e = entries[i]
+            local off = topic.partitions[e.partition]:offset_for_timestamp(q.timestamp)
+            for_times[i] = {
+                partition = e.partition,
+                offset    = off or e.latest,
+                found     = off ~= nil,
+            }
+        end
+    end
+
+    conn:send(proto.encode_offsets(correl, entries, for_times))
+end
+
+-- DELETE_TOPIC: remove a topic, its log, and everything referencing it (live
+-- group subscriptions, committed offsets, DLQ counters -- see
+-- Broker:delete_topic). Internal topics are refused.
+--
+-- This is the one destructive admin op, and it is deliberately unconditional:
+-- there is no "only if empty" guard, because a topic you want gone is usually
+-- one with data in it. The protection that does exist is the internal-topic
+-- refusal, which stops a client from deleting the broker's own state.
+function M.delete_topic(server, conn, correl, payload)
+    local c, err = proto.decode_delete_topic(payload)
+    if not c then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    if server.broker.is_internal(c.name) then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_FORBIDDEN,
+            string.format("cannot delete internal topic '%s'", c.name)))
+        return
+    end
+    if not server.broker.topic_manager.topics[c.name] then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
+            string.format("topic %s does not exist", c.name)))
+        return
+    end
+
+    local ok, derr = server.broker:delete_topic(c.name)
+    if not ok then
+        conn:send(proto.encode_error(correl, proto.ERR_INTERNAL, derr))
+        return
+    end
+    -- A non-nil err alongside ok=true means the log is gone but some
+    -- bookkeeping cleanup failed. The delete happened, so this is a warning,
+    -- not an error reply -- telling the client it failed would invite a retry
+    -- against a topic that no longer exists.
+    if derr then
+        log:warn("delete_topic %s: %s", c.name, derr)
+    end
+
+    metrics.set("moonmq_topic_count", #server.broker:list_topics())
+    log:info("topic '%s' deleted", c.name)
+    conn:send(proto.encode_ok(correl))
+end
+
+-- DESCRIBE_TOPIC: partition count plus the persisted per-topic config. Only
+-- keys actually set are returned; an absent key means the partition default is
+-- in force (which is why we do not helpfully fill defaults in -- "unset" and
+-- "set to the current default" behave differently the day the default moves).
+function M.describe_topic(server, conn, correl, payload)
+    local c, err = proto.decode_describe_topic(payload)
+    if not c then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    local desc, derr = server.broker:describe_topic(c.name)
+    if not desc then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
+            derr or "topic missing"))
+        return
+    end
+
+    conn:send(proto.encode_topic_description(
+        correl, desc.name, desc.num_partitions, desc.config))
+end
+
+-- ALTER_TOPIC_CONFIG: merge config changes into the topic's sidecar and apply
+-- the live-applicable ones to open partitions (see Broker:alter_topic_config).
+function M.alter_topic_config(server, conn, correl, payload)
+    local c, err = proto.decode_alter_topic_config(payload)
+    if not c then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    if server.broker.is_internal(c.name) then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_FORBIDDEN,
+            string.format("cannot reconfigure internal topic '%s'", c.name)))
+        return
+    end
+    if not server.broker.topic_manager.topics[c.name] then
+        conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
+            string.format("topic %s does not exist", c.name)))
+        return
+    end
+
+    local applied, aerr = server.broker:alter_topic_config(c.name, c.config)
+    if not applied then
+        -- A rejected key or unparseable value is the client's mistake, not a
+        -- broker failure, so it gets its own code rather than ERR_INTERNAL.
+        conn:send(proto.encode_error(correl, proto.ERR_INVALID_CONFIG, aerr))
+        return
+    end
+
+    local keys = {}
+    for k in pairs(applied) do keys[#keys + 1] = k end
+    table.sort(keys)
+    if #keys > 0 then
+        log:info("topic '%s' config altered: %s", c.name, table.concat(keys, ","))
+    end
+    conn:send(proto.encode_ok(correl))
+end
+
+-- LIST_GROUPS: every group this broker knows about, live or merely holding
+-- committed offsets. See GroupCoordinator:list for the cluster caveat.
+function M.list_groups(server, conn, correl, _payload)
+    conn:send(proto.encode_group_list(correl, server.coordinator:list()))
+end
+
+-- DESCRIBE_GROUP: members, their assignments, and the group's durable
+-- committed offsets. Pairing the offsets with LIST_OFFSETS' latest/lso is what
+-- makes consumer lag computable without the broker defining it.
+function M.describe_group(server, conn, correl, payload)
+    local c, err = proto.decode_describe_group(payload)
+    if not c then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    local desc, derr = server.coordinator:describe(c.group_id)
+    if not desc then
+        conn:send(proto.encode_error(correl, proto.ERR_GROUP_MISSING,
+            derr or "group missing"))
+        return
+    end
+
+    conn:send(proto.encode_group_description(correl, desc))
+end
+
+-- DELETE_GROUP: drop a group and tombstone its committed offsets. Refused
+-- while it still has live members (see GroupCoordinator:delete).
+function M.delete_group(server, conn, correl, payload)
+    local c, err = proto.decode_delete_group(payload)
+    if not c then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
+        return
+    end
+
+    local n, derr, not_empty = server.coordinator:delete(c.group_id)
+    if not n then
+        conn:send(proto.encode_error(correl,
+            not_empty and proto.ERR_GROUP_NOT_EMPTY or proto.ERR_GROUP_MISSING,
+            derr))
+        return
+    end
+
+    log:info("group '%s' deleted (%d committed offset(s) cleared)", c.group_id, n)
+    conn:send(proto.encode_ok(correl))
 end
 
 -- JOIN_GROUP: register this connection as a member of a group subscribing
@@ -1284,6 +1459,12 @@ M.BY_OP = {
     [proto.OP_CREATE_TOPIC]       = M.create_topic,
     [proto.OP_LIST_TOPICS]        = M.list_topics,
     [proto.OP_LIST_OFFSETS]       = M.list_offsets,
+    [proto.OP_DELETE_TOPIC]       = M.delete_topic,
+    [proto.OP_DESCRIBE_TOPIC]     = M.describe_topic,
+    [proto.OP_ALTER_TOPIC_CONFIG] = M.alter_topic_config,
+    [proto.OP_LIST_GROUPS]        = M.list_groups,
+    [proto.OP_DESCRIBE_GROUP]     = M.describe_group,
+    [proto.OP_DELETE_GROUP]       = M.delete_group,
     [proto.OP_JOIN_GROUP]         = M.join_group,
     [proto.OP_LEAVE_GROUP]        = M.leave_group,
     [proto.OP_GROUP_HEARTBEAT]    = M.group_heartbeat,

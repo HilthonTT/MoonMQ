@@ -163,6 +163,179 @@ function Broker:create_topic(name, num_partitions, opts)
     return topic, err
 end
 
+-- is_internal reports whether `name` is broker-owned state rather than user
+-- data (__consumer_offsets, __producer_state). The `__` prefix is already the
+-- convention Broker:list_topics and tick_cleaners filter on; this puts a name
+-- on it so the admin paths refuse the same set.
+function Broker.is_internal(name)
+    return name:sub(1, 2) == "__"
+end
+
+-- delete_topic removes a topic and everything that referenced it.
+--
+-- Deleting the log is the easy half. The rest of this function is the state
+-- that would otherwise dangle and quietly misbehave:
+--
+--   * consumer groups keep a subscribed-topic table and per-member
+--     assignments, so a rebalance after deletion would assign partitions of a
+--     log that no longer exists. Cleared via the coordinator (installed by the
+--     Server; absent in bare-broker tests, hence the nil check).
+--   * committed offsets in __consumer_offsets survive independently of the
+--     topic. Recreating a topic of the same name would hand every previously
+--     subscribed group a stale offset into an unrelated log, so they are
+--     tombstoned.
+--   * DLQ attempt counters are keyed by (group, topic, partition, offset) and
+--     are in-memory only, so they die with the process; they are dropped here
+--     anyway so a delete/recreate cycle inside one broker lifetime starts
+--     clean.
+--
+-- Internal topics are refused: they are broker state, and removing them out
+-- from under the OffsetManager or ProducerStateManager would corrupt a running
+-- broker. Returns (true, nil) or (nil, err).
+function Broker:delete_topic(name)
+    assert(type(name) == "string", "name must be a string")
+
+    if Broker.is_internal(name) then
+        return nil, string.format("refusing to delete internal topic '%s'", name)
+    end
+    if not self.topic_manager.topics[name] then
+        return nil, string.format("topic %s does not exist", name)
+    end
+
+    -- Drop the topic out of live consumer groups BEFORE the log goes away, so
+    -- no rebalance can observe a half-deleted topic.
+    if self.group_coordinator then
+        self.group_coordinator:forget_topic(name)
+    end
+
+    local ok, err = self.topic_manager:delete_topic(name)
+    if not ok then return nil, err end
+
+    -- Past the point of no return: the log is gone. Any failure below leaves
+    -- stale bookkeeping rather than a live topic, so report it without
+    -- pretending the delete didn't happen.
+    if self.offsets then
+        local _, oerr = self.offsets:delete_topic_offsets(name)
+        if oerr then
+            return true, string.format(
+                "topic deleted, but clearing its committed offsets failed: %s", oerr)
+        end
+    end
+
+    if self.dlq and self.dlq.forget_topic then
+        self.dlq:forget_topic(name)
+    end
+
+    return true, nil
+end
+
+-- describe_topic returns { name, num_partitions, config } where `config` is
+-- the persisted sidecar (see topic_config.lua). Only keys actually set are
+-- present -- an absent key means the partition default applies.
+function Broker:describe_topic(name)
+    assert(type(name) == "string", "name must be a string")
+
+    local topic, terr = self:get_topic(name)
+    if not topic then return nil, terr end
+
+    local config, cerr = self.topic_manager:config(name)
+    if not config then return nil, cerr end
+
+    return {
+        name           = name,
+        num_partitions = #topic.partitions,
+        config         = config,
+    }, nil
+end
+
+-- Config keys ALTER_TOPIC_CONFIG accepts, and how to parse each one's wire
+-- value (values arrive as strings; see encode_alter_topic_config).
+--
+-- `backend` is deliberately absent: it selects the storage engine, which is
+-- baked into the on-disk layout at creation. Changing it on a topic with data
+-- would mean reinterpreting existing segments under a different format.
+local ALTERABLE = {
+    max_segment_size = "number",
+    retention        = "number",
+    cleaner_interval = "number",
+    max_log_bytes    = "number",
+    cleanup_policy   = "string",
+}
+
+-- Which alterable keys are also LIVE fields on an open SegmentedPartition, so
+-- a change takes effect without a restart. The rest are read at open time and
+-- apply on the next one.
+local LIVE_PARTITION_FIELDS = {
+    max_segment_size = true,
+    retention        = true,
+    cleaner_interval = true,
+}
+
+-- alter_topic_config merges `changes` into the topic's persisted config and
+-- applies what can be applied live.
+--
+-- The sidecar is the durable source of truth Broker:load_topics restores from,
+-- so it is written first: if the process dies between the write and the
+-- in-memory update, a restart converges on the new config. The reverse order
+-- would lose the change entirely.
+--
+-- Returns (applied_table, nil) or (nil, err).
+function Broker:alter_topic_config(name, changes)
+    assert(type(name) == "string", "name must be a string")
+    assert(type(changes) == "table", "changes must be a table")
+
+    if Broker.is_internal(name) then
+        return nil, string.format(
+            "refusing to reconfigure internal topic '%s'", name)
+    end
+
+    local topic, terr = self:get_topic(name)
+    if not topic then return nil, terr end
+
+    local parsed = {}
+    for key, raw in pairs(changes) do
+        local kind = ALTERABLE[key]
+        if not kind then
+            return nil, string.format("unknown or immutable config key '%s'", key)
+        end
+        if kind == "number" then
+            local n = tonumber(raw)
+            if not n then
+                return nil, string.format(
+                    "config key '%s' needs a number, got %q", key, tostring(raw))
+            end
+            if n <= 0 then
+                return nil, string.format(
+                    "config key '%s' must be positive, got %s", key, tostring(n))
+            end
+            -- The sidecar writes numbers with %.f and reads them back with
+            -- tonumber, so a fractional value would not round-trip.
+            parsed[key] = math.floor(n)
+        else
+            parsed[key] = tostring(raw)
+        end
+    end
+
+    if next(parsed) == nil then return {}, nil end
+
+    local merged, cerr = self.topic_manager:config(name)
+    if not merged then return nil, cerr end
+    for k, v in pairs(parsed) do merged[k] = v end
+
+    local ok, serr = self.topic_manager:set_config(name, merged)
+    if not ok then return nil, serr end
+
+    for key, value in pairs(parsed) do
+        if LIVE_PARTITION_FIELDS[key] then
+            for _, p in ipairs(topic.partitions) do
+                if p[key] ~= nil then p[key] = value end
+            end
+        end
+    end
+
+    return parsed, nil
+end
+
 -- attach_committer_factory installs a callback `fn(partition)` that the
 -- broker invokes on every partition — both those already loaded and any
 -- created later via :create_topic. The Server calls this once at startup

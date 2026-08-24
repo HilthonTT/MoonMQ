@@ -134,6 +134,18 @@ local function set_in_map(map, group, topic, partition, offset)
     t[partition] = offset
 end
 
+-- Inverse of set_in_map, pruning the intermediate tables it leaves behind.
+-- Without the pruning a group that had every offset deleted would still show
+-- up in :groups() as an empty shell, and DESCRIBE_GROUP would report a group
+-- that no longer has any committed state.
+local function unset_in_map(map, group, topic, partition)
+    local g = map[group]; if not g then return end
+    local t = g[topic];   if not t then return end
+    t[partition] = nil
+    if next(t) == nil then g[topic] = nil end
+    if next(g) == nil then map[group] = nil end
+end
+
 -- _partition_for maps a group to its internal partition (1-based). FNV-1a
 -- gives a stable, platform-independent bucket so a group's offset history
 -- always replays from the same partition. The `% nparts` yields 0..nparts-1;
@@ -144,14 +156,13 @@ end
 
 -- commit appends an offset record and updates the in-memory map.
 -- Returns (true, nil) or (nil, err).
-function OffsetManager:commit(group, topic, partition, offset)
-    assert(type(group) == "string", "group must be a string")
-    assert(type(topic) == "string", "topic must be a string")
-    assert(type(partition) == "number", "partition must be a number")
-    assert(type(offset) == "number", "offset must be a number")
-
+-- _append writes one (key, value) record into the group's internal partition
+-- and fsyncs it. `val` is the packed offset for a commit, or "" for a
+-- tombstone. Shared by commit() and delete() so both go through exactly the
+-- same durability path -- a delete that wasn't fsynced would come back on the
+-- next restart, which is the whole bug this store exists to avoid.
+function OffsetManager:_append(group, topic, partition, val)
     local key = string.pack(KEY_FMT, group, topic, partition)
-    local val = string.pack(VALUE_FMT, offset)
     local rec = msg_m.Message.new(key, val, os.time() * 1000)
 
     local part = self.topic.partitions[self:_partition_for(group)]
@@ -173,8 +184,117 @@ function OffsetManager:commit(group, topic, partition, offset)
         end
     end
 
+    return true, nil
+end
+
+function OffsetManager:commit(group, topic, partition, offset)
+    assert(type(group) == "string", "group must be a string")
+    assert(type(topic) == "string", "topic must be a string")
+    assert(type(partition) == "number", "partition must be a number")
+    assert(type(offset) == "number", "offset must be a number")
+
+    local ok, err = self:_append(group, topic, partition,
+        string.pack(VALUE_FMT, offset))
+    if not ok then return nil, err end
+
     set_in_map(self.map, group, topic, partition, offset)
     return true, nil
+end
+
+-- delete writes a TOMBSTONE for (group, topic, partition): a record with the
+-- same key and a ZERO-LENGTH value. This is not a private convention -- it is
+-- exactly what src/commitlog/compact_cleaner.lua already recognises, so once
+-- the key's tombstone is its latest record, compaction drops the key from the
+-- log entirely rather than retaining a deletion marker forever.
+--
+-- Deleting only from the in-memory map would be a restart-shaped bug: recover()
+-- replays the log and the old committed offset would come straight back.
+function OffsetManager:delete(group, topic, partition)
+    assert(type(group) == "string", "group must be a string")
+    assert(type(topic) == "string", "topic must be a string")
+    assert(type(partition) == "number", "partition must be a number")
+
+    local ok, err = self:_append(group, topic, partition, "")
+    if not ok then return nil, err end
+
+    unset_in_map(self.map, group, topic, partition)
+    return true, nil
+end
+
+-- delete_group tombstones every committed offset a group holds. Returns
+-- (count, nil) or (nil, err) -- on error some tombstones may already be
+-- durable, which is safe: they are individually meaningful, and a retry
+-- finishes the job.
+function OffsetManager:delete_group(group)
+    assert(type(group) == "string", "group must be a string")
+
+    local n = 0
+    for _, o in ipairs(self:offsets_for_group(group)) do
+        local ok, err = self:delete(group, o.topic, o.partition)
+        if not ok then return nil, err end
+        n = n + 1
+    end
+    return n, nil
+end
+
+-- delete_topic_offsets tombstones every group's committed offsets for one
+-- topic. Called when the topic itself is deleted: without it, recreating a
+-- topic of the same name would hand every previously-subscribed group a stale
+-- offset into a log that no longer has those records.
+function OffsetManager:delete_topic_offsets(topic)
+    assert(type(topic) == "string", "topic must be a string")
+
+    local doomed = {}
+    for group, topics in pairs(self.map) do
+        local t = topics[topic]
+        if t then
+            for partition in pairs(t) do
+                doomed[#doomed + 1] = { group = group, partition = partition }
+            end
+        end
+    end
+
+    local n = 0
+    for _, d in ipairs(doomed) do
+        local ok, err = self:delete(d.group, topic, d.partition)
+        if not ok then return nil, err end
+        n = n + 1
+    end
+    return n, nil
+end
+
+-- groups returns every group id with at least one committed offset, sorted.
+-- Note this is the DURABLE view: a group appears here whether or not it
+-- currently has live members, which is precisely the state LIST_GROUPS must
+-- surface (an abandoned group still holds offsets and still occupies a name).
+function OffsetManager:groups()
+    local out = {}
+    for group in pairs(self.map) do out[#out + 1] = group end
+    table.sort(out)
+    return out
+end
+
+-- offsets_for_group returns { { topic, partition, offset }, ... } for one
+-- group, sorted by (topic, partition) so the wire bytes are deterministic.
+function OffsetManager:offsets_for_group(group)
+    assert(type(group) == "string", "group must be a string")
+
+    local out = {}
+    local topics = self.map[group]
+    if not topics then return out end
+
+    for topic, parts in pairs(topics) do
+        for partition, offset in pairs(parts) do
+            out[#out + 1] = {
+                topic = topic, partition = partition, offset = offset,
+            }
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.topic ~= b.topic then return a.topic < b.topic end
+        return a.partition < b.partition
+    end)
+    return out
 end
 
 -- fetch returns the committed offset for (group, topic, partition), or nil
@@ -219,6 +339,13 @@ function OffsetManager:recover()
     for _, part in ipairs(self.topic.partitions) do
         local serr = part:scan(function(_offset, msg)
             local ok, group, topic, partition = pcall(string.unpack, KEY_FMT, msg.key)
+            if ok and #msg.value == 0 then
+                -- Tombstone (see :delete). Records replay in append order, so
+                -- this correctly erases an earlier commit for the same key --
+                -- and a later commit after it re-establishes the offset.
+                unset_in_map(self.map, group, topic, partition)
+                return
+            end
             local vok, stored = pcall(string.unpack, VALUE_FMT, msg.value)
             if ok and vok then
                 set_in_map(self.map, group, topic, partition, stored)
@@ -236,8 +363,20 @@ function OffsetManager:recover()
         end
     end
 
-    if restored > 0 then
-        log:info("recovered %d committed offset(s) from %s", restored, OFFSETS_TOPIC)
+    -- Count what SURVIVED, not how many records were replayed. Those differ
+    -- once tombstones exist: a commit followed by its tombstone replays two
+    -- records and leaves nothing, and reporting "recovered 1" there would
+    -- describe an offset the broker does not actually hold.
+    local live = 0
+    for _, topics in pairs(self.map) do
+        for _, parts in pairs(topics) do
+            for _ in pairs(parts) do live = live + 1 end
+        end
+    end
+
+    if live > 0 then
+        log:info("recovered %d committed offset(s) from %s (%d record(s) replayed)",
+            live, OFFSETS_TOPIC, restored)
     end
     return nil
 end

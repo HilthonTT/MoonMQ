@@ -28,6 +28,7 @@ records.
 | **Throughput** | Record batching on both sides: one frame for N records, one fsync per partition instead of per record. |
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
 | **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. |
+| **Admin** | Create/describe/delete topics, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
 
 ## Quick start
@@ -67,6 +68,36 @@ local ends  = assert(c:list_offsets("orders"))                 -- per partition 
 makes lag (`latest - committed`) computable and what lets a consumer seek to
 either end. Under `read_committed` measure against `lso` instead — that is the
 offset the broker will actually deliver up to.
+
+To seek by wall-clock rather than by offset, `offsets_for_times` resolves the
+earliest offset per partition whose record timestamp is at or after a given
+millisecond timestamp — Kafka's `offsetForTimes`. It reads the sparse
+`.timeindex` every partition already writes, so it is a short binary search
+plus a bounded scan rather than a walk of the log:
+
+```lua
+local at = assert(c:offsets_for_times("orders", 1700000000000))
+-- { { partition = 1, offset = 8134, found = true }, ... }
+```
+
+`found = false` means nothing at or after that time exists yet; `offset` is
+then the partition's `latest`, i.e. where the first such record will land, so
+"seek to T and follow" works on a partition that has not reached T yet.
+
+Admin calls round out the surface — topics can be described, reconfigured and
+deleted at runtime, and consumer groups inspected:
+
+```lua
+assert(c:alter_topic_config("orders", { retention = 86400 }))  -- seconds
+local d = assert(c:describe_group("billing"))
+-- d.members[i].assignment, d.offsets[i] = { topic, partition, offset }
+```
+
+Pairing `describe_group`'s committed offsets with `list_offsets` is what makes
+lag a broker-side fact rather than something a sidecar has to reconstruct. A
+group holding committed offsets but no live members — an abandoned or
+between-deploys consumer — shows up in `list_groups` with state `empty`, which
+is usually the thing you went looking for.
 
 Runnable examples: `src/examples/tcp_client.lua`,
 `src/examples/consumer_group.lua`.

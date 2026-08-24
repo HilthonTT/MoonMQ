@@ -119,4 +119,70 @@ function TopicManager:create_topic(name, numPartitions, opts)
     return topic, nil
 end
 
+-- topic_dir returns the on-disk directory for `name`, whether or not the topic
+-- is currently open.
+function TopicManager:topic_dir(name)
+    return fs_m.join_path(self.baseDir, name)
+end
+
+-- config returns the persisted per-topic opts for `name` (the topic.config
+-- sidecar), or an empty table when the topic was created with none. An open
+-- topic is NOT required -- this reads the sidecar, which is the durable source
+-- of truth that Broker:load_topics restores from on restart.
+function TopicManager:config(name)
+    assert(type(name) == "string", "name must be a string")
+    return topic_config.load(self:topic_dir(name))
+end
+
+-- set_config replaces the sidecar for `name` wholesale. Callers merge onto
+-- :config() first; a plain overwrite here keeps save() the single writer and
+-- avoids a read-modify-write hidden inside the storage layer.
+function TopicManager:set_config(name, opts)
+    assert(type(name) == "string", "name must be a string")
+    assert(type(opts) == "table", "opts must be a table")
+    return topic_config.save(self:topic_dir(name), opts)
+end
+
+-- delete_topic closes every partition of `name` and removes its directory.
+--
+-- Ordering is the whole story here: descriptors are released BEFORE the tree
+-- is unlinked. On Windows an open file cannot be deleted at all, so a
+-- close-after-unlink ordering would fail outright there; on POSIX it would
+-- "succeed" while the bytes stayed alive behind the open handles until GC.
+-- Closing first makes both platforms behave the same way.
+--
+-- The topic is dropped from the in-memory table only after the tree is gone,
+-- so a failed unlink leaves a consistent broker: the topic is still open, still
+-- listed, still serving. The one state we refuse to produce is "forgotten in
+-- memory but still on disk", which the next restart would silently resurrect.
+--
+-- Returns (true, nil) or (nil, err).
+function TopicManager:delete_topic(name)
+    assert(type(name) == "string", "name must be a string")
+
+    local topic = self.topics[name]
+    if not topic then
+        return nil, string.format("topic '%s' does not exist", name)
+    end
+
+    -- Detach committers before closing: a partition wired to the reactor's
+    -- group committer has waiters that must be drained, and closing the files
+    -- underneath them would strand those waiters on a partition that can no
+    -- longer be synced.
+    for _, p in ipairs(topic.partitions) do
+        if p.detach_committer then p:detach_committer() end
+    end
+    for _, p in ipairs(topic.partitions) do
+        p:close()
+    end
+
+    local ok, err = fs_m.remove_all(self:topic_dir(name))
+    if not ok then
+        return nil, string.format("failed to remove topic '%s': %s", name, tostring(err))
+    end
+
+    self.topics[name] = nil
+    return true, nil
+end
+
 return TopicManager
