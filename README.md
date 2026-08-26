@@ -28,14 +28,15 @@ records.
 | **Throughput** | Record batching on both sides: one frame for N records, one fsync per partition instead of per record. |
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
 | **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. |
+| **Admin** | Create/describe/delete topics, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
 
 ## Quick start
 
 ```bash
-sudo apt install lua5.4 lua-socket    # Debian/Ubuntu
-make deps                             # dkjson, busted, luasocket via luarocks-5.4
-lua5.4 main.lua                       # or: make run
+sudo apt install lua5.4 lua-socket libssl-dev zlib1g-dev   # Debian/Ubuntu
+make deps          # busted, dkjson, luasocket, luaposix, lua-zlib, luaossl
+lua5.4 main.lua    # or: make run
 ```
 
 ```
@@ -68,6 +69,36 @@ makes lag (`latest - committed`) computable and what lets a consumer seek to
 either end. Under `read_committed` measure against `lso` instead — that is the
 offset the broker will actually deliver up to.
 
+To seek by wall-clock rather than by offset, `offsets_for_times` resolves the
+earliest offset per partition whose record timestamp is at or after a given
+millisecond timestamp — Kafka's `offsetForTimes`. It reads the sparse
+`.timeindex` every partition already writes, so it is a short binary search
+plus a bounded scan rather than a walk of the log:
+
+```lua
+local at = assert(c:offsets_for_times("orders", 1700000000000))
+-- { { partition = 1, offset = 8134, found = true }, ... }
+```
+
+`found = false` means nothing at or after that time exists yet; `offset` is
+then the partition's `latest`, i.e. where the first such record will land, so
+"seek to T and follow" works on a partition that has not reached T yet.
+
+Admin calls round out the surface — topics can be described, reconfigured and
+deleted at runtime, and consumer groups inspected:
+
+```lua
+assert(c:alter_topic_config("orders", { retention = 86400 }))  -- seconds
+local d = assert(c:describe_group("billing"))
+-- d.members[i].assignment, d.offsets[i] = { topic, partition, offset }
+```
+
+Pairing `describe_group`'s committed offsets with `list_offsets` is what makes
+lag a broker-side fact rather than something a sidecar has to reconstruct. A
+group holding committed offsets but no live members — an abandoned or
+between-deploys consumer — shows up in `list_groups` with state `empty`, which
+is usually the thing you went looking for.
+
 Runnable examples: `src/examples/tcp_client.lua`,
 `src/examples/consumer_group.lua`.
 
@@ -76,12 +107,26 @@ Runnable examples: `src/examples/tcp_client.lua`,
 - **Lua 5.4** — uses native bitwise operators and `goto`/labels
 - **LuaSocket** — TCP networking
 - **dkjson** — pure-Lua JSON, reads `appsettings.json`
-- **luaposix** (Linux) — real `fsync`/`ftruncate`, so `acks=1` actually hits disk
+- **luaposix** (Linux) — real `fsync`/`ftruncate`, so `acks=1` actually hits
+  disk. Also gives `src/io/fs.lua` syscall-based directory access: without it
+  every `is_dir`/`read_dir`/`mkdir` forks a process **on the reactor thread**
+  (measured on ext4: 23 ms per `test -d` against 2.5 µs for a `stat`, and 42
+  process spawns just to open ten partitions)
+- **lua-zlib** — gzip compression *and* the native CRC-32 every record is
+  checksummed with. The pure-Lua fallback runs at ~16 MB/s against ~740 MB/s
+- **luaossl** — native PBKDF2 for password verification. Without it a login
+  costs **3.2 s of reactor time at 10,000 iterations and ~190 s at the
+  recommended 600,000**, versus 5 ms and 0.29 s natively. Needs `libssl-dev`
 
-SHA-256/HMAC is vendored (`src/vendor/sha2.lua`) — nothing to install.
-Optional: `zlib` for gzip, LuaJIT FFI + `libsnappy` for Snappy. Both codecs
-load lazily; a broker without them boots fine and only rejects produce
-requests asking for the missing codec.
+luaposix is **required** on Linux — `src/io/io_sync.lua` has no other way to
+fsync. lua-zlib and luaossl are optional: without them the broker still boots
+and falls back to pure Lua, logging which backend it picked (`filesystem
+backend=…`, `PBKDF2 backend=…`) at startup. Those fallbacks are correct, not
+fast — a production broker wants all three. Snappy compression additionally
+needs LuaJIT FFI + `libsnappy`; SHA-256/HMAC is vendored
+(`src/vendor/sha2.lua`) with nothing to install.
+
+`make deps` installs the lot.
 
 <details>
 <summary><b>Building luaposix for Lua 5.4</b> (Ubuntu's package only ships 5.1–5.3)</summary>
@@ -124,9 +169,18 @@ C runtime), so Windows needs **LuaJIT** rather than stock Lua 5.4.
 
 | Section | Keys |
 | --- | --- |
-| `Server` | `Host`, `Port` (9092), `DataDir`, `MaxConnections`, `MaxConnectionsPerIP`, `MaxFrameSize`, `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `MetricsHost`, `MetricsPort` (`null` disables), `Acks`, `Replication`, `Cluster`, `Autobalance` |
+| `Server` | `Host`, `Port` (9092), `DataDir`, `MaxConnections` (960), `MaxConnectionsPerIP`, `FdReserve` (64), `MaxFrameSize`, `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `MetricsHost`, `MetricsPort` (`null` disables), `Acks`, `Replication`, `Cluster`, `Autobalance` |
 | `Auth` | `Username` + either `PasswordHash` (`pbkdf2-sha256$<iter>$<salt_hex>$<hash_hex>`) or plaintext `Password`; `MaxFailures`, `FailureWindow`, `BanDuration` for per-IP lockout |
 | `Logging` | `Level` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `File` (empty = stderr only), `LogToStderr` (default true, tees both) |
+
+`MaxConnections` is a ceiling, not a promise: the event loop multiplexes with
+`select(2)`, which cannot watch a descriptor numbered at or above
+`FD_SETSIZE` (1024 on Linux). The broker clamps the configured value to
+`FD_SETSIZE` minus a reserve for listeners and the log files each open
+partition holds, logs the clamp, and refuses any connection whose descriptor
+lands above the line — one refused connection instead of a dead broker. A node
+with many partitions should raise the reserve (`Server.FdReserve`); watch
+`moonmq_connections_refused_fd_total` to see whether the budget is too tight.
 
 Generate a password hash — 600 000 PBKDF2 iterations per NIST 2024 guidance
 (existing hashes keep their stored iteration count):
@@ -134,6 +188,15 @@ Generate a password hash — 600 000 PBKDF2 iterations per NIST 2024 guidance
 ```bash
 make hash PASSWORD=yourpw
 ```
+
+> [!IMPORTANT]
+> Verification cost scales linearly with the iteration count, it runs **inline
+> on the single reactor thread**, and the stored hash carries its own iteration
+> count — so a 600 000-iteration hash generated on a host with luaossl is
+> still accepted by a broker without it, where it takes minutes per login.
+> The broker measures this at startup and warns when a login would cost more
+> than a second; install luaossl, or re-hash with a count the host can afford
+> (`lua bin/moonmq-hash.lua <password> <iterations>`).
 
 > [!WARNING]
 > With no usable credential the broker starts **open** (no authentication)

@@ -1,6 +1,13 @@
 -- IEEE 802.3 CRC-32, byte-compatible with Go's crc32.ChecksumIEEE.
--- Uses zlib via FFI when available (fast path); falls back to a
--- table-driven pure-Lua implementation otherwise.
+-- Three implementations, probed in order:
+--   1. zlib via LuaJIT FFI       — only exists under LuaJIT.
+--   2. zlib via the lua-zlib rock — the fast path on PUC Lua 5.4, which is
+--      what the Makefile, CI and every spec run actually use. lua-zlib is
+--      already a declared dependency (src/record/compression.lua needs it
+--      for gzip), so this costs nothing extra.
+--   3. table-driven pure Lua      — correct everywhere, ~46x slower than
+--      either native path (16 MB/s vs 737 MB/s measured on a 200B record).
+-- All three produce identical values; the record format does not change.
 
 local os_utils = require("src.core.os")
 
@@ -30,6 +37,20 @@ end
 if zlib then
     return function(data)
         return tonumber(zlib.crc32(0, data, #data)) % 0x100000000
+    end
+end
+
+-- lua-zlib: `zlib.crc32()` returns a stateful updater; calling it with a
+-- string returns the running CRC of everything fed so far, so a fresh
+-- updater per call gives the one-shot checksum. The result comes back as a
+-- Lua float, hence the math.floor — string.pack(">I4") rejects a float with
+-- a fractional part, and an unfloored value would also fail == against the
+-- pure-Lua path.
+local has_zlib, zlib_rock = pcall(require, "zlib")
+if has_zlib and type(zlib_rock) == "table" and zlib_rock.crc32 then
+    local new_crc = zlib_rock.crc32
+    return function(data)
+        return math.floor(new_crc()(data)) % 0x100000000
     end
 end
 

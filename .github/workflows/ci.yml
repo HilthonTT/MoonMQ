@@ -4,25 +4,48 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  # Weekly build with nothing pushed. The luarocks installs below are
+  # unpinned and Dependabot has no LuaRocks ecosystem (see dependabot.yml),
+  # so an upstream rock release is otherwise only discovered when it breaks
+  # someone's unrelated PR.
+  schedule:
+    - cron: '0 6 * * 1'
 
 # Cancel superseded runs on the same ref so a rapid push sequence doesn't queue
-# redundant jobs.
+# redundant jobs — but never on main: that's the ref releases are cut from, and
+# a cancelled build there leaves no record of whether the merge was green.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Nothing in this workflow writes to the repo, so drop the default token
+# scopes to read-only.
+permissions:
+  contents: read
 
 jobs:
   test:
     name: lint + test + smoke
     runs-on: ubuntu-latest
+    # The reactor, chaos and replication specs drive real sockets and a
+    # restart/recovery loop; a deadlock there would otherwise sit on a runner
+    # for GitHub's 6-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Lua 5.4, LuaRocks, and zlib headers
+      - name: Install Lua 5.4, LuaRocks, and native library headers
+        # --no-install-recommends keeps the runner lean; build-essential and
+        # unzip are then named explicitly because luarocks needs both to build
+        # the C rocks below (already present on ubuntu-latest, so this is a
+        # no-op there and insurance if the image ever slims down).
         run: |
           sudo apt-get update
           # zlib1g-dev: lua-zlib builds against it. liblua5.4-dev: rock C modules.
-          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks zlib1g-dev
+          # libssl-dev: luaossl (native PBKDF2) builds against it.
+          sudo apt-get install -y --no-install-recommends \
+            lua5.4 liblua5.4-dev luarocks zlib1g-dev libssl-dev \
+            build-essential unzip
 
       - name: Install Lua dependencies
         # luarocks-5.4, NOT plain luarocks: the Debian/Ubuntu `luarocks`
@@ -36,6 +59,7 @@ jobs:
           sudo luarocks-5.4 install dkjson
           sudo luarocks-5.4 install lua-zlib
           sudo luarocks-5.4 install luaposix
+          sudo luarocks-5.4 install luaossl
           sudo luarocks-5.4 install luacheck
 
       - name: Verify toolchain targets Lua 5.4
@@ -49,6 +73,33 @@ jobs:
           grep -q '5\.4' "$(command -v busted)" \
             || { echo "::error::busted is not bound to Lua 5.4"; exit 1; }
 
+      - name: Verify the native fast paths are actually active
+        # The bug this guards against: src/core/crc32.lua used to probe only
+        # LuaJIT's FFI for a native zlib, so on PUC Lua 5.4 — this job, the
+        # Makefile, every spec run — it silently fell back to a pure-Lua loop
+        # ~46x slower, with lua-zlib installed the whole time. A fast path
+        # nobody asserts on is a fast path that quietly stops being taken.
+        # Same for luaposix (file I/O without forking) and luaossl (PBKDF2
+        # without minutes of reactor time per login).
+        run: |
+          lua5.4 -e '
+            local fs   = require("src.io.fs")
+            local auth = require("src.server.auth")
+            assert(fs.backend == "posix",
+              "fs backend is " .. fs.backend .. ", expected posix (luaposix missing?)")
+            assert(auth.kdf_backend() == "openssl",
+              "PBKDF2 backend is " .. auth.kdf_backend() .. ", expected openssl (luaossl missing?)")
+            local crc32 = require("src.core.crc32")
+            local blob, t0 = ("moonmq"):rep(700000), os.clock()
+            crc32(blob)
+            local elapsed = os.clock() - t0
+            assert(elapsed < 0.05, string.format(
+              "crc32 took %.3fs for %d bytes - that is the pure-Lua fallback, not zlib",
+              elapsed, #blob))
+            print(string.format("fs=%s kdf=%s crc32=%.4fs/%dB",
+              fs.backend, auth.kdf_backend(), elapsed, #blob))
+          '
+
       - name: Lint (luacheck)
         run: luacheck src bin main.lua spec
 
@@ -59,3 +110,18 @@ jobs:
         # Deliberately outside busted (see the file header); run it explicitly
         # so CI exercises the restart/recovery + segment-roll path too.
         run: lua5.4 spec/storage_smoke.lua
+
+      - name: Upload log/segment trees from the failed run
+        # The smoke test rmtree()s at the START of each phase, not the end, so
+        # the tree that failed is still on disk here. Both paths are gitignored
+        # and would otherwise die with the runner — and a corrupt segment is
+        # exactly what you want in hand when recovery or a roll goes wrong.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonmq-failure-data
+          path: |
+            data_server/
+            /tmp/moonmq_storage_smoke/
+          if-no-files-found: ignore
+          retention-days: 7

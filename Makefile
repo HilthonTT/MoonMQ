@@ -7,7 +7,18 @@ deps:
 	$(LUAROCKS) install busted
 	$(LUAROCKS) install luasocket
 	$(LUAROCKS) install dkjson
+	# lua-zlib: gzip compression AND the fast CRC-32 (src/core/crc32.lua falls
+	# back to a ~46x slower pure-Lua loop without it).
 	$(LUAROCKS) install lua-zlib
+	# luaposix: fsync/ftruncate, signal handling, and syscall-based file I/O.
+	# Without it src/io/fs.lua forks a process for every directory check, on
+	# the reactor thread.
+	$(LUAROCKS) install luaposix
+	# luaossl: native PBKDF2. Without it password verification runs in pure
+	# Lua and costs seconds-to-minutes of reactor time per login (see the
+	# table in src/server/auth.lua). Needs libssl headers: on Debian/Ubuntu
+	# `apt-get install libssl-dev`.
+	$(LUAROCKS) install luaossl
 	$(LUAROCKS) install luacheck
 	$(LUAROCKS) install sirocco
 	$(LUAROCKS) install hump

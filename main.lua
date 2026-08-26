@@ -165,6 +165,10 @@ if is_main(arg, ...) then
         port                   = s.Port or 9092,
         max_connections        = s.MaxConnections,
         max_connections_per_ip = s.MaxConnectionsPerIP,
+        -- Descriptors reserved for non-connection use (listeners, metrics,
+        -- replication, one open log + timeindex per partition). Raise it on a
+        -- broker with many partitions; see Server.new.
+        fd_reserve             = s.FdReserve,
         max_frame              = s.MaxFrameSize,
         max_pending_bytes      = s.MaxPendingBytes,
         send_deadline          = s.SendDeadline,

@@ -598,6 +598,182 @@ function Client:list_offsets(topic)
     return proto.decode_offsets(payload)
 end
 
+-- offsets_for_times resolves, for every partition of `topic`, the earliest
+-- offset whose record timestamp is >= `timestamp_ms` (Kafka's offsetForTimes).
+-- Returns, in partition order:
+--
+--   { { partition = 1, offset = 17, found = true }, ... }
+--
+-- `found = false` means no record qualifies -- the partition is empty, or the
+-- timestamp is past everything written so far -- and `offset` is then the
+-- partition's `latest`, i.e. where the first qualifying record will land. That
+-- makes "seek to 09:00 and follow" work on a quiet partition without a
+-- special case: you seek to the end and wait.
+--
+-- This is a log walk, not a counter read (see encode_list_offsets), so treat
+-- it as a seek primitive rather than something to call per poll.
+function Client:offsets_for_times(topic, timestamp_ms)
+    assert(type(topic) == "string", "topic must be a string")
+    assert(math.type(timestamp_ms) == "integer" and timestamp_ms >= 0,
+        "timestamp_ms must be a non-negative integer (milliseconds)")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_list_offsets(correl, topic, timestamp_ms))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_OFFSETS then
+        return nil, string.format("expected OFFSETS, got 0x%02x", op)
+    end
+
+    local entries, derr = proto.decode_offsets(payload)
+    if not entries then return nil, derr end
+    if not entries.for_times then
+        -- The broker answered with bounds only, which means it predates
+        -- offset-for-timestamp. Say so plainly rather than returning an empty
+        -- list that reads like "no partition has data after that time".
+        return nil, "broker does not support offset-for-timestamp"
+    end
+    return entries.for_times
+end
+
+-- delete_topic removes `name` and its log from the broker, along with the
+-- committed offsets and live group subscriptions that referenced it. There is
+-- no undo and no confirmation step -- the data is gone when this returns.
+function Client:delete_topic(name)
+    assert(type(name) == "string", "name must be a string")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_delete_topic(correl, name))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    return true
+end
+
+-- describe_topic returns { name, num_partitions, config } where `config` maps
+-- the keys actually set on the topic to their values AS STRINGS (the sidecar
+-- mixes numbers and strings; see encode_topic_description). A key absent from
+-- `config` is at the partition default, which is not the same as being set to
+-- whatever that default currently happens to be.
+function Client:describe_topic(name)
+    assert(type(name) == "string", "name must be a string")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_describe_topic(correl, name))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_TOPIC_DESCRIPTION then
+        return nil, string.format("expected TOPIC_DESCRIPTION, got 0x%02x", op)
+    end
+    return proto.decode_topic_description(payload)
+end
+
+-- alter_topic_config merges `config` (a { key = value } table) into the
+-- topic's persisted settings. Recognised keys: max_segment_size, retention,
+-- cleaner_interval, max_log_bytes, cleanup_policy. `backend` is immutable --
+-- it decides the on-disk format, so changing it on a topic with data would
+-- mean reinterpreting existing segments.
+--
+-- retention and cleaner_interval are in SECONDS, sizes in BYTES. Changes to
+-- max_segment_size / retention / cleaner_interval take effect immediately on
+-- open partitions; the rest apply the next time the topic is opened.
+function Client:alter_topic_config(name, config)
+    assert(type(name) == "string", "name must be a string")
+    assert(type(config) == "table", "config must be a table")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_alter_topic_config(correl, name, config))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    return true
+end
+
+-- list_groups returns { { group_id, state, member_count }, ... } sorted by id.
+-- A group with committed offsets but no live members is reported with state
+-- "empty" and zero members -- that is what an abandoned consumer group looks
+-- like, and it is usually why you are calling this.
+function Client:list_groups()
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_list_groups(correl))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_GROUP_LIST then
+        return nil, string.format("expected GROUP_LIST, got 0x%02x", op)
+    end
+    return proto.decode_group_list(payload)
+end
+
+-- describe_group returns
+--   { group_id, state,
+--     members = { { member_id, assignment = { [topic] = {ids} } }, ... },
+--     offsets = { { topic, partition, offset }, ... } }
+--
+-- `offsets` is the group's DURABLE committed position, independent of
+-- membership. Pair it with :list_offsets to compute lag:
+--   lag = latest - committed   (or lso - committed under read_committed).
+function Client:describe_group(group_id)
+    assert(type(group_id) == "string", "group_id must be a string")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_describe_group(correl, group_id))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if op ~= proto.OP_GROUP_DESCRIPTION then
+        return nil, string.format("expected GROUP_DESCRIPTION, got 0x%02x", op)
+    end
+    return proto.decode_group_description(payload)
+end
+
+-- delete_group removes a group and tombstones its committed offsets. Fails
+-- with ERR_GROUP_NOT_EMPTY while the group still has live members: make the
+-- consumers leave first, or the next commit from a surviving member would
+-- immediately recreate what this deleted.
+function Client:delete_group(group_id)
+    assert(type(group_id) == "string", "group_id must be a string")
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(proto.encode_delete_group(correl, group_id))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    return true
+end
+
 -- join_group registers this client as a member of `group_id` subscribing to
 -- `topics` (a topic name or array of names) and returns the broker's
 -- assignment: { member_id = "...", assignment = { [topic] = { part_id, ... } } }.

@@ -36,4 +36,47 @@ describe("crc32 (IEEE 802.3)", function()
         local v = crc32("some long-ish payload to exercise the table path")
         assert.is_true(v >= 0 and v < 0x100000000)
     end)
+
+    -- crc32.lua picks a native zlib (FFI or the lua-zlib rock) when one is
+    -- present and a pure-Lua table otherwise. Which backend is active depends
+    -- on the host, and a mismatch between them would silently corrupt every
+    -- record on disk — so check whatever backend loaded against an
+    -- independent reference implementation of the same polynomial.
+    describe("active backend vs. an independent reference", function()
+        local ref_table = {}
+        for i = 0, 255 do
+            local c = i
+            for _ = 1, 8 do
+                if (c & 1) ~= 0 then c = (c >> 1) ~ 0xEDB88320 else c = c >> 1 end
+            end
+            ref_table[i] = c
+        end
+
+        local function reference(data)
+            local crc = 0xFFFFFFFF
+            for i = 1, #data do
+                crc = (crc >> 8) ~ ref_table[(crc ~ data:byte(i)) & 0xFF]
+            end
+            return (crc ~ 0xFFFFFFFF) % 0x100000000
+        end
+
+        it("agrees on strings of every length from 0 to 64", function()
+            for n = 0, 64 do
+                local s = string.rep("Mm\0\xFF9", math.ceil(n / 5)):sub(1, n)
+                assert.are.equal(reference(s), crc32(s),
+                    string.format("mismatch at length %d", n))
+            end
+        end)
+
+        it("agrees on a payload larger than one record", function()
+            local s = string.rep("moonmq-partition-payload-\xC3\xA9\0", 5000)
+            assert.are.equal(reference(s), crc32(s))
+        end)
+
+        it("returns an integer, not a float (string.pack(\">I4\") needs one)", function()
+            local v = crc32("pack me")
+            assert.are.equal(math.type(v), "integer")
+            assert.has_no.errors(function() local _ = string.pack(">I4", v) end)
+        end)
+    end)
 end)

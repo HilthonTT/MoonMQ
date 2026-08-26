@@ -354,6 +354,78 @@ function ConsumerGroup:check_heartbeats()
     return expired
 end
 
+-- member_count returns how many members the group currently holds.
+function ConsumerGroup:member_count()
+    local n = 0
+    for _ in pairs(self.members) do n = n + 1 end
+    return n
+end
+
+-- describe returns a plain snapshot for DESCRIBE_GROUP:
+--   { group_id, state, members = { { member_id, assignment }, ... } }
+-- Members are sorted by id so the wire bytes are deterministic. `assignment`
+-- is the member's current partition assignment ({ topic -> {ids} }), which is
+-- nil for a member that joined but has not been through a rebalance yet -- an
+-- empty table is substituted so callers never have to nil-check it.
+function ConsumerGroup:describe()
+    local ids = {}
+    for member_id in pairs(self.members) do ids[#ids + 1] = member_id end
+    table.sort(ids)
+
+    local members = {}
+    for i, member_id in ipairs(ids) do
+        members[i] = {
+            member_id  = member_id,
+            assignment = self.members[member_id].partitions or {},
+        }
+    end
+
+    return { group_id = self.group_id, state = self:state(), members = members }
+end
+
+-- forget_topic drops `topic_name` from the group: out of the subscribed-topic
+-- table, out of every member's subscription list, and then out of every
+-- assignment via a rebalance. Called when the topic is deleted.
+--
+-- Without this a deleted topic keeps living inside the group: `self.topics`
+-- still maps it to a partition list, so the next rebalance happily assigns
+-- partitions of a log that no longer exists, and consumers chase reads against
+-- it until something errors. Returns true when the group actually held it.
+function ConsumerGroup:forget_topic(topic_name)
+    assert(type(topic_name) == "string", "topic_name must be a string")
+    if self.fsm:is(STATES.DEAD) then return false end
+    if not self.topics[topic_name] then return false end
+
+    self.topics[topic_name] = nil
+
+    for _, member in pairs(self.members) do
+        local kept = {}
+        for _, t in ipairs(member.topics or {}) do
+            if t ~= topic_name then kept[#kept + 1] = t end
+        end
+        member.topics = kept
+        if member.partitions then member.partitions[topic_name] = nil end
+    end
+
+    -- A group whose only subscription just vanished has nothing left to
+    -- assign. Collapse to `empty` rather than running a rebalance that would
+    -- hand every member an empty assignment -- same rule leave() applies when
+    -- the last member goes.
+    if next(self.topics) == nil then
+        -- empty_out has no edge from `empty` itself. Reaching here from an
+        -- already-empty group would need topics with no members, which join()
+        -- and leave() between them never leave behind -- but the FSM raises on
+        -- an illegal edge, so guard rather than rely on that invariant holding
+        -- for every future caller.
+        if not self.fsm:is(STATES.EMPTY) then
+            self.fsm:empty_out()
+        end
+    else
+        self:_run_rebalance()
+    end
+    return true
+end
+
 -- Private: reassign partitions to current members.
 function ConsumerGroup:_rebalance()
     local assignments = self.strategy(self.members, self.topics)

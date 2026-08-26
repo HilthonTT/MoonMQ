@@ -10,6 +10,32 @@ local log    = require("src.log.logger").get("auth")
 
 local M = {}
 
+-- Native PBKDF2 via luaossl, with the pure-Lua implementation below kept as
+-- the fallback. This is not a micro-optimisation: PBKDF2 runs inline on the
+-- single reactor thread, and in pure Lua it dominates everything else the
+-- broker does. Measured here (Lua 5.4, one core):
+--
+--     iterations   pure Lua        luaossl
+--     10,000        3.16 s          0.005 s
+--     600,000     ~190 s (est.)     0.286 s
+--
+-- 600,000 is this module's own recommended cost. Before the native path, a
+-- profile of the broker ingesting 6,000 records attributed 98.6% of samples
+-- to sha2.lua — one login outweighing the entire workload — and an
+-- unauthenticated peer sending wrong passwords could buy minutes of broker
+-- CPU per packet, since a wrong guess never hits the success cache.
+--
+-- Both paths produce identical bytes (checked against RFC 6070-style vectors
+-- and against each other in spec/auth_kdf_spec.lua), so stored hashes are
+-- portable between hosts with and without luaossl.
+local kdf_native
+do
+    local ok, kdf = pcall(require, "openssl.kdf")
+    if ok and type(kdf) == "table" and type(kdf.derive) == "function" then
+        kdf_native = kdf
+    end
+end
+
 -- NIST SP 800-132 / OWASP 2024 guidance for PBKDF2-HMAC-SHA256.
 -- 10000 (the previous default) is brute-forceable on commodity GPUs in
 -- 2026. New hashes use 600k; existing stored hashes encode their own
@@ -47,6 +73,13 @@ local YIELD_EVERY = 8192
 local MAX_PBKDF2_ITERATIONS = 1000000
 M.MAX_PBKDF2_ITERATIONS = MAX_PBKDF2_ITERATIONS
 
+-- Boot-time cost check thresholds. Below MIN_ITERATIONS a hash is cheap
+-- everywhere and not worth timing (it also keeps the probe out of tests that
+-- build throwaway authenticators). Above WARN_SECONDS per login, the operator
+-- needs to know before the first client connects, not after.
+local COST_CHECK_MIN_ITERATIONS = 1000
+local COST_WARN_SECONDS         = 1.0
+
 local function xor_strings(a, b)
     assert(#a == #b, "xor_strings: length mismatch")
     local out = {}
@@ -59,7 +92,9 @@ end
 -- opts (optional): { yield_fn = function() ... end } — called every
 -- YIELD_EVERY iterations so a cooperative scheduler can interleave other
 -- work. Callers without a scheduler (the hash CLI, tests) just omit it.
-local function pbkdf2_hmac_sha256(password, salt, iterations, dklen, opts)
+-- Only the pure-Lua path yields; the native one finishes in well under the
+-- time a single yield slice would have taken.
+local function pbkdf2_pure(password, salt, iterations, dklen, opts)
     assert(type(dklen) == "number" and dklen > 0, "dklen must be positive")
     local yield_fn = opts and opts.yield_fn
     local hLen = 32
@@ -83,7 +118,62 @@ local function pbkdf2_hmac_sha256(password, salt, iterations, dklen, opts)
 
     return table.concat(output):sub(1, dklen)
 end
+M.pbkdf2_pure = pbkdf2_pure
+
+-- Set once, the first time the native path lets us down, so a degraded
+-- broker says so exactly once instead of on every AUTH.
+local native_failed = false
+
+local function pbkdf2_hmac_sha256(password, salt, iterations, dklen, opts)
+    assert(type(dklen) == "number" and dklen > 0, "dklen must be positive")
+
+    if kdf_native and not native_failed then
+        local ok, out = pcall(kdf_native.derive, {
+            type   = "PBKDF2",
+            md     = "sha256",
+            pass   = password,
+            salt   = salt,
+            iter   = iterations,
+            outlen = dklen,
+        })
+        if ok and type(out) == "string" and #out == dklen then
+            return out
+        end
+        -- Never fail an otherwise-valid login because the native backend
+        -- misbehaved: fall through to the pure implementation, which
+        -- produces the same bytes.
+        native_failed = true
+        log:warn("native PBKDF2 (luaossl) failed, falling back to pure Lua: %s",
+            tostring(ok and "unexpected output" or out))
+    end
+
+    return pbkdf2_pure(password, salt, iterations, dklen, opts)
+end
 M.pbkdf2_hmac_sha256 = pbkdf2_hmac_sha256
+
+-- "openssl" when derivations run natively, "lua" when they don't. Read by
+-- the boot-time cost check below and reported in the server's startup log.
+function M.kdf_backend()
+    return (kdf_native and not native_failed) and "openssl" or "lua"
+end
+
+-- Rough seconds one verification of `iterations` will cost on THIS host,
+-- measured rather than assumed (a Pi and a workstation differ by an order of
+-- magnitude). Times a short pure-Lua derivation and extrapolates; only ever
+-- called on the slow path, where the ~30ms probe is noise next to the
+-- multi-second verify it is warning about.
+function M.estimate_verify_seconds(iterations)
+    assert(type(iterations) == "number", "iterations must be a number")
+    if M.kdf_backend() == "openssl" then
+        -- ~0.5us/iteration natively; far below any deadline worth warning on.
+        return iterations * 0.0000005
+    end
+    local probe = 100
+    local t0 = socket.gettime()
+    pbkdf2_pure("cost-probe", "0123456789abcdef", probe, 32)
+    local per_iteration = (socket.gettime() - t0) / probe
+    return per_iteration * iterations
+end
 
 -- Constant-time string compare. The HMAC indirection that used to wrap
 -- both inputs added no security: the key was a per-process random value
@@ -175,6 +265,27 @@ function M.static_authenticator(opts)
         password_hash = M.hash_password(opts.password)
     else
         error("static_authenticator: provide password_hash or password")
+    end
+
+    -- Tell the operator, at boot, what a login is going to cost. Getting this
+    -- wrong is silent otherwise: the hash carries its own iteration count, so
+    -- a 600k hash generated by `make hash` on a host with luaossl will still
+    -- be accepted by a broker without it — and then take minutes per AUTH,
+    -- blocking the reactor, with nothing in the log to explain why.
+    local parsed = parse_hash(password_hash)
+    local backend = M.kdf_backend()
+    if parsed and parsed.iterations >= COST_CHECK_MIN_ITERATIONS then
+        local estimate = M.estimate_verify_seconds(parsed.iterations)
+        if estimate >= COST_WARN_SECONDS then
+            log:warn("PBKDF2 backend=%s iterations=%d: ~%.1fs of reactor time "
+                .. "PER login on this host. Install luaossl for a native "
+                .. "derivation (~1000x faster), or re-hash with fewer "
+                .. "iterations: lua bin/moonmq-hash.lua <password> <iterations>",
+                backend, parsed.iterations, estimate)
+        else
+            log:info("PBKDF2 backend=%s iterations=%d (~%.3fs per login)",
+                backend, parsed.iterations, estimate)
+        end
     end
 
     return setmetatable({
