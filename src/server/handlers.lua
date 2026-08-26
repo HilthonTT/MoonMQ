@@ -982,6 +982,19 @@ function M.create_topic(server, conn, correl, payload)
             "num_partitions out of range (1..1024)"))
         return
     end
+    -- The "__" prefix is reserved for broker-internal topics
+    -- (__consumer_offsets, __producer_state, __transaction_state). Those are
+    -- created through the TopicManager directly, and Broker:list_topics hides
+    -- them — which is exactly why a client must not be able to create one:
+    -- the max_topics check below counts list_topics(), so a client looping on
+    -- CREATE_TOPIC "__x1", "__x2", ... was never counted and never capped,
+    -- exhausting the topic table and file descriptors. Broker:tick_cleaners
+    -- skips "__" topics too, so the segments they accrue are never aged out.
+    if c.name:sub(1, 2) == "__" then
+        conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME,
+            "topic names starting with '__' are reserved for internal use"))
+        return
+    end
     -- Topic-count cap. Without this a client (authenticated or not,
     -- depending on the auth config) can CREATE_TOPIC in a loop and
     -- exhaust the broker's in-memory topic table + descriptors. We

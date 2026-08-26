@@ -52,14 +52,25 @@ local function verify_file(file_path, start_at)
             break
         end
         local total_size = string.unpack(">I8", size_bytes)
-        local record_end = current + HEADER_SIZE + total_size
 
-        if record_end > file_size
-           or total_size < msg_m.MIN_BODY then
+        -- Bound total_size against the bytes REMAINING rather than computing
+        -- `current + HEADER_SIZE + total_size` and comparing that sum: the
+        -- length prefix is covered by neither CRC, so corruption can set it to
+        -- any u64, and a value just under 2^63 made the sum wrap to a negative
+        -- Lua integer. The wrapped sum passed the `> file_size` test, so a
+        -- bogus ~9 exabyte length reached f:read() below and raised an
+        -- uncaught "not enough memory" — crashing recovery instead of
+        -- truncating a torn tail. The subtraction can't overflow (both
+        -- operands are file positions), and a negative total_size (high bit
+        -- set) still fails the MIN_BODY test. Same bound the other two readers
+        -- already apply (message.deserialize_record, read_message).
+        if total_size < msg_m.MIN_BODY
+           or total_size > file_size - (current + HEADER_SIZE) then
             log:error("%s: bad framing at %d, truncating", file_path, current)
             truncate_at = current
             break
         end
+        local record_end = current + HEADER_SIZE + total_size
 
         local body = f:read(total_size)
         if not body or #body < total_size then

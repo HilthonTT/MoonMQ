@@ -60,8 +60,16 @@ function AbortIndex:_load()
             local k = key(e.topic, e.partition)
             local list = self.map[k]
             if not list then list = {}; self.map[k] = list end
+            -- epoch is the only field that may be absent (entries written
+            -- before it existed) -> default 0. It must still be COERCED to a
+            -- number: this parses a file, and a non-number epoch would never
+            -- compare equal to the number is_aborted is called with, silently
+            -- un-filtering every aborted record in that partition for
+            -- read_committed consumers.
+            local epoch = e.epoch
+            if type(epoch) ~= "number" then epoch = 0 end
             list[#list + 1] = {
-                pid = e.pid, epoch = e.epoch or 0, first = e.first, upto = e.upto,
+                pid = e.pid, epoch = epoch, first = e.first, upto = e.upto,
             }
         end
     end
@@ -101,6 +109,12 @@ end
 function AbortIndex:add(topic, partition, pid, epoch, first, upto)
     assert(type(topic) == "string" and type(partition) == "number")
     assert(type(pid) == "number" and type(first) == "number" and type(upto) == "number")
+    -- Asserted, not defaulted. The dedupe scan below compares epoch verbatim,
+    -- so normalising nil -> 0 only at insert time (as this used to) made an
+    -- entry that could never match itself: every recovery retry would append a
+    -- duplicate and grow txn-aborts.json without bound. Both callers pass a
+    -- number, so the nil case was dead code hiding that mismatch.
+    assert(type(epoch) == "number", "epoch must be a number")
     if upto <= first then return true end   -- empty range: txn wrote nothing here
 
     local k = key(topic, partition)
@@ -111,7 +125,7 @@ function AbortIndex:add(topic, partition, pid, epoch, first, upto)
             return true   -- already recorded (recovery retry)
         end
     end
-    list[#list + 1] = { pid = pid, epoch = epoch or 0, first = first, upto = upto }
+    list[#list + 1] = { pid = pid, epoch = epoch, first = first, upto = upto }
 
     local ok, err = self:_save()
     if not ok then
@@ -128,7 +142,7 @@ function AbortIndex:is_aborted(topic, partition, pid, epoch, offset)
     local list = self.map[key(topic, partition)]
     if not list then return false end
     for _, e in ipairs(list) do
-        if e.pid == pid and e.epoch == (epoch or 0)
+        if e.pid == pid and e.epoch == epoch
             and offset >= e.first and offset < e.upto then
             return true
         end

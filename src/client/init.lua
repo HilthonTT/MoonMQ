@@ -172,27 +172,58 @@ function Client:_write(data)
     return sent == #data, nil
 end
 
+-- Read exactly n bytes. A short read must NOT lose the bytes it did get:
+-- sock:receive returns them as the third value alongside a "timeout" error,
+-- and next_record deliberately polls with a sub-second socket timeout, so a
+-- frame that straddles the poll window is the normal case, not an edge one.
+-- Dropping the partial desynced the stream permanently — every later read
+-- then parsed record payload bytes as a frame header. Stash the partial in
+-- self.rx_partial and resume from it on the next call. (The reactor path
+-- already accumulates inside read_exact.)
 function Client:_read_bytes(n)
     if self.closed then return nil, "closed" end
-    local data, err
+
     if self.reactor then
-        data, err = self.reactor:read_exact(self.sock, n, nil)
-    else
-        data, err = self.sock:receive(n)
+        local data, err = self.reactor:read_exact(self.sock, n, nil)
+        if not data then self:_mark_closed_on(err) end
+        return data, err
     end
-    if not data then self:_mark_closed_on(err) end
-    return data, err
+
+    local buf = self.rx_partial or ""
+    while #buf < n do
+        local data, err, partial = self.sock:receive(n - #buf)
+        if data then
+            buf = buf .. data
+        else
+            if partial and #partial > 0 then buf = buf .. partial end
+            if #buf < n then
+                self.rx_partial = buf
+                self:_mark_closed_on(err)
+                return nil, err
+            end
+        end
+    end
+    self.rx_partial = nil
+    return buf, nil
 end
 
+-- Frame reads are resumable for the same reason: a timeout between the length
+-- prefix and the body would otherwise make the next call re-read 4 bytes from
+-- the middle of the body. rx_frame_len remembers which half we're waiting on,
+-- so _read_bytes's partial buffer always belongs to the read in progress.
 function Client:_read_frame()
-    local len_bytes, err = self:_read_bytes(4)
-    if not len_bytes then return nil, nil, nil, err end
-    local frame_len = string.unpack(">I4", len_bytes)
-    if frame_len > 16 * 1024 * 1024 then
-        return nil, nil, nil, "frame too large from server"
+    if not self.rx_frame_len then
+        local len_bytes, err = self:_read_bytes(4)
+        if not len_bytes then return nil, nil, nil, err end
+        local frame_len = string.unpack(">I4", len_bytes)
+        if frame_len > 16 * 1024 * 1024 then
+            return nil, nil, nil, "frame too large from server"
+        end
+        self.rx_frame_len = frame_len
     end
-    local body, berr = self:_read_bytes(frame_len)
+    local body, berr = self:_read_bytes(self.rx_frame_len)
     if not body then return nil, nil, nil, berr end
+    self.rx_frame_len = nil
     return proto.parse_frame(body)
 end
  

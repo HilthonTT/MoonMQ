@@ -47,7 +47,14 @@ end
 function M:_apply(topic_name, partition_id, payload)
     if #payload < 8 then return nil, "short record" end
     local total_size = string.unpack(">I8", payload)
-    if #payload < 8 + total_size then return nil, "truncated record body" end
+    -- Overflow-free, for the same reason as the other length-prefix readers:
+    -- `8 + total_size` wraps negative for a u64 near 2^63, and `#payload <
+    -- <negative>` is false, so a corrupt prefix slipped through to the slice
+    -- below. (string.sub clamps, so that degraded to a clean decode error
+    -- rather than a fault -- this makes the check load-bearing by design.)
+    if total_size < msg_m.MIN_BODY or total_size > #payload - 8 then
+        return nil, "truncated record body"
+    end
     local msg, derr = msg_m.decode_body(payload:sub(9, 8 + total_size))
     if not msg then return nil, "decode: " .. tostring(derr) end
 

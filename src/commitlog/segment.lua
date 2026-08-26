@@ -111,7 +111,16 @@ function Segment:build_index()
             break
         end
         local total_size = string.unpack(">I8", size_bytes)
-        if total_size < 0 or position + 8 + total_size > file_end then
+        -- Bound against the bytes REMAINING, never `position + 8 + total_size
+        -- > file_end`: the prefix is covered by neither CRC, so corruption can
+        -- set it to any u64, and a value near 2^63 wraps that sum to a
+        -- negative Lua integer and slips past the comparison. The subtraction
+        -- can't overflow (both operands are file positions). MIN_BODY also
+        -- subsumes the old `< 0` test, since a high-bit-set length decodes to
+        -- a negative integer. Same form as read_message / verify_file /
+        -- deserialize_record, which is the authority this rewinds into below.
+        if total_size < message_m.MIN_BODY
+           or total_size > file_end - (position + 8) then
             break  -- length runs past EOF: torn/corrupt tail
         end
 
