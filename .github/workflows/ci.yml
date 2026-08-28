@@ -117,7 +117,7 @@ jobs:
         # and would otherwise die with the runner — and a corrupt segment is
         # exactly what you want in hand when recovery or a roll goes wrong.
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: moonmq-failure-data
           path: |
