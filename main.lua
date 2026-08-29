@@ -3,6 +3,7 @@ local Config = require("src.server.config")
 local auth_m = require("src.server.auth")
 local users_m = require("src.server.users")
 local quota_m = require("src.server.quota")
+local tls_m = require("src.io.tls")
 local version_m = require("src.core.version")
 local Log    = require("src.log.logger")
 local repl = require("src.repl.repl")
@@ -118,6 +119,41 @@ local function build_auth(cfg)
     return authenticator, quotas
 end
 
+-- Resolve one TLS block into (server_config, client_config).
+--
+-- Fatal on error, like the rest of the security config: an unreadable
+-- certificate or a Verify with nothing to verify against means the operator
+-- asked for encryption and would not be getting it. Falling back to plaintext
+-- there is the one outcome nobody wants.
+--
+-- `mode` selects which halves to build: a listener needs only the server side,
+-- an inter-broker link needs both (its own listener and the client that dials
+-- its peers), and both are built from ONE config block so a cluster cannot be
+-- encrypted in one direction only.
+local function build_tls(block, where, mode)
+    local server_cfg, client_cfg
+
+    if mode ~= "client" then
+        local cfg, err = tls_m.server_config(block, where)
+        if err then
+            log:error("%s", err)
+            os.exit(1)
+        end
+        server_cfg = cfg
+    end
+
+    if mode ~= "server" then
+        local cfg, err = tls_m.client_config(block, where)
+        if err then
+            log:error("%s", err)
+            os.exit(1)
+        end
+        client_cfg = cfg
+    end
+
+    return server_cfg, client_cfg
+end
+
 -- Metrics-endpoint credentials. The token may come from the environment so it
 -- does not have to live in a file that ships with the repo.
 local function build_metrics_auth(cfg)
@@ -167,6 +203,9 @@ if is_main(arg, ...) then
     for _, p in ipairs(rep.Peers or {}) do
         peers[#peers + 1] = { id = p.Id, address = p.Address }
     end
+    -- One Replication.Tls block yields both halves: the follower's /replicate
+    -- listener and the leader's client to it.
+    local rep_server_tls, rep_client_tls = build_tls(rep.Tls, "Replication.Tls")
     local replication = {
         enabled        = rep.Enabled or false,
         replica_id     = rep.ReplicaId or 1,
@@ -176,6 +215,8 @@ if is_main(arg, ...) then
         peers          = peers,
         lag_max        = rep.LagMax,
         ack_timeout    = rep.AckTimeout,
+        server_tls     = rep_server_tls,
+        tls            = rep_client_tls,
     }
 
     -- Cluster config (static membership + partition ownership; see
@@ -188,6 +229,7 @@ if is_main(arg, ...) then
             cluster_peers[#cluster_peers + 1] =
                 { id = p.Id, address = p.Address, token = p.Token }
         end
+        local cl_server_tls, cl_client_tls = build_tls(cl.Tls, "Cluster.Tls")
         cluster = {
             broker_id    = cl.BrokerId,
             host         = cl.Host or "127.0.0.1",
@@ -196,6 +238,8 @@ if is_main(arg, ...) then
             token        = cl.Token,
             peer_timeout = cl.PeerTimeout,
             batch_bytes  = cl.BatchBytes,
+            server_tls   = cl_server_tls,
+            tls          = cl_client_tls,
         }
     end
 
@@ -256,6 +300,10 @@ if is_main(arg, ...) then
         -- listener. Both nil unless configured; see docs/security.md.
         quotas                 = quotas,
         metrics_auth           = build_metrics_auth(cfg),
+        -- TLS, per listener. Absent blocks leave that port in plaintext, which
+        -- is what every existing deployment gets on upgrade.
+        tls                    = (build_tls(s.Tls, "Server.Tls", "server")),
+        metrics_tls            = (build_tls(s.MetricsTls, "Server.MetricsTls", "server")),
         -- LingerMs is the JSON unit (Kafka-conventional); convert to seconds
         -- at the boundary. Server.new accepts seconds so all internal math
         -- stays in one unit (socket.gettime() is seconds).

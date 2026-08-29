@@ -42,6 +42,7 @@ local socket = require("socket")
 local json   = require("dkjson")
 local msg_m  = require("src.record.message")
 local httpk  = require("src.server.http_kit")
+local tls_m  = require("src.io.tls")
 local util_m = require("src.core.util")
 local ControllerFence = require("src.cluster.controller_fence")
 local log    = require("src.log.logger").get("cluster_server")
@@ -74,6 +75,10 @@ function M.new(opts)
         port        = assert(opts.port, "port required"),
         token       = opts.token,
         fence       = fence,
+        -- TLS for the inter-broker listener (src/io/tls.lua). X-Cluster-Token
+        -- authenticates a peer; TLS is what keeps that token — and the records
+        -- migrated through these routes — off the wire in the clear.
+        tls         = opts.tls,
         -- The server's GroupCoordinator (optional): serves the coordinator
         -- side of forwarded consumer-group requests (/cluster/group/*).
         group_coordinator = opts.group_coordinator,
@@ -487,14 +492,15 @@ end
 
 function M:start()
     local _, lerr = self.reactor:listen(self.host, self.port,
-        function(sock) self:_handle(sock) end)
+        function(sock) self:_handle(sock) end,
+        { tls = self.tls })
     if lerr then
         log:error("cluster listen failed on %s:%d: %s", self.host, self.port, lerr)
         return nil, lerr
     end
-    log:info("cluster endpoint listening on %s:%d (broker_id=%s%s)",
+    log:info("cluster endpoint listening on %s:%d (broker_id=%s%s, %s)",
         self.host, self.port, self.broker_id,
-        self.token and ", token auth on" or "")
+        self.token and ", token auth on" or "", tls_m.describe(self.tls))
     return true
 end
 

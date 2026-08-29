@@ -29,14 +29,14 @@ records.
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
 | **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. |
 | **Admin** | Create/describe/delete topics, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
-| **Security** | Multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 (the password never crosses the wire), per-user and per-topic quotas, optional auth on the metrics port. |
+| **Security** | TLS on every listener (mutual TLS optional), multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 (the password never crosses the wire), per-user and per-topic quotas, optional auth on the metrics port. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
 
 ## Quick start
 
 ```bash
 sudo apt install lua5.4 lua-socket libssl-dev zlib1g-dev   # Debian/Ubuntu
-make deps          # busted, dkjson, luasocket, luaposix, lua-zlib, luaossl
+make deps          # busted, dkjson, luasocket, luaposix, lua-zlib, luaossl, luasec
 lua5.4 main.lua    # or: make run
 ```
 
@@ -118,12 +118,16 @@ Runnable examples: `src/examples/tcp_client.lua`,
 - **luaossl** — native PBKDF2 for password verification. Without it a login
   costs **3.2 s of reactor time at 10,000 iterations and ~190 s at the
   recommended 600,000**, versus 5 ms and 0.29 s natively. Needs `libssl-dev`
+- **luasec** — TLS on the client, metrics, cluster and replication listeners.
+  Without it the broker still boots and only refuses configurations that ask
+  for TLS. Needs `libssl-dev`
 
 luaposix is **required** on Linux — `src/io/io_sync.lua` has no other way to
-fsync. lua-zlib and luaossl are optional: without them the broker still boots
-and falls back to pure Lua, logging which backend it picked (`filesystem
-backend=…`, `PBKDF2 backend=…`) at startup. Those fallbacks are correct, not
-fast — a production broker wants all three. Snappy compression additionally
+fsync. lua-zlib, luaossl and luasec are optional: without them the broker still
+boots and falls back to pure Lua (or, for luasec, to plaintext-only), logging
+which backend it picked (`filesystem backend=…`, `PBKDF2 backend=…`) at
+startup. Those fallbacks are correct, not fast — a production broker wants
+them all. Snappy compression additionally
 needs LuaJIT FFI + `libsnappy`; SHA-256/HMAC is vendored
 (`src/vendor/sha2.lua`) with nothing to install.
 
@@ -170,7 +174,7 @@ C runtime), so Windows needs **LuaJIT** rather than stock Lua 5.4.
 
 | Section | Keys |
 | --- | --- |
-| `Server` | `Host`, `Port` (9092), `DataDir`, `MaxConnections` (960), `MaxConnectionsPerIP`, `FdReserve` (64), `MaxFrameSize`, `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `MetricsHost`, `MetricsPort` (`null` disables), `MetricsAuth`, `Acks`, `Replication`, `Cluster`, `Autobalance` |
+| `Server` | `Host`, `Port` (9092), `DataDir`, `MaxConnections` (960), `MaxConnectionsPerIP`, `FdReserve` (64), `MaxFrameSize`, `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `Tls`, `MetricsHost`, `MetricsPort` (`null` disables), `MetricsTls`, `MetricsAuth`, `Acks`, `Replication`, `Cluster`, `Autobalance` |
 | `Auth` | `Username` + either `PasswordHash` (`pbkdf2-sha256$…` or `scram-sha-256$…`) or plaintext `Password`; `MaxFailures`, `FailureWindow`, `BanDuration` for per-IP lockout. `Users` (multi-tenant list with `Acls` + `Quota`) and `Quotas` (`Default`/`Topics`/`BurstSeconds`) — see [docs/security.md](docs/security.md) |
 | `Logging` | `Level` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `File` (empty = stderr only), `LogToStderr` (default true, tees both) |
 
@@ -201,8 +205,9 @@ make hash PASSWORD=yourpw
 
 > [!WARNING]
 > With no usable credential the broker starts **open** (no authentication)
-> and logs a warning. The metrics endpoints are unauthenticated by default too
-> — set `Server.MetricsAuth`, or keep `MetricsHost` on loopback.
+> and logs a warning. Every listener is **plaintext** until a `Tls` block says
+> otherwise, and the metrics endpoints are unauthenticated by default — set
+> `Server.MetricsAuth`, or keep `MetricsHost` on loopback.
 
 ### Users, ACLs, SCRAM, quotas
 
@@ -247,8 +252,45 @@ make hash PASSWORD=yourpw           # pbkdf2-sha256$… — login-equivalent if 
 
 Quotas are token buckets keyed by principal and by topic, which is what the
 per-connection rate limiter is not — a tenant cannot buy more budget by opening
-more sockets. Full reference, including exactly which permission each request
-checks: **[docs/security.md](docs/security.md)**.
+more sockets.
+
+### TLS
+
+Off by default; every listener configures its own block, because a public
+client port and a loopback scrape endpoint are not the same problem:
+
+```json
+"Server": {
+  "Tls":         { "CertFile": "/etc/moonmq/server.crt",
+                   "KeyFile":  "/etc/moonmq/server.key" },
+  "MetricsTls":  { "CertFile": "…", "KeyFile": "…" },
+  "Cluster":     { "Tls": { "CertFile": "…", "KeyFile": "…",
+                            "CaFile": "/etc/moonmq/ca.crt",
+                            "Verify": "required" } },
+  "Replication": { "Tls": { "CertFile": "…", "KeyFile": "…" } }
+}
+```
+
+```lua
+local c = assert(Client.new{ host = "broker.internal", port = 9092,
+                             username = "orders-svc", password = "…",
+                             mechanism = "scram-sha-256",
+                             tls = { cafile = "/etc/moonmq/ca.crt" } })
+```
+
+`Verify: "required"` on a listener is mutual TLS — a client without a valid
+certificate is refused. Clients verify the chain *and* the hostname (luasec
+checks only the chain, which would accept any certificate the CA ever issued).
+A misconfigured block is fatal at boot rather than a silent fall back to
+plaintext.
+
+The interesting part is not the crypto but the event loop: an encrypted read
+can need the socket to become *writable*, which no plaintext socket ever does.
+`Reactor:park` waits on the direction TLS asks for, and every read, write,
+handshake and HTTP header parse goes through it.
+
+Full reference, including exactly which permission each request checks:
+**[docs/security.md](docs/security.md)**.
 
 There is no built-in log rotation — pair `Logging.File` with `logrotate(8)`
 using `copytruncate` (the broker holds the FD open). If the path can't be
@@ -305,9 +347,9 @@ and fetch paths, wire protocol, and metrics — then
 | [docs/transactions.md](docs/transactions.md) | Idempotent producer, transactions, `read_committed` |
 | [docs/batching.md](docs/batching.md) | Batch wire formats, guarantees, limits |
 | [docs/dlq.md](docs/dlq.md) | Dead-letter queue and NACK semantics |
-| [docs/security.md](docs/security.md) | Users, ACLs, SCRAM-SHA-256, quotas, metrics-endpoint auth |
+| [docs/security.md](docs/security.md) | TLS, users, ACLs, SCRAM-SHA-256, quotas, metrics-endpoint auth |
 | [docs/mql.md](docs/mql.md) | The interactive console's SQL-like grammar |
-| [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md) | Scoped-but-unshipped: TLS, controller consensus |
+| [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md) | Scoped-but-unshipped: controller consensus (TLS has since shipped) |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability |
 
 ## Credits

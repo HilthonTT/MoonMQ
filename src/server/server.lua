@@ -22,6 +22,7 @@
 --   - Pending-send cap reinterpreted as a per-write deadline
 --   - Pre-auth opcode whitelist (only HELLO/AUTH/IDENTIFY/HEARTBEAT allowed)
 
+local socket           = require("socket")
 local Reactor          = require("src.server.reactor")
 local fs_m             = require("src.io.fs")
 local proto            = require("src.wire.protocol")
@@ -33,6 +34,7 @@ local brk_m            = require("src.broker")
 local prd_m            = require("src.broker.producer")
 local metrics          = require("src.metrics")
 local MetricsHttp      = require("src.server.metrics_http")
+local tls_m            = require("src.io.tls")
 local Replicator       = require("src.server.replicator")
 local ReplicaServer    = require("src.server.replica_server")
 local replica_m        = require("src.server.replica")
@@ -64,7 +66,11 @@ local function build_replicator(reactor, rc)
     for _, peer in ipairs(rc.peers or {}) do
         followers[#followers + 1] = {
             id     = peer.id,
-            client = replica_m.ReplicaClient.new(peer.address, rc.ack_timeout),
+            -- The same Replication.Tls block configures the follower's
+            -- listener and this client, so a half-encrypted link is not a
+            -- configuration a single node can produce.
+            client = replica_m.ReplicaClient.new(peer.address, rc.ack_timeout,
+                { tls = rc.tls }),
         }
     end
     if #followers == 0 then return nil end
@@ -204,6 +210,11 @@ function Server.new(opts)
         "Failed authentications, labelled by mechanism.")
     metrics.describe("moonmq_metrics_http_unauthorized_total", "counter",
         "Metrics-endpoint requests refused for missing or bad credentials.")
+    metrics.describe("moonmq_tls_handshakes_total", "counter",
+        "Completed TLS handshakes across every listener.")
+    metrics.describe("moonmq_tls_handshake_failures_total", "counter",
+        "TLS handshakes that failed: an untrusted or missing client "
+        .. "certificate, a plaintext client on a TLS port, or a stalled peer.")
 
     local reactor = Reactor.new({ fd_limit = opts.fd_limit })
 
@@ -255,7 +266,8 @@ function Server.new(opts)
         local peers = {}
         for _, p in ipairs(cc.peers or {}) do
             peers[p.id] = Peer.new(p.id, p.address,
-                { token = p.token or cc.token, timeout = cc.peer_timeout })
+                { token = p.token or cc.token, timeout = cc.peer_timeout,
+                  tls = cc.tls })
         end
 
         -- Consumers consult ownership through the broker (see
@@ -279,6 +291,10 @@ function Server.new(opts)
             port  = cc.port,          -- nil = endpoint off (client-only node)
             token = cc.token,
             fence = fence,
+            -- Listener half of Cluster.Tls; the client half went to the Peers
+            -- above. Both come from one config block, so a cluster cannot end
+            -- up encrypted in one direction only.
+            server_tls = cc.server_tls,
         }
     end
 
@@ -354,6 +370,10 @@ function Server.new(opts)
         -- Credential/permission gate for the metrics listener. nil leaves
         -- /metrics and /stats open, as they have always been.
         metrics_auth         = opts.metrics_auth,
+        -- TLS for the client listener and, separately, for the metrics one
+        -- (src/io/tls.lua). nil on either leaves that port in plaintext.
+        tls                  = opts.tls,
+        metrics_tls          = opts.metrics_tls,
 
         group_commit_linger_s    = opts.group_commit_linger_s
                                    or DEFAULT_GROUP_COMMIT_LINGER_S,
@@ -434,6 +454,20 @@ function Server:_unregister_conn(conn)
     metrics.set("moonmq_connections_open", self.connections)
 end
 
+-- Turn a peer away with one courtesy error frame, then close.
+--
+-- Routed through the reactor's send_all rather than a bare sock:send: after a
+-- TLS handshake the socket is non-blocking, and a raw send can come back
+-- "wantwrite" with the frame unsent — so the peer would be dropped with no
+-- explanation of why. The 250ms deadline keeps a wedged peer from holding the
+-- accept coroutine on a path whose whole point is to shed load.
+function Server:_refuse(sock, frame)
+    pcall(function()
+        self.reactor:send_all(sock, frame, socket.gettime() + 0.25)
+    end)
+    pcall(function() sock:close() end)
+end
+
 function Server:_handle(sock, peer, ip)
     -- Banned IPs are slammed shut BEFORE registering the connection, so
     -- a banned attacker can't tie up max_connections_per_ip slots for
@@ -443,7 +477,7 @@ function Server:_handle(sock, peer, ip)
         if banned then
             local f = proto.encode_error(uuid.ZERO, proto.ERR_AUTH_FAILED,
                 string.format("banned for %ds", remaining))
-            pcall(function() sock:send(f); sock:close() end)
+            self:_refuse(sock, f)
             return
         end
     end
@@ -451,7 +485,7 @@ function Server:_handle(sock, peer, ip)
     local reg_ok, reason = self:_register_conn(ip)
     if not reg_ok then
         local f = proto.encode_error(uuid.ZERO, proto.ERR_RATE_LIMITED, reason)
-        pcall(function() sock:send(f); sock:close() end)
+        self:_refuse(sock, f)
         return
     end
 
@@ -581,7 +615,22 @@ end
 
 function Server:start()
     local _, err = self.reactor:listen(self.host, self.port,
-        function(sock, peer, ip) self:_handle(sock, peer, ip) end)
+        function(sock, peer, ip) self:_handle(sock, peer, ip) end,
+        {
+            tls = self.tls,
+            -- Consulted before the TLS handshake. A banned peer is refused
+            -- here rather than in _handle so it cannot make the broker pay for
+            -- a handshake — server-side asymmetric crypto is exactly the work
+            -- a lockout exists to stop an abusive IP from buying. It gets a
+            -- TCP close instead of a protocol error frame, because on a TLS
+            -- listener there is no session to send one over yet.
+            pre_tls = function(_sock, _peer, ip)
+                if not (self.authenticator and self.authenticator.is_banned) then
+                    return true
+                end
+                return not self.authenticator:is_banned(ip)
+            end,
+        })
     if err then return nil, err end
 
     -- Wire group commit. The factory closure is invoked on every
@@ -618,9 +667,19 @@ function Server:start()
         self.reactor:spawn(function() self:_run_producer_expiry() end)
     end
 
-    log:info("listening on %s:%d (proto v%d, %s/%s)",
+    log:info("listening on %s:%d (proto v%d, %s/%s, %s)",
         self.host, self.port, proto.PROTOCOL_VERSION,
-        proto.SERVER_NAME, proto.SERVER_VERSION)
+        proto.SERVER_NAME, proto.SERVER_VERSION, tls_m.describe(self.tls))
+
+    -- The bind address is the only protection a plaintext listener has, so
+    -- say so when it is not a loopback one. Record payloads, topic names and
+    -- group names all cross this port in the clear.
+    if not self.tls and self.host ~= "127.0.0.1" and self.host ~= "localhost"
+       and self.host ~= "::1" then
+        log:warn("client listener on %s:%d is PLAINTEXT: records, topic names "
+            .. "and group names are readable on the path. Configure Server.Tls, "
+            .. "or keep the broker on a private network.", self.host, self.port)
+    end
 
     -- Say which filesystem backend is live. The shell fallback forks a process
     -- per stat/readdir on this very thread (measured: 23ms per `test -d`
@@ -646,6 +705,7 @@ function Server:start()
             -- principal must hold cluster:describe.
             auth          = self.metrics_auth,
             authenticator = self.authenticator,
+            tls           = self.metrics_tls,
         })
         mh:start()
     end
@@ -663,6 +723,7 @@ function Server:start()
             host        = self.cluster.host,
             port        = self.cluster.port,
             token       = self.cluster.token,
+            tls         = self.cluster.server_tls,
             fence       = self.cluster.fence,
             -- Serves the coordinator side of forwarded consumer-group
             -- requests (/cluster/group/*) for groups hashed to this broker.
@@ -714,6 +775,9 @@ function Server:start()
                 broker  = self.broker,
                 host    = rc.replicate_host or "127.0.0.1",
                 port    = rc.replicate_port,
+                -- Listener side of the same Replication.Tls block whose
+                -- client half build_replicator handed to the ReplicaClients.
+                tls     = rc.server_tls,
             })
             rs:start()
         end

@@ -9,6 +9,7 @@
 local socket   = require("socket")
 local os_utils = require("src.core.os")
 local metrics  = require("src.metrics")
+local tls      = require("src.io.tls")
 local log      = require("src.log.logger").get("reactor")
 
 local Reactor = {}
@@ -105,6 +106,45 @@ function Reactor:sleep(seconds)
     coroutine.yield()
 end
 
+-- Park until `sock` is ready for whatever `err` says it is waiting on, and
+-- report whether `err` was a would-block condition at all.
+--
+-- This is where TLS meets the event loop. On a plain socket a non-blocking
+-- operation that cannot proceed says "timeout", and the direction to wait on
+-- is obvious from which operation it was. On a TLS socket it is not: an
+-- encrypted READ can need the socket to become WRITABLE (the record it is
+-- decrypting triggered a renegotiation, or the handshake is still finishing),
+-- and a write can need readability for the same reason. luasec reports that
+-- as "wantread"/"wantwrite", and the only correct response is to wait on the
+-- direction the TLS layer asked for rather than the one the caller intended.
+--
+-- `fallback` is the direction to use for a plain "timeout" — "read" or
+-- "write", from the caller's point of view.
+function Reactor:park(sock, err, fallback)
+    if err == "wantread" then
+        self:wait_readable(sock)
+        return true
+    elseif err == "wantwrite" then
+        self:wait_writable(sock)
+        return true
+    elseif err == "timeout" then
+        if fallback == "write" then
+            self:wait_writable(sock)
+        else
+            self:wait_readable(sock)
+        end
+        return true
+    end
+    return false
+end
+
+-- True when `err` means "not done yet", whatever the direction. Callers that
+-- own their own waiting (http_kit's header reader) use this to tell a stall
+-- from a failure.
+function Reactor.would_block(err)
+    return err == "timeout" or err == "wantread" or err == "wantwrite"
+end
+
 function Reactor:read_exact(sock, n, deadline)
     assert(type(n) == "number", "n must be a number")
     assert(deadline == nil or type(deadline) == "number",
@@ -124,13 +164,17 @@ function Reactor:read_exact(sock, n, deadline)
                 buf[#buf + 1] = partial
                 got = got + #partial
             end
-            
-            if err == "timeout" then
+
+            if Reactor.would_block(err) then
                 if got >= n then break end
                 if deadline and socket.gettime() > deadline then
                     return nil, "deadline exceeded"
                 end
-                self:wait_readable(sock)
+                -- park() picks the direction: "timeout" waits for readability
+                -- (this is a read), but a TLS "wantwrite" waits for the socket
+                -- to drain instead — waiting for readability there would hang
+                -- until the deadline every time.
+                self:park(sock, err, "read")
             else
                 return nil, err -- "closed", network error, etc.
             end
@@ -151,11 +195,14 @@ function Reactor:send_all(sock, data, deadline)
             sent = ok
         else
             sent = last or sent
-            if err == "timeout" then
+            if Reactor.would_block(err) then
                 if deadline and socket.gettime() > deadline then
                     return nil, "write deadline exceeded"
                 end
-                self:wait_writable(sock)
+                -- A TLS write can need READability (a renegotiation arriving
+                -- mid-record); park() honours that rather than the direction
+                -- this call happens to be going.
+                self:park(sock, err, "write")
             else
                 return nil, err
             end
@@ -177,9 +224,65 @@ function Reactor:accept(listener)
     end
 end
 
-function Reactor:listen(host, port, on_accept)
+-- Wrap an accepted socket and drive the TLS handshake to completion without
+-- blocking the loop. Returns the wrapped socket, or (nil, err).
+--
+-- A handshake is several round trips and can stall in either direction at any
+-- of them, which is why it is a yielding loop here rather than a blocking call
+-- at the edge: one peer that opens a connection and then says nothing would
+-- otherwise freeze every other connection on the broker for the length of the
+-- handshake deadline.
+function Reactor:tls_handshake(sock, params, deadline)
+    local wrapped, werr = tls.wrap(sock, params)
+    if not wrapped then
+        -- wrap() consumed the original socket on some failure paths; close
+        -- what we still have a handle on and let the caller give up.
+        pcall(function() sock:close() end)
+        return nil, werr or "tls wrap failed"
+    end
+
+    wrapped:settimeout(0)
+
+    -- Every failure path closes the socket before returning. A handshake that
+    -- fails is the COMMON case on a public port — a plaintext client, a
+    -- scanner, a peer that dies mid-negotiation — so leaving the descriptor
+    -- open on the way out would be a slow, self-inflicted fd exhaustion.
+    local function fail(reason)
+        pcall(function() wrapped:close() end)
+        return nil, reason
+    end
+
+    while true do
+        local ok, herr = wrapped:dohandshake()
+        if ok then return wrapped end
+
+        if not Reactor.would_block(herr) then
+            return fail(herr or "handshake failed")
+        end
+        if deadline and socket.gettime() > deadline then
+            return fail("handshake deadline exceeded")
+        end
+        -- Direction comes from the TLS layer, not from us: "read" is only the
+        -- fallback for a bare timeout.
+        self:park(wrapped, herr, "read")
+    end
+end
+
+-- opts (optional):
+--   tls      — { params = <luasec params>, handshake_timeout = n }. Every
+--              accepted socket is wrapped and handshaken before on_accept
+--              sees it, so callers above this line never learn whether their
+--              listener is encrypted.
+--   pre_tls  — function(sock, peer, ip) -> boolean. Consulted BEFORE the
+--              handshake, so a peer we already know we will refuse (a banned
+--              IP) cannot make the broker pay for one. Returning false closes
+--              the connection immediately.
+function Reactor:listen(host, port, on_accept, opts)
     local listener, err = socket.bind(host, port)
     if not listener then return nil, err end
+
+    opts = opts or {}
+    local tls_cfg = opts.tls
 
     self.listeners[listener] = on_accept
 
@@ -207,10 +310,36 @@ function Reactor:listen(host, port, on_accept)
                 end
                 pcall(function() client:close() end)
             else
+                -- Read the peer BEFORE any TLS wrap: luasec takes ownership of
+                -- the socket and the original object must not be touched again.
                 local ip, peer_port = client:getpeername()
                 ip = ip or "?"
                 local peer = string.format("%s:%s", ip, peer_port or "?")
-                self:spawn(function() on_accept(client, peer, ip) end)
+
+                self:spawn(function()
+                    local sock = client
+                    if tls_cfg then
+                        if opts.pre_tls and not opts.pre_tls(sock, peer, ip) then
+                            pcall(function() sock:close() end)
+                            return
+                        end
+                        -- Per connection, in this connection's own coroutine:
+                        -- a slow handshake delays nobody else.
+                        local deadline = socket.gettime()
+                            + (tls_cfg.handshake_timeout or 10)
+                        local secured, terr =
+                            self:tls_handshake(sock, tls_cfg.params, deadline)
+                        if not secured then
+                            metrics.inc("moonmq_tls_handshake_failures_total")
+                            log:warn("TLS handshake with %s failed: %s",
+                                peer, tostring(terr))
+                            return
+                        end
+                        metrics.inc("moonmq_tls_handshakes_total")
+                        sock = secured
+                    end
+                    on_accept(sock, peer, ip)
+                end)
             end
         end
         self.listeners[listener] = nil

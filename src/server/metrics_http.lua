@@ -75,6 +75,11 @@ function M.new(opts)
         -- { token = "...", basic = true } — nil leaves the endpoints open.
         auth          = opts.auth,
         authenticator = opts.authenticator,  -- user store, for Basic
+        -- TLS for this listener (src/io/tls.lua). Separate from the client
+        -- port's: a scrape endpoint on loopback often does not need it while
+        -- the public port does — and Basic credentials over plaintext would
+        -- otherwise hand the scraper's password to anyone on the path.
+        tls           = opts.tls,
     }, M)
 end
 
@@ -155,8 +160,10 @@ local function read_request(reactor, sock, deadline)
         local idx = buf:find("\r\n\r\n", 1, true)
         if idx then return buf:sub(1, idx + 3) end
 
-        if err == "timeout" then
-            reactor:wait_readable(sock)
+        -- park(), not wait_readable(): a TLS read can be waiting on
+        -- writability (see Reactor:park).
+        if reactor.would_block and reactor.would_block(err) then
+            reactor:park(sock, err, "read")
         elseif err == "closed" then
             return nil, "peer closed"
         elseif err then
@@ -288,7 +295,8 @@ end
 
 function M:start()
     local _, lerr = self.reactor:listen(self.host, self.port,
-        function(sock, peer, ip) self:_handle(sock, peer, ip) end)
+        function(sock, peer, ip) self:_handle(sock, peer, ip) end,
+        { tls = self.tls })
     if lerr then
         log:error("listen failed on %s:%d: %s", self.host, self.port, lerr)
         return nil, lerr

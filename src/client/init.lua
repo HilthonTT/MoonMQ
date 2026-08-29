@@ -8,6 +8,7 @@ local dlq_env = require("src.record.dlq_envelope")
 local scram = require("src.server.scram")
 local pbkdf2 = require("src.core.pbkdf2")
 local rng = require("src.core.rng")
+local tls_m = require("src.io.tls")
 
 local DEFAULT_TIMEOUT = 30
 
@@ -31,6 +32,30 @@ function Client.new(opts)
     local sock, cerr = socket.connect(host, port)
     if not sock then
         return nil, string.format("connect %s:%d: %s", host, port, tostring(cerr))
+    end
+
+    -- TLS, if asked for. opts.tls takes the same block shape as the broker's
+    -- Server.Tls (lowercase keys accepted too):
+    --
+    --   tls = { cafile = "/etc/moonmq/ca.crt" }          -- verify the broker
+    --   tls = { cafile = "…", certfile = "…", keyfile = "…" }  -- plus mTLS
+    --   tls = { insecure = true }                        -- dev only, no checks
+    --
+    -- The wrap has to happen before HELLO: everything below this line, the
+    -- handshake included, is application data inside the tunnel.
+    if opts.tls then
+        local cfg, terr = tls_m.client_config(opts.tls, "client tls")
+        if not cfg then
+            sock:close()
+            return nil, terr or "tls: nothing configured"
+        end
+        sock:settimeout(opts.timeout or DEFAULT_TIMEOUT)
+        local secured, herr = tls_m.connect_handshake(
+            sock, cfg, host, opts.timeout or DEFAULT_TIMEOUT)
+        if not secured then
+            return nil, string.format("tls %s:%d: %s", host, port, tostring(herr))
+        end
+        sock = secured
     end
 
     local c = setmetatable({

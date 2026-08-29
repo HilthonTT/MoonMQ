@@ -11,13 +11,15 @@
 --   → 200 { "offset": <follower LEO> }   on success
 --   → 4xx/5xx text                        on error
 --
--- HTTP/1.1, Connection: close. No auth — bind to a trusted network / firewall
--- the port, same caveat as the metrics endpoint.
+-- HTTP/1.1, Connection: close. No user auth — bind to a trusted network /
+-- firewall the port, same caveat as the metrics endpoint. TLS is available
+-- (Replication.Tls) and is what stops the log being readable in transit.
 
 local socket  = require("socket")
 local json    = require("dkjson")
 local msg_m   = require("src.record.message")
 local httpk   = require("src.server.http_kit")
+local tls_m   = require("src.io.tls")
 local log     = require("src.log.logger").get("replica_server")
 
 local M = {}
@@ -33,6 +35,10 @@ function M.new(opts)
         broker  = assert(opts.broker, "broker required"),
         host    = opts.host or "127.0.0.1",
         port    = assert(opts.port, "port required"),
+        -- TLS for the replication listener (src/io/tls.lua). The leader
+        -- ships every record through here, so on anything but a trusted
+        -- link this is the port that leaks the whole log.
+        tls     = opts.tls,
     }, M)
 end
 
@@ -118,13 +124,14 @@ end
 
 function M:start()
     local _, lerr = self.reactor:listen(self.host, self.port,
-        function(sock) self:_handle(sock) end)
+        function(sock) self:_handle(sock) end,
+        { tls = self.tls })
     if lerr then
         log:error("replica listen failed on %s:%d: %s", self.host, self.port, lerr)
         return nil, lerr
     end
-    log:info("replica endpoint listening on %s:%d (POST /replicate)",
-        self.host, self.port)
+    log:info("replica endpoint listening on %s:%d (POST /replicate, %s)",
+        self.host, self.port, tls_m.describe(self.tls))
     return true
 end
 

@@ -67,6 +67,7 @@ src/
   record/          on-disk record codec (v2: CRC-framed key/value + attrs byte)
                    plus gzip/snappy compression
   io/              filesystem + durability primitives (fsync, ftruncate, rename)
+                   and TLS parameters/wrapping shared by every listener + client
   metrics/ log/    Prometheus registry · leveled logger
   core/            pure utilities (crc32, uuid, rng, futures, time, validation,
                    base64, constant-time compare, PBKDF2)
@@ -299,6 +300,14 @@ framing isolated in `src/server/framer.lua` and 16-byte connection/correlation
 IDs from `src/core/uuid.lua`. A watchdog drops connections that fail to
 authenticate within `HandshakeDeadline`.
 
+TLS, when a listener configures it (`src/io/tls.lua`), is wrapped around the
+socket before any of that: the reactor performs the handshake in the accepting
+connection's own coroutine and hands `on_accept` an already-encrypted socket,
+so everything above this line is unchanged by it. The one place TLS is visible
+is `Reactor:park` — an encrypted read can need the socket to become *writable*,
+and every read, write, handshake and HTTP header parse waits on the direction
+the TLS layer asks for rather than the one the caller intended.
+
 ## Observability
 
 Two HTTP endpoints on `MetricsHost:MetricsPort` (default `127.0.0.1:9090`).
@@ -324,6 +333,7 @@ port. `/health` is open either way.
 | `moonmq_authz_denied_total` | counter | `resource`, `operation` |
 | `moonmq_quota_throttled_total` | counter | `scope`, `dimension` |
 | `moonmq_auth_success_total` · `moonmq_auth_failures_total` | counter | `mechanism` |
+| `moonmq_tls_handshakes_total` · `moonmq_tls_handshake_failures_total` | counter | — |
 
 `moonmq_partition_log_bytes` is per-partition — a few thousand series at the
 default `MaxTopics=1024`, which is fine for Prometheus. Lift `MaxTopics`
@@ -343,6 +353,7 @@ such as a connection id.
 | the event loop | `src/server/reactor.lua` (~270 lines, self-contained) |
 | a request's lifecycle | `src/server/connection.lua`, then `handlers.lua` |
 | who may do what | `src/server/acl.lua`, then the gates in `handlers.lua` |
+| TLS | `src/io/tls.lua`, then `Reactor:park` / `tls_handshake` |
 | the wire protocol | `src/wire/protocol.lua` (every frame documented) |
 | the disk format | `src/record/message.lua`, then `storage/segmentation.lua` |
 | crash recovery | `storage/segment_verify.lua` + `Broker:load_topics` |

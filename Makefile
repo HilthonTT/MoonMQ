@@ -19,6 +19,10 @@ deps:
 	# table in src/server/auth.lua). Needs libssl headers: on Debian/Ubuntu
 	# `apt-get install libssl-dev`.
 	$(LUAROCKS) install luaossl
+	# luasec: TLS for the client, metrics, cluster and replication listeners
+	# (src/io/tls.lua). Without it the broker still boots and only refuses
+	# configurations that ask for TLS. Same libssl headers as luaossl.
+	$(LUAROCKS) install luasec
 	$(LUAROCKS) install luacheck
 	$(LUAROCKS) install sirocco
 	$(LUAROCKS) install hump

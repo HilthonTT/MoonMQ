@@ -1,14 +1,11 @@
-# Users, ACLs, quotas, and SCRAM
+# Users, ACLs, SCRAM, quotas, and TLS
 
 Everything here is **opt-in and backwards compatible**. A broker running the
 config it ran yesterday behaves exactly as it did yesterday: one account, full
 authority, password authentication, open metrics. What follows is how to stop
 doing that.
 
-The one thing this does *not* give you is confidentiality. The client protocol
-is still plaintext TCP — SCRAM keeps the password off the wire, but the records
-themselves are readable by anyone on the path. TLS remains the open item; see
-[roadmap-security-consensus.md](roadmap-security-consensus.md).
+Confidentiality is [§5, TLS](#5-tls) — also opt-in, and also off by default.
 
 ---
 
@@ -271,7 +268,126 @@ block if that is not what you want.
 
 ---
 
-## 5. Metrics endpoint
+## 5. TLS
+
+Off by default. A broker with no `Tls` block anywhere behaves exactly as it did
+before, which is what every existing deployment gets on upgrade. What it will
+not do is quietly fall back to plaintext on a listener you asked to encrypt: a
+missing certificate, an unreadable key, or a `Verify` with nothing to verify
+against stops the broker at boot, naming the listener.
+
+Needs **luasec** (`luarocks install luasec`). Without it the broker still boots
+and only refuses configurations that ask for TLS.
+
+### Four listeners, four blocks
+
+They have genuinely different exposure, so each configures its own:
+
+| Block | Port | What it protects |
+| --- | --- | --- |
+| `Server.Tls` | client protocol | Records, keys, topic and group names — everything a client sends or receives |
+| `Server.MetricsTls` | `/metrics`, `/stats` | Topic names and sizes; and Basic credentials, if `MetricsAuth.Basic` is on |
+| `Server.Cluster.Tls` | `/cluster/*` | The `X-Cluster-Token`, and every record migrated between brokers |
+| `Server.Replication.Tls` | `/replicate` | Every record, again — this is the whole log in flight |
+
+```json
+"Server": {
+  "Tls": {
+    "CertFile": "/etc/moonmq/server.crt",
+    "KeyFile":  "/etc/moonmq/server.key",
+    "HandshakeTimeout": 10
+  },
+  "MetricsTls": { "CertFile": "…", "KeyFile": "…" },
+  "Cluster":     { "Tls": { "CertFile": "…", "KeyFile": "…",
+                            "CaFile": "/etc/moonmq/ca.crt",
+                            "Verify": "required" } },
+  "Replication": { "Tls": { "CertFile": "…", "KeyFile": "…", "Verify": "none" } }
+}
+```
+
+Keys: `Enabled` (defaults to true when the block exists — writing out cert
+paths and getting plaintext because a flag was missing is a trap),
+`CertFile`, `KeyFile`, `CaFile`, `CaPath`, `Verify`, `Protocol`, `Ciphers`,
+`ServerName`, `HandshakeTimeout`.
+
+`Cluster.Tls` and `Replication.Tls` each configure **both halves** of their
+link — the listener and the client that dials peers — from one block, so a
+cluster cannot end up encrypted in one direction only.
+
+### Verification
+
+| `Verify` | Server means | Client means |
+| --- | --- | --- |
+| `none` | Do not ask for a client certificate (default) | Encrypt, but check nothing (`Insecure: true` is a synonym) |
+| `peer` | Validate a client certificate if one is offered | Validate the broker's certificate (default) |
+| `required` | Refuse any client without a valid certificate — **mTLS** | as `peer` |
+
+Anything other than `none` needs a `CaFile` (or `CaPath`) to validate against.
+A **client** with neither falls back to the system trust store
+(`/etc/ssl/certs/ca-certificates.crt` and the usual alternatives), which is
+what verifying a publicly-signed certificate means everywhere else. A
+**listener** never does: `Verify: "required"` there means mTLS against a
+private CA, and silently accepting every client signed by any public CA on the
+machine would be a severe, silent widening.
+
+Clients also check the **hostname**. luasec validates the certificate chain but
+does not check that the name on it is the host you dialled — without that step
+any certificate from the trusted CA, including one issued to an attacker for a
+name they legitimately control, would be accepted. Both SANs and the common
+name are checked, with single-level wildcards (`*.example.com`).
+
+### Clients
+
+```lua
+local c = assert(Client.new{
+    host = "broker.internal", port = 9092,
+    username = "orders-svc", password = "…", mechanism = "scram-sha-256",
+    tls = { cafile = "/etc/moonmq/ca.crt" },
+})
+```
+
+`tls = true` is shorthand for "encrypt and verify against the system trust
+store". `tls = { insecure = true }` skips verification — for a self-signed
+development broker, and nowhere else. `server_name` overrides the name checked
+and sent in SNI, for a broker reached by IP or through a load balancer. Add
+`certfile`/`keyfile` for mTLS.
+
+### How it works, and why that part was the work
+
+TLS on a reactor is not a wrapper. On a plain socket, an operation that cannot
+proceed says `timeout`, and the direction to wait on is obvious from which
+operation it was. On a TLS socket it is not: an encrypted **read** can need the
+socket to become **writable** — the record it is decrypting triggered a
+renegotiation, or the handshake has not finished — and a write can need
+readability for the same reason. luasec reports that as `wantread`/`wantwrite`,
+and the only correct response is to wait on the direction the TLS layer asked
+for.
+
+That is `Reactor:park` (`src/server/reactor.lua`), and it is what
+`read_exact`, `send_all`, `tls_handshake` and the HTTP header readers all go
+through. The handshake itself runs as a yielding loop in the accepting
+connection's own coroutine, so one peer that opens a socket and then says
+nothing stalls only itself, and it is bounded by `HandshakeTimeout`.
+
+For the client listener, a `pre_tls` hook runs **before** the handshake, so a
+banned IP is closed without the broker performing one — server-side asymmetric
+crypto is exactly the work a lockout exists to stop an abusive peer from
+buying. Such a peer gets a TCP close rather than a protocol error frame,
+because on a TLS listener there is no session to send one over yet.
+
+### Not covered
+
+* **Channel binding.** SCRAM advertises `n,,` (no binding). Now that there is a
+  TLS channel, `tls-server-end-point` binding is implementable; the client-final
+  `c=` field is already validated against the header the client opened with, so
+  a downgrade would be detectable.
+* **Certificate reloading.** A renewed certificate needs a broker restart.
+* **Certificate-derived principals.** An mTLS client certificate authenticates
+  the *connection*; the MoonMQ principal still comes from AUTH or SCRAM.
+
+---
+
+## 6. Metrics endpoint
 
 `/metrics` and `/stats` have always been open, and still are by default —
 which is why `MetricsHost` defaults to loopback. `/stats` lists every topic
@@ -303,7 +419,7 @@ wrong reasons.
 
 ---
 
-## 6. Observability
+## 7. Observability
 
 | Metric | Labels |
 | --- | --- |
@@ -312,6 +428,8 @@ wrong reasons.
 | `moonmq_auth_success_total` | `mechanism` (`plain`/`scram`) |
 | `moonmq_auth_failures_total` | `mechanism` |
 | `moonmq_metrics_http_unauthorized_total` | — |
+| `moonmq_tls_handshakes_total` | — |
+| `moonmq_tls_handshake_failures_total` | — |
 
 Every denial is also logged with the connection id, the username, the
 operation, and the resource, which between them name the ACL rule that is
@@ -319,7 +437,7 @@ missing.
 
 ---
 
-## 7. Recommended posture
+## 8. Recommended posture
 
 1. Replace the shipped `admin`/`admin` credential (`make hash PASSWORD=... SCRAM=1`).
 2. Give every application its own user with the narrowest prefix rules that work.
@@ -327,4 +445,9 @@ missing.
 4. Move clients to `mechanism = "scram-sha-256"`.
 5. Set a `Default` quota so one misbehaving client cannot starve the rest.
 6. Set `MetricsAuth`, or keep `MetricsHost` on loopback.
-7. Keep the broker on a private network until TLS lands.
+7. Turn on `Server.Tls`. SCRAM keeps the password off the wire; TLS is what
+   keeps the *records* off it.
+8. Encrypt the inter-broker links too (`Cluster.Tls`, `Replication.Tls`) — the
+   replication port carries the entire log.
+9. Watch `moonmq_tls_handshake_failures_total`: a steady nonzero rate is either
+   a client that has not been switched over, or someone probing the port.

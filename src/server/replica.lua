@@ -3,6 +3,7 @@ local http   = require("socket.http")
 local ltn12  = require("ltn12")
 local json   = require("dkjson")        -- only needs json.decode
 local msg_m  = require("src.record.message")
+local tls_m  = require("src.io.tls")
 local log    = require("src.log.logger").get("replicate")
 
 local DEFAULT_QUEUE_SIZE = 1000
@@ -11,12 +12,17 @@ local DEFAULT_TIMEOUT_IN_SECONDS = 5 -- seconds
 local ReplicaClient = {}
 ReplicaClient.__index = ReplicaClient
 
-function ReplicaClient.new(address, timeout)
+-- opts.tls (optional): a client-side TLS config from src/io/tls.lua. Set it
+-- when the follower's /replicate listener is encrypted; the two are configured
+-- from the same Replication.Tls block, so they cannot disagree by accident.
+function ReplicaClient.new(address, timeout, opts)
     assert(type(address) == "string", "address must be a string")
+    opts = opts or {}
 
     return setmetatable({
         address = address,
         timeout = timeout or DEFAULT_TIMEOUT_IN_SECONDS,
+        tls     = opts.tls,
     }, ReplicaClient)
 end
 
@@ -32,7 +38,8 @@ function ReplicaClient:send(topic_name, partition_id, sender_replica_id, payload
     local response_body = {}
 
     local _, code, _hdrs, status = http.request{
-        url     = string.format("http://%s/replicate", self.address),
+        url     = string.format("%s://%s/replicate",
+                                self.tls and "https" or "http", self.address),
         method  = "POST",
         headers = {
             ["Content-Type"]   = "application/octet-stream",
@@ -43,11 +50,17 @@ function ReplicaClient:send(topic_name, partition_id, sender_replica_id, payload
         },
         source = ltn12.source.string(payload),
         sink   = ltn12.sink.table(response_body),
-        create = function()
-            local s = socket.tcp()
-            s:settimeout(timeout)
-            return s
-        end,
+        -- The TLS variant wraps and handshakes inside connect(), then forwards
+        -- every method to the wrapped socket, so LuaSocket's HTTP layer above
+        -- it is unchanged. It honours `timeout` per request, which luasec's
+        -- own ssl.https create does not.
+        create = self.tls
+            and tls_m.http_create(self.tls.params, timeout, self.tls.server_name)
+            or function()
+                local s = socket.tcp()
+                s:settimeout(timeout)
+                return s
+            end,
     }
 
     if type(code) ~= "number" then

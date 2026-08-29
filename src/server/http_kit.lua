@@ -33,7 +33,10 @@ function M.read_headers(reactor, sock, deadline)
         local idx = buf:find("\r\n\r\n", 1, true)
         if idx then return buf:sub(1, idx + 3), buf:sub(idx + 4) end
 
-        if err == "timeout" then reactor:wait_readable(sock)
+        -- park(), not wait_readable(): on a TLS socket the read may be waiting
+        -- for the socket to become WRITABLE instead (see Reactor:park).
+        if reactor.would_block and reactor.would_block(err) then
+            reactor:park(sock, err, "read")
         elseif err == "closed" then return nil, "peer closed"
         elseif err then return nil, err
         elseif not progressed then reactor:sleep(0.02) end
@@ -55,7 +58,8 @@ function M.read_body(reactor, sock, have, want, deadline, max_body)
         if chunk then parts[#parts + 1] = chunk; got = got + #chunk
         elseif partial and #partial > 0 then parts[#parts + 1] = partial; got = got + #partial end
         if got >= want then break end
-        if err == "timeout" then reactor:wait_readable(sock)
+        if reactor.would_block and reactor.would_block(err) then
+            reactor:park(sock, err, "read")
         elseif err == "closed" then return nil, "peer closed"
         elseif err then return nil, err end
     end

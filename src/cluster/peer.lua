@@ -8,6 +8,7 @@ local socket = require("socket")
 local http   = require("socket.http")
 local ltn12  = require("ltn12")
 local json   = require("dkjson")
+local tls_m  = require("src.io.tls")
 
 local DEFAULT_TIMEOUT = 5
 
@@ -24,6 +25,10 @@ function Peer.new(id, address, opts)
         address = address,
         token   = opts.token,
         timeout = opts.timeout or DEFAULT_TIMEOUT,
+        -- Client-side TLS config (src/io/tls.lua) for reaching this peer's
+        -- cluster endpoint. Comes from the same Cluster.Tls block that
+        -- encrypts our own listener, so a cluster is either all-TLS or not.
+        tls     = opts.tls,
     }, Peer)
 end
 
@@ -43,16 +48,19 @@ function Peer:_request(method, path, headers, body)
     end
 
     local _, code, _, status = http.request{
-        url     = string.format("http://%s%s", self.address, path),
+        url     = string.format("%s://%s%s",
+                                self.tls and "https" or "http", self.address, path),
         method  = method,
         headers = headers,
         source  = body and ltn12.source.string(body) or nil,
         sink    = ltn12.sink.table(response_body),
-        create  = function()
-            local s = socket.tcp()
-            s:settimeout(timeout)
-            return s
-        end,
+        create  = self.tls
+            and tls_m.http_create(self.tls.params, timeout, self.tls.server_name)
+            or function()
+                local s = socket.tcp()
+                s:settimeout(timeout)
+                return s
+            end,
     }
 
     if type(code) ~= "number" then

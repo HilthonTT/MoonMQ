@@ -1,25 +1,43 @@
-# Roadmap notes: TLS and controller consensus
+# Roadmap notes: TLS (shipped) and controller consensus
 
 Two design gaps assessed on 2026-07-19, alongside the batch that shipped
 producer-state expiry, cross-broker transactional produce, and cluster-wide
 consumer groups. Both are implementable; neither is a bolt-on. This note
 records the integration points so the work can start without re-scoping.
 
-> **Update (2026-08-29).** The rest of the security backlog has shipped:
-> multiple users with ACLs, SCRAM-SHA-256, per-user/per-topic quotas, and
-> optional authentication on the metrics port — see [security.md](security.md).
-> That changes the TLS argument below in one way worth noting. SCRAM keeps
-> credentials off the wire, so the *password* is no longer exposed by a
-> plaintext deployment; **record payloads still are**, as is every topic and
-> group name. TLS remains the open item, and the plan below is unchanged by
-> the new code — the reactor readiness handling in step (2) is still the whole
-> difficulty. One addition: when TLS lands, SCRAM channel binding becomes
-> available, and `src/server/scram.lua` already validates the gs2 header and
-> the client-final `c=` field so a downgrade would be detectable.
+> **Update (2026-08-29). TLS has shipped** — along with multi-user auth, ACLs,
+> SCRAM-SHA-256, quotas and metrics-endpoint authentication. See
+> [security.md](security.md); the TLS section below is kept as the record of
+> what was planned and how it actually landed.
+>
+> It went in essentially as scoped, in the order the note recommended. What is
+> worth recording is that step (2) really was the whole difficulty: the
+> readiness handling is `Reactor:park`, which routes `wantread`/`wantwrite` to
+> the direction the TLS layer asks for rather than the one the caller intended,
+> and `read_exact`, `send_all`, the handshake loop and the HTTP header readers
+> all go through it. Steps (1), (3) and (4) were then mechanical — every
+> listener takes `{ tls = … }` from `Reactor:listen` and receives an
+> already-encrypted socket, and the two HTTP clients take a `create` function.
+>
+> Two departures from the plan below:
+>
+> * **Configuration is per listener, not one global block**: `Server.Tls`,
+>   `Server.MetricsTls`, `Cluster.Tls`, `Replication.Tls`. The four have
+>   genuinely different exposure, and the cluster/replication blocks configure
+>   both halves of their link at once so it cannot be encrypted in one
+>   direction only.
+> * **A `pre_tls` hook runs before the handshake**, so a banned IP is refused
+>   without the broker performing the asymmetric crypto — a lockout that still
+>   pays for a handshake is not much of a lockout.
+>
+> Still open on the TLS side: SCRAM channel binding (`tls-server-end-point`) is
+> now implementable — `src/server/scram.lua` already validates the gs2 header
+> and the client-final `c=` field, so a downgrade would be detectable — and
+> certificate reload still needs a restart.
 
-## TLS (client protocol + inter-broker HTTP)
+## TLS (client protocol + inter-broker HTTP) — SHIPPED
 
-**Status today:** everything is plaintext — the client TCP protocol, the
+**Status when this was written:** everything is plaintext — the client TCP protocol, the
 `/replicate` follower endpoint, the `/cluster/*` peer endpoints, and
 `/metrics`. The documented posture is loopback binds, private networks,
 `X-Cluster-Token`, and firewalls.
