@@ -114,6 +114,20 @@ M.OP_LIST_GROUPS      = 0x1C
 M.OP_DESCRIBE_GROUP   = 0x1D
 M.OP_DELETE_GROUP     = 0x1E
 
+-- SCRAM-SHA-256 authentication (RFC 5802/7677; see src/server/scram.lua).
+-- A three-frame alternative to OP_AUTH that never puts the password on the
+-- wire and costs the broker no PBKDF2:
+--
+--   AUTH_SCRAM       -> str mechanism | str client-first-message
+--   AUTH_CHALLENGE   <- str server-first-message           (0x91)
+--   AUTH_SCRAM_FINAL -> str client-final-message
+--   AUTH_OK          <- str server-final-message           (0x81, payload)
+--
+-- Either mechanism may be used on a connection; both end in AUTH_OK and
+-- both are one-shot. Old clients that only speak OP_AUTH are unaffected.
+M.OP_AUTH_SCRAM       = 0x1F
+M.OP_AUTH_SCRAM_FINAL = 0x20
+
 -- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
@@ -136,6 +150,7 @@ M.OP_OFFSETS       = 0x8D
 M.OP_TOPIC_DESCRIPTION = 0x8E
 M.OP_GROUP_LIST        = 0x8F
 M.OP_GROUP_DESCRIPTION = 0x90
+M.OP_AUTH_CHALLENGE    = 0x91
 M.OP_ERROR         = 0xFE
 
 -- Correlation IDs are 16-byte UUIDs.
@@ -240,6 +255,13 @@ M.ERR_GROUP_MISSING        = 15
 M.ERR_GROUP_NOT_EMPTY      = 16
 M.ERR_INVALID_CONFIG       = 17
 M.ERR_TOPIC_FORBIDDEN      = 18
+-- NOT_AUTHORIZED: the connection is authenticated, but the principal's ACL
+-- (src/server/acl.lua) does not grant this operation on this resource.
+-- Distinct from NOT_AUTHED (no valid session at all) and AUTH_FAILED (bad
+-- credential): retrying with the same credential will never help, and the
+-- message names the resource and operation so the operator knows which ACL
+-- rule is missing.
+M.ERR_NOT_AUTHORIZED       = 19
 -- Transactional / durable-producer error codes (see docs/transactions.md).
 -- PRODUCER_FENCED: a produce/transaction op arrived with an epoch older than
 --   the current one for this producer id — a newer session (same
@@ -310,8 +332,27 @@ function M.encode_auth(correl_id, username, password)
     return encode_frame(M.OP_AUTH, correl_id, payload)
 end
 
-function M.encode_auth_ok(correl_id)
-    return encode_frame(M.OP_AUTH_OK, correl_id, "")
+-- `extra` carries the SCRAM server-final message ("v=<signature>") when the
+-- session authenticated over SCRAM. It is a plain trailing string, so a client
+-- that only knows the old empty-payload AUTH_OK reads the frame unchanged —
+-- but a SCRAM client MUST verify it, or it has authenticated itself to a
+-- server it never authenticated in return.
+function M.encode_auth_ok(correl_id, extra)
+    return encode_frame(M.OP_AUTH_OK, correl_id,
+        extra and extra ~= "" and encode_string(extra) or "")
+end
+
+function M.encode_auth_scram(correl_id, mechanism, client_first)
+    local payload = encode_string(mechanism) .. encode_string(client_first)
+    return encode_frame(M.OP_AUTH_SCRAM, correl_id, payload)
+end
+
+function M.encode_auth_challenge(correl_id, server_first)
+    return encode_frame(M.OP_AUTH_CHALLENGE, correl_id, encode_string(server_first))
+end
+
+function M.encode_auth_scram_final(correl_id, client_final)
+    return encode_frame(M.OP_AUTH_SCRAM_FINAL, correl_id, encode_string(client_final))
 end
 
 -- PRODUCE payload: u8 codec | str topic | str key | str value.
@@ -899,6 +940,41 @@ function M.decode_auth(payload)
     local pass, _, perr = decode_string(payload, p, MAX_PASSWORD)
     if not pass then return nil, perr end
     return { username = user, password = pass }, nil
+end
+
+-- SCRAM messages are short printable ASCII (the longest field is a base64
+-- 32-byte proof). 4 KiB is far above any legal message and keeps a
+-- pre-authentication frame from being an allocation lever.
+local MAX_SASL_MESSAGE = 4096
+local MAX_MECHANISM    = 64
+M.MAX_SASL_MESSAGE = MAX_SASL_MESSAGE
+
+function M.decode_auth_scram(payload)
+    local mechanism, p, err = decode_string(payload, 1, MAX_MECHANISM)
+    if not mechanism then return nil, err end
+    local message, _, merr = decode_string(payload, p, MAX_SASL_MESSAGE)
+    if not message then return nil, merr end
+    return { mechanism = mechanism, message = message }, nil
+end
+
+function M.decode_auth_challenge(payload)
+    local message, _, err = decode_string(payload, 1, MAX_SASL_MESSAGE)
+    if not message then return nil, err end
+    return { message = message }, nil
+end
+
+function M.decode_auth_scram_final(payload)
+    local message, _, err = decode_string(payload, 1, MAX_SASL_MESSAGE)
+    if not message then return nil, err end
+    return { message = message }, nil
+end
+
+-- An empty payload is the pre-SCRAM shape and stays valid: message = "".
+function M.decode_auth_ok(payload)
+    if not payload or #payload == 0 then return { message = "" }, nil end
+    local message, _, err = decode_string(payload, 1, MAX_SASL_MESSAGE)
+    if not message then return nil, err end
+    return { message = message }, nil
 end
 
 function M.decode_produce(payload)

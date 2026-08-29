@@ -49,7 +49,9 @@ main.lua           CLI entrypoint: config, logging, auth wiring, server boot
 bin/               operational tools (HTTP gateway, password hasher)
 src/
   server/          TCP front-end: reactor loop, framing, connection lifecycle,
-                   opcode handlers, group coordination, auth, metrics HTTP
+                   opcode handlers, group coordination, metrics HTTP, and the
+                   security layer: users (store) + auth (credentials, lockout)
+                   + scram (SCRAM-SHA-256) + acl (permissions) + quota (buckets)
   client/          network client (speaks the wire protocol over TCP)
   wire/            binary protocol codec, shared by server and client
   broker/          domain layer: Broker facade, in-process Producer/Consumer,
@@ -66,7 +68,8 @@ src/
                    plus gzip/snappy compression
   io/              filesystem + durability primitives (fsync, ftruncate, rename)
   metrics/ log/    Prometheus registry · leveled logger
-  core/            pure utilities (crc32, uuid, rng, futures, time, validation)
+  core/            pure utilities (crc32, uuid, rng, futures, time, validation,
+                   base64, constant-time compare, PBKDF2)
   fsm/ chaos/      state-machine library · fault-injecting producer wrapper
   repl/            interactive MQL console (sql/ lexer→parser→executor)
   vendor/          vendored third-party code (sha2)
@@ -261,7 +264,8 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 
 | Client → server | Purpose |
 | --- | --- |
-| `HELLO` · `AUTH` | Protocol-version handshake · authentication |
+| `HELLO` · `AUTH` | Protocol-version handshake · password authentication |
+| `AUTH_SCRAM` · `AUTH_SCRAM_FINAL` | SCRAM-SHA-256 client-first · client-final (answered by `AUTH_CHALLENGE`, then `AUTH_OK` carrying the server signature) |
 | `PRODUCE` · `PRODUCE_BATCH` | Append one record · append N in one frame |
 | `FETCH` · `SUBSCRIBE` | Pull a batch · stream on arrival |
 | `COMMIT` · `NACK` | Commit a group offset · reject a record (→ DLQ) |
@@ -298,7 +302,9 @@ authenticate within `HandshakeDeadline`.
 ## Observability
 
 Two HTTP endpoints on `MetricsHost:MetricsPort` (default `127.0.0.1:9090`).
-**Unauthenticated** — keep it on loopback or firewall the port.
+**Unauthenticated unless `Server.MetricsAuth` is set** (bearer token or HTTP
+Basic against the user store) — otherwise keep it on loopback or firewall the
+port. `/health` is open either way.
 
 **`GET /metrics`** — Prometheus exposition format:
 
@@ -315,6 +321,9 @@ Two HTTP endpoints on `MetricsHost:MetricsPort` (default `127.0.0.1:9090`).
 | `moonmq_fsync_duration_seconds` | histogram | `topic` |
 | `moonmq_topic_count` | gauge | — |
 | `moonmq_partition_log_bytes` | gauge | `topic`, `partition` |
+| `moonmq_authz_denied_total` | counter | `resource`, `operation` |
+| `moonmq_quota_throttled_total` | counter | `scope`, `dimension` |
+| `moonmq_auth_success_total` · `moonmq_auth_failures_total` | counter | `mechanism` |
 
 `moonmq_partition_log_bytes` is per-partition — a few thousand series at the
 default `MaxTopics=1024`, which is fine for Prometheus. Lift `MaxTopics`
@@ -333,6 +342,7 @@ such as a connection id.
 | --- | --- |
 | the event loop | `src/server/reactor.lua` (~270 lines, self-contained) |
 | a request's lifecycle | `src/server/connection.lua`, then `handlers.lua` |
+| who may do what | `src/server/acl.lua`, then the gates in `handlers.lua` |
 | the wire protocol | `src/wire/protocol.lua` (every frame documented) |
 | the disk format | `src/record/message.lua`, then `storage/segmentation.lua` |
 | crash recovery | `storage/segment_verify.lua` + `Broker:load_topics` |

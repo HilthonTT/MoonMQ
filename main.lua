@@ -1,6 +1,8 @@
 local Server = require("src.server.server")
 local Config = require("src.server.config")
 local auth_m = require("src.server.auth")
+local users_m = require("src.server.users")
+local quota_m = require("src.server.quota")
 local version_m = require("src.core.version")
 local Log    = require("src.log.logger")
 local repl = require("src.repl.repl")
@@ -40,33 +42,95 @@ local function run_cli_command(argv)
     return false
 end
 
-local function build_authenticator(cfg)
-    local ac = cfg.Auth
-    if not ac or not ac.Username then
-        log:warn("Auth.Username missing, server is OPEN")
-        return nil
+-- Build the user store, the authenticator over it, and the quota manager that
+-- reads per-user limits from the same parsed config.
+--
+-- A configuration problem here is FATAL rather than a warning that degrades to
+-- an open broker: an unparseable ACL or a bad credential means the operator's
+-- intent is unknown, and guessing at it is how a broker ends up serving
+-- everyone. The one exception is "no credentials at all", which stays the
+-- documented OPEN mode.
+--
+-- Returns (authenticator, quotas). Either may be nil.
+local function build_auth(cfg)
+    local ac = cfg.Auth or {}
+
+    if ac.Password == "CHANGE_ME" then
+        log:warn("default password in use; replace Auth.Password")
     end
 
-    local opts = {
-        username       = ac.Username,
+    local store, serr = users_m.load(ac)
+    if serr then
+        log:error("Auth config: %s", serr)
+        os.exit(1)
+    end
+    if not store then
+        log:warn("no credentials configured, server is OPEN "
+            .. "(any client may produce, consume, and delete any topic)")
+        return nil, nil
+    end
+
+    local authenticator = auth_m.authenticator({
+        store          = store,
         max_failures   = ac.MaxFailures,
         failure_window = ac.FailureWindow,
         ban_duration   = ac.BanDuration,
-    }
+    })
+    log:info("auth: %d user(s): %s", store:count(), store:describe())
 
-    if ac.PasswordHash and ac.PasswordHash ~= "" then
-        opts.password_hash = ac.PasswordHash
-    elseif ac.Password and ac.Password ~= "" then
-        if ac.Password == "CHANGE_ME" then
-            log:warn("default password in use; replace Auth.Password")
-        end
-        opts.password = ac.Password
-    else
-        log:warn("no credential configured, server is OPEN")
-        return nil
+    -- Quotas: a default applying to every principal, per-user overrides drawn
+    -- from the user entries themselves, and per-topic ceilings that apply to
+    -- whoever touches that topic.
+    local qc = ac.Quotas or {}
+    local default_spec, derr = quota_m.spec(qc.Default)
+    if derr then
+        log:error("Auth.Quotas.Default: %s", derr)
+        os.exit(1)
     end
 
-    return auth_m.static_authenticator(opts)
+    local topic_specs = {}
+    for name, block in pairs(qc.Topics or {}) do
+        local spec, terr = quota_m.spec(block)
+        if terr then
+            log:error("Auth.Quotas.Topics.%s: %s", name, terr)
+            os.exit(1)
+        end
+        topic_specs[name] = spec
+    end
+
+    local user_specs = store:quota_specs()
+
+    local quotas
+    if default_spec or next(topic_specs) ~= nil or next(user_specs) ~= nil then
+        quotas = quota_m.new({
+            default       = default_spec,
+            users         = user_specs,
+            topics        = topic_specs,
+            burst_seconds = qc.BurstSeconds,
+        })
+        local n_users, n_topics = 0, 0
+        for _ in pairs(user_specs)  do n_users  = n_users  + 1 end
+        for _ in pairs(topic_specs) do n_topics = n_topics + 1 end
+        log:info("quotas enabled (default=%s, %d user override(s), %d topic rule(s))",
+            default_spec and "yes" or "no", n_users, n_topics)
+    end
+
+    return authenticator, quotas
+end
+
+-- Metrics-endpoint credentials. The token may come from the environment so it
+-- does not have to live in a file that ships with the repo.
+local function build_metrics_auth(cfg)
+    local mc = Config.get(cfg, "Server.MetricsAuth", nil)
+    local token = os.getenv("MOONMQ_METRICS_TOKEN")
+    if type(mc) ~= "table" and not token then return nil end
+    mc = type(mc) == "table" and mc or {}
+
+    if mc.Token and mc.Token ~= "" then token = mc.Token end
+    local basic = mc.Basic == true
+
+    if not token and not basic then return nil end
+    return { token = token, basic = basic }
 end
 
 if is_main(arg, ...) then
@@ -92,6 +156,8 @@ if is_main(arg, ...) then
 
     local s = cfg.Server or {}
     local gc = s.GroupCommit or {}
+
+    local authenticator, quotas = build_auth(cfg)
 
     -- Replication config (single-leader, static). Peers are the followers a
     -- leader ships to; map JSON {Id, Address} to the {id, address} the server
@@ -185,7 +251,11 @@ if is_main(arg, ...) then
         producer_expiry_check_interval = s.ProducerExpiryCheckIntervalSeconds,
         metrics_host           = s.MetricsHost or "127.0.0.1",
         metrics_port           = s.MetricsPort or 9090,
-        authenticator          = build_authenticator(cfg),
+        authenticator          = authenticator,
+        -- Per-user / per-topic quotas, and the credential gate on the metrics
+        -- listener. Both nil unless configured; see docs/security.md.
+        quotas                 = quotas,
+        metrics_auth           = build_metrics_auth(cfg),
         -- LingerMs is the JSON unit (Kafka-conventional); convert to seconds
         -- at the boundary. Server.new accepts seconds so all internal math
         -- stays in one unit (socket.gettime() is seconds).

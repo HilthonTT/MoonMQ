@@ -50,7 +50,7 @@ example:
 	$(LUA) src/examples/tcp_client.lua
 
 hash:
-	@test -n "$(PASSWORD)" || (echo "usage: make hash PASSWORD=mypass [ITER=10000]" && exit 1)
-	@$(LUA) bin/moonmq-hash.lua "$(PASSWORD)" $(ITER)
+	@test -n "$(PASSWORD)" || (echo "usage: make hash PASSWORD=mypass [ITER=10000] [SCRAM=1]" && exit 1)
+	@$(LUA) bin/moonmq-hash.lua "$(PASSWORD)" $(ITER) $(if $(SCRAM),--scram,)
 
 .PHONY: deps test smoke lint check run server gateway example hash

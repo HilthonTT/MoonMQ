@@ -29,6 +29,7 @@ records.
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
 | **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. |
 | **Admin** | Create/describe/delete topics, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
+| **Security** | Multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 (the password never crosses the wire), per-user and per-topic quotas, optional auth on the metrics port. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
 
 ## Quick start
@@ -169,8 +170,8 @@ C runtime), so Windows needs **LuaJIT** rather than stock Lua 5.4.
 
 | Section | Keys |
 | --- | --- |
-| `Server` | `Host`, `Port` (9092), `DataDir`, `MaxConnections` (960), `MaxConnectionsPerIP`, `FdReserve` (64), `MaxFrameSize`, `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `MetricsHost`, `MetricsPort` (`null` disables), `Acks`, `Replication`, `Cluster`, `Autobalance` |
-| `Auth` | `Username` + either `PasswordHash` (`pbkdf2-sha256$<iter>$<salt_hex>$<hash_hex>`) or plaintext `Password`; `MaxFailures`, `FailureWindow`, `BanDuration` for per-IP lockout |
+| `Server` | `Host`, `Port` (9092), `DataDir`, `MaxConnections` (960), `MaxConnectionsPerIP`, `FdReserve` (64), `MaxFrameSize`, `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `MetricsHost`, `MetricsPort` (`null` disables), `MetricsAuth`, `Acks`, `Replication`, `Cluster`, `Autobalance` |
+| `Auth` | `Username` + either `PasswordHash` (`pbkdf2-sha256$…` or `scram-sha-256$…`) or plaintext `Password`; `MaxFailures`, `FailureWindow`, `BanDuration` for per-IP lockout. `Users` (multi-tenant list with `Acls` + `Quota`) and `Quotas` (`Default`/`Topics`/`BurstSeconds`) — see [docs/security.md](docs/security.md) |
 | `Logging` | `Level` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `File` (empty = stderr only), `LogToStderr` (default true, tees both) |
 
 `MaxConnections` is a ceiling, not a promise: the event loop multiplexes with
@@ -200,8 +201,54 @@ make hash PASSWORD=yourpw
 
 > [!WARNING]
 > With no usable credential the broker starts **open** (no authentication)
-> and logs a warning. The metrics endpoints are unauthenticated too — keep
-> `MetricsHost` on loopback or firewall the port.
+> and logs a warning. The metrics endpoints are unauthenticated by default too
+> — set `Server.MetricsAuth`, or keep `MetricsHost` on loopback.
+
+### Users, ACLs, SCRAM, quotas
+
+A lone `Auth.Username` is a **superuser**: it may produce to, consume from,
+reconfigure and delete every topic. For more than one tenant, replace it with
+`Auth.Users` — each entry carrying its own credential, its own ACL, and
+optionally its own quota:
+
+```json
+"Auth": {
+  "Users": [
+    { "Username": "admin", "PasswordHash": "scram-sha-256$600000$…",
+      "Superuser": true },
+    { "Username": "orders-svc", "PasswordHash": "scram-sha-256$600000$…",
+      "Acls": [
+        { "Resource": "topic", "Name": "orders.*",
+          "Operations": ["read", "write", "describe"] },
+        { "Resource": "group", "Name": "orders-*", "Operations": ["read"] }
+      ],
+      "Quota": { "ProduceRecordsPerSec": 5000 } }
+  ]
+}
+```
+
+ACLs are default-deny and deny-wins, over `topic` / `group` / `cluster` with
+literal, prefix (`orders.*`) or `*` names. `LIST_TOPICS` and `LIST_GROUPS` are
+*filtered* rather than refused, so a tenant sees its own slice of the broker and
+nothing else. A refused request gets `ERR_NOT_AUTHORIZED` naming the operation
+and resource, so the missing rule is obvious from the client's log.
+
+**SCRAM-SHA-256** (`mechanism = "scram-sha-256"` on the client) is worth
+switching to for two reasons: the password never crosses the wire — which
+matters on a plaintext connection — and the PBKDF2 derivation happens on the
+*client*, so a login no longer costs the broker's single reactor thread 0.29 s
+(or minutes, without luaossl). Credentials come in two formats, both accepted by
+both mechanisms:
+
+```bash
+make hash PASSWORD=yourpw SCRAM=1   # scram-sha-256$… — preferred
+make hash PASSWORD=yourpw           # pbkdf2-sha256$… — login-equivalent if leaked
+```
+
+Quotas are token buckets keyed by principal and by topic, which is what the
+per-connection rate limiter is not — a tenant cannot buy more budget by opening
+more sockets. Full reference, including exactly which permission each request
+checks: **[docs/security.md](docs/security.md)**.
 
 There is no built-in log rotation — pair `Logging.File` with `logrotate(8)`
 using `copytruncate` (the broker holds the FD open). If the path can't be
@@ -258,6 +305,7 @@ and fetch paths, wire protocol, and metrics — then
 | [docs/transactions.md](docs/transactions.md) | Idempotent producer, transactions, `read_committed` |
 | [docs/batching.md](docs/batching.md) | Batch wire formats, guarantees, limits |
 | [docs/dlq.md](docs/dlq.md) | Dead-letter queue and NACK semantics |
+| [docs/security.md](docs/security.md) | Users, ACLs, SCRAM-SHA-256, quotas, metrics-endpoint auth |
 | [docs/mql.md](docs/mql.md) | The interactive console's SQL-like grammar |
 | [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md) | Scoped-but-unshipped: TLS, controller consensus |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability |

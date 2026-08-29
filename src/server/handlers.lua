@@ -17,10 +17,133 @@ local consumer_m = require("src.broker.consumer")
 local msg_m      = require("src.record.message")
 local compression = require("src.record.compression")
 local metrics    = require("src.metrics")
+local acl_m      = require("src.server.acl")
+local quota_m    = require("src.server.quota")
+local scram_m    = require("src.server.scram")
+local rng        = require("src.core.rng")
 local log        = require("src.log.logger").get("server")
 local push_log   = require("src.log.logger").get("push")
 
 local M = {}
+
+------------------------------------------------------------------------------
+-- Authorization and quota gates
+--
+-- Every handler that names a resource asks `authorize` before it touches
+-- broker state, and handlers that move data ask `charge` before (or, for
+-- delivery, after) the records move. The two are separate on purpose: a
+-- request the principal may not make is refused outright, while one it may
+-- make but has outrun its budget on is throttled and retryable.
+--
+-- OPEN mode (no authenticator configured) leaves conn.principal nil, and both
+-- gates then pass everything — the broker documents itself as open in that
+-- configuration and this is not the place to change that contract.
+------------------------------------------------------------------------------
+
+-- Silent check, for list endpoints that filter rather than refuse.
+local function permitted(conn, resource, name, operation)
+    local principal = conn.principal
+    if not principal then return true end
+    return principal.acl:authorized(resource, name, operation)
+end
+M.permitted = permitted
+
+-- Checking check: sends ERR_NOT_AUTHORIZED and returns false when refused.
+-- The error names the operation and resource, because the operator reading
+-- the client's log is the person who has to write the missing ACL rule.
+local function authorize(conn, correl, resource, name, operation)
+    if permitted(conn, resource, name, operation) then return true end
+
+    metrics.inc("moonmq_authz_denied_total", 1,
+        { resource = resource, operation = operation })
+    log:warn("conn=%s user=%s DENIED %s on %s %q", conn.id_short,
+        conn.username or "?", operation, resource, name or "*")
+    conn:send(proto.encode_error(correl, proto.ERR_NOT_AUTHORIZED,
+        string.format("not authorized: %s on %s %q",
+            operation, resource, name or "*")))
+    return false
+end
+M.authorize = authorize
+
+-- Charge a quota dimension. Returns true when the request may proceed;
+-- otherwise answers ERR_RATE_LIMITED with the wait and returns false. Nothing
+-- is consumed on refusal, so a refused request does not deepen the hole it is
+-- already in.
+local function charge(server, conn, correl, topic, dim, amount)
+    local quotas = server.quotas
+    if not quotas then return true end
+
+    local principal = conn.principal and conn.principal.username or nil
+    local ok, retry, scope = quotas:check(principal, topic, dim, amount)
+    if ok then return true end
+
+    conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
+        string.format("%s quota exceeded on %s; retry in %.2fs",
+            scope, dim, retry or 0)))
+    return false
+end
+M.charge = charge
+
+-- Total stored size of a record set, for the byte-rate dimensions. Key and
+-- value only: the framing is the broker's overhead, not the tenant's.
+local function record_bytes(records)
+    local total = 0
+    for i = 1, #records do
+        total = total + #records[i].key + #records[i].value
+    end
+    return total
+end
+
+-- Meter records that have ALREADY been delivered, grouped by topic.
+--
+-- Grouped, because a single poll returns whatever the consumer subscribes to:
+-- charging the batch to the frame's topic would let one topic's ceiling be
+-- paid out of another topic's bucket. Nothing can be refused at this point —
+-- the records are out — so the charge lands as bounded debt and the next
+-- request pays it. Returns the longest delay any bucket implies, which is
+-- what the push path sleeps on and the pull path ignores.
+local function meter_delivery(server, conn, records, count)
+    if not server.quotas or count <= 0 then return 0 end
+
+    local user = conn.principal and conn.principal.username or nil
+    local counts, bytes, order = {}, {}, {}
+    for i = 1, count do
+        local r = records[i]
+        if counts[r.topic] == nil then
+            counts[r.topic], bytes[r.topic] = 0, 0
+            order[#order + 1] = r.topic
+        end
+        counts[r.topic] = counts[r.topic] + 1
+        bytes[r.topic]  = bytes[r.topic] + #r.key + #r.value
+    end
+
+    local wait = 0
+    for _, topic in ipairs(order) do
+        wait = math.max(wait, server.quotas:delay(user, topic,
+            quota_m.DIM_FETCH_RECORDS, counts[topic]))
+        wait = math.max(wait, server.quotas:delay(user, topic,
+            quota_m.DIM_FETCH_BYTES, bytes[topic]))
+    end
+    return wait
+end
+
+-- The other half of deliver-then-meter: refuse a consumer that is still
+-- carrying debt from a previous oversized batch, before reading the log.
+local function delivery_allowed(server, conn, correl, topic)
+    if not server.quotas then return true end
+
+    local user = conn.principal and conn.principal.username or nil
+    for _, dim in ipairs({ quota_m.DIM_FETCH_RECORDS, quota_m.DIM_FETCH_BYTES }) do
+        local ok, retry, scope = server.quotas:available(user, topic, dim)
+        if not ok then
+            conn:send(proto.encode_error(correl, proto.ERR_RATE_LIMITED,
+                string.format("%s quota exceeded on %s; retry in %.2fs",
+                    scope, dim, retry or 0)))
+            return false
+        end
+    end
+    return true
+end
 
 -- Build the Message to append for a produce request, applying compression when
 -- a codec is requested. The KEY is always stored plaintext (so commitlog
@@ -114,7 +237,7 @@ function M.auth(server, conn, correl, payload)
     -- pcall so a throwing verify can't leave the flag stuck on, which would
     -- disable the watchdog for this connection.
     conn.auth_in_progress = true
-    local called, ok, auth_err =
+    local called, ok, auth_err, principal =
         pcall(server.authenticator.verify, server.authenticator,
               a.username, a.password, conn.ip)
     conn.auth_in_progress = false
@@ -125,14 +248,144 @@ function M.auth(server, conn, correl, payload)
     end
     if not ok then
         -- Don't log the supplied username — it's attacker-controlled.
+        metrics.inc("moonmq_auth_failures_total", 1, { mechanism = "plain" })
         conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
             auth_err or "auth failed")
         return
     end
 
-    conn.username = a.username
+    conn.username  = a.username
+    conn.principal = principal
+    metrics.inc("moonmq_auth_success_total", 1, { mechanism = "plain" })
     conn:transition_to(Connection.STATE_AUTHENTICATED)
     conn:send(proto.encode_auth_ok(correl))
+end
+
+-- AUTH_SCRAM — client-first. Answers with the salt and iteration count for the
+-- named user so the client can derive the salted password itself.
+--
+-- Nothing here is secret and nothing here is expensive: the reply is the same
+-- shape for a real user and for one that does not exist (the authenticator
+-- hands back a decoy credential derived from the username), and the broker
+-- runs no PBKDF2 at all. That is the point — an unauthenticated peer can no
+-- longer spend broker CPU or enumerate accounts by timing the response.
+function M.auth_scram(server, conn, correl, payload)
+    local req, err = proto.decode_auth_scram(payload)
+    if not req then
+        conn:close(Connection.REASON_BAD_FRAME, proto.ERR_BAD_FRAME, err)
+        return
+    end
+
+    if req.mechanism:upper() ~= scram_m.MECHANISM then
+        conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL,
+            string.format("unsupported mechanism %q (this broker speaks %s)",
+                req.mechanism, scram_m.MECHANISM))
+        return
+    end
+
+    if not server.authenticator then
+        log:warn("no authenticator configured, refusing SCRAM")
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
+            "broker has no credentials configured; connect without AUTH")
+        return
+    end
+
+    local banned, remaining = server.authenticator:is_banned(conn.ip)
+    if banned then
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
+            string.format("ip banned for %d more seconds", remaining))
+        return
+    end
+
+    local first, ferr = scram_m.parse_client_first(req.message)
+    if not first then
+        conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL, ferr)
+        return
+    end
+
+    local credential, principal = server.authenticator:scram_credential(first.username)
+    local combined_nonce = first.nonce .. scram_m.nonce(rng.bytes)
+    local server_first = scram_m.server_first(combined_nonce,
+        credential.salt, credential.iterations)
+
+    conn.scram = {
+        username     = first.username,
+        principal    = principal,     -- nil for an unknown user; the proof
+                                      -- check fails against the decoy anyway
+        credential   = credential,
+        nonce        = combined_nonce,
+        client_first = first.bare,
+        gs2          = first.gs2,
+        server_first = server_first,
+    }
+
+    conn:send(proto.encode_auth_challenge(correl, server_first))
+end
+
+-- AUTH_SCRAM_FINAL — client-final. Verifies the proof and, on success,
+-- returns the server signature inside AUTH_OK so the client can verify the
+-- broker in return.
+function M.auth_scram_final(server, conn, correl, payload)
+    local state = conn.scram
+    if not state then
+        conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL,
+            "AUTH_SCRAM_FINAL without a preceding AUTH_SCRAM")
+        return
+    end
+    -- One attempt per exchange. Without this a client could keep re-sending
+    -- final messages against one server nonce, turning a single challenge into
+    -- an unlimited offline-style oracle on the live connection.
+    conn.scram = nil
+
+    local req, err = proto.decode_auth_scram_final(payload)
+    if not req then
+        conn:close(Connection.REASON_BAD_FRAME, proto.ERR_BAD_FRAME, err)
+        return
+    end
+
+    local final, ferr = scram_m.parse_client_final(req.message)
+    if not final then
+        conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL, ferr)
+        return
+    end
+
+    local function reject(reason)
+        server.authenticator:note_failure(conn.ip)
+        metrics.inc("moonmq_auth_failures_total", 1, { mechanism = "scram" })
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED, reason)
+    end
+
+    -- The nonce must be the one we issued: it is what binds this proof to this
+    -- exchange, and a replayed client-final from an earlier session carries a
+    -- different one.
+    if final.nonce ~= state.nonce then
+        reject("scram nonce mismatch")
+        return
+    end
+    if not scram_m.check_cbind(state.gs2, final.cbind) then
+        reject("scram channel-binding mismatch")
+        return
+    end
+
+    local auth_message = scram_m.auth_message(
+        state.client_first, state.server_first, final.without_proof)
+
+    -- state.principal is nil exactly when the username was unknown; the proof
+    -- check below fails against the decoy regardless, and both paths take the
+    -- same work, so the two cases stay indistinguishable.
+    if not scram_m.verify_proof(state.credential.stored_key, auth_message, final.proof)
+       or not state.principal then
+        reject("invalid credentials")
+        return
+    end
+
+    server.authenticator:note_success(conn.ip)
+    conn.username  = state.username
+    conn.principal = state.principal
+    metrics.inc("moonmq_auth_success_total", 1, { mechanism = "scram" })
+    conn:transition_to(Connection.STATE_AUTHENTICATED)
+    conn:send(proto.encode_auth_ok(correl,
+        scram_m.server_final(state.credential.server_key, auth_message)))
 end
 
 function M.produce(server, conn, correl, payload)
@@ -147,6 +400,13 @@ function M.produce(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
         return
     end
+
+    if not authorize(conn, correl, acl_m.RES_TOPIC, p.topic, acl_m.OP_WRITE) then return end
+    if not charge(server, conn, correl, p.topic, quota_m.DIM_REQUESTS, 1) then return end
+    if not charge(server, conn, correl, p.topic,
+                  quota_m.DIM_PRODUCE_RECORDS, 1) then return end
+    if not charge(server, conn, correl, p.topic,
+                  quota_m.DIM_PRODUCE_BYTES, #p.key + #p.value) then return end
 
     local msg, berr = build_stored_message(p.codec, p.key, p.value)
     if not msg then
@@ -224,6 +484,13 @@ function M.produce_batch(server, conn, correl, payload)
             "produce rate exceeded"))
         return
     end
+
+    if not authorize(conn, correl, acl_m.RES_TOPIC, b.topic, acl_m.OP_WRITE) then return end
+    if not charge(server, conn, correl, b.topic, quota_m.DIM_REQUESTS, 1) then return end
+    if not charge(server, conn, correl, b.topic,
+                  quota_m.DIM_PRODUCE_RECORDS, count) then return end
+    if not charge(server, conn, correl, b.topic,
+                  quota_m.DIM_PRODUCE_BYTES, record_bytes(b.records)) then return end
 
     -- Plain (non-idempotent) batch: append and ack.
     if not b.idempotent then
@@ -459,6 +726,13 @@ function M.produce_idempotent(server, conn, correl, payload)
         return
     end
 
+    -- Authorization and the request charge apply to every frame; the
+    -- record/byte charge waits until we know this is a fresh append rather
+    -- than a replayed retry (below), so a client that retries after a lost ack
+    -- is not billed twice for one record.
+    if not authorize(conn, correl, acl_m.RES_TOPIC, p.topic, acl_m.OP_WRITE) then return end
+    if not charge(server, conn, correl, p.topic, quota_m.DIM_REQUESTS, 1) then return end
+
     local ps       = server.broker.producer_state
     local durable  = conn.producer_name ~= nil
 
@@ -510,6 +784,11 @@ function M.produce_idempotent(server, conn, correl, payload)
     -- BEFORE the append — the enrolment captures the partition's LEO as the
     -- transaction's first offset there, which is what bounds the LSO and the
     -- aborted-range filter for read_committed (see Coordinator:add_partition).
+    if not charge(server, conn, correl, p.topic,
+                  quota_m.DIM_PRODUCE_RECORDS, 1) then return end
+    if not charge(server, conn, correl, p.topic,
+                  quota_m.DIM_PRODUCE_BYTES, #p.key + #p.value) then return end
+
     local in_txn = conn.in_txn and conn.producer_name ~= nil
     local msg, berr = build_stored_message(p.codec, p.key, p.value,
         in_txn and { pid = conn.pid, epoch = conn.epoch } or nil)
@@ -611,6 +890,16 @@ local function subscriber_loop(server, conn)
             return
         end
         if records and #records > 0 then
+            -- Quota on the push path is BACKPRESSURE, not refusal: there is no
+            -- request to fail, and the subscriber has no way to ask again more
+            -- slowly. Sleeping for the interval the quota implies is the same
+            -- enforcement expressed in the only currency this loop has.
+            local wait = meter_delivery(server, conn, records, #records)
+            if wait > 0 then
+                server.reactor:sleep(wait)
+                if conn.state == Connection.STATE_CLOSED then return end
+            end
+
             for i = 1, #records do
                 if conn.state == Connection.STATE_CLOSED then return end
                 local r = records[i]
@@ -655,6 +944,15 @@ function M.subscribe(server, conn, correl, payload)
             "connection already in pull mode (used FETCH)"))
         return
     end
+
+    -- Reading a topic through a group touches two resources: the records, and
+    -- the group's committed offsets (a subscriber advances them). Both are
+    -- checked, so a principal cannot borrow another tenant's group to read a
+    -- topic it is allowed to read — or, worse, wreck that group's position.
+    if not authorize(conn, correl, acl_m.RES_TOPIC, s.topic, acl_m.OP_READ) then return end
+    if not authorize(conn, correl, acl_m.RES_GROUP, s.group_id, acl_m.OP_READ) then return end
+    if not charge(server, conn, correl, s.topic, quota_m.DIM_REQUESTS, 1) then return end
+
     local consumer, cerr = ensure_consumer(conn, server.broker, s.group_id, s.isolation)
     if not consumer then
         conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
@@ -692,6 +990,16 @@ function M.fetch(server, conn, correl, payload)
             "connection already in push mode (used SUBSCRIBE)"))
         return
     end
+
+    if not authorize(conn, correl, acl_m.RES_TOPIC, f.topic, acl_m.OP_READ) then return end
+    if not authorize(conn, correl, acl_m.RES_GROUP, f.group_id, acl_m.OP_READ) then return end
+    if not charge(server, conn, correl, f.topic, quota_m.DIM_REQUESTS, 1) then return end
+    -- Delivery is metered after the fact (the record count is not knowable
+    -- until the log has been read), so what happens up front is a check, not a
+    -- charge: a consumer still carrying debt from a previous oversized batch
+    -- waits, and an empty poll costs it nothing.
+    if not delivery_allowed(server, conn, correl, f.topic) then return end
+
     local consumer, cerr = ensure_consumer(conn, server.broker, f.group_id, f.isolation)
     if not consumer then
         conn:send(proto.encode_error(correl, proto.ERR_BAD_PROTOCOL, cerr))
@@ -814,6 +1122,10 @@ function M.fetch(server, conn, correl, payload)
 
         if delivered > 0 then
             metrics.inc("moonmq_fetch_records_total", delivered, { topic = f.topic })
+            -- Meter what actually went out, per topic. The returned delay is
+            -- the push path's business; here the debt simply waits for the
+            -- next FETCH, which is the right shape for a pull consumer.
+            meter_delivery(server, conn, records, delivered)
         end
     end
     conn:send(proto.encode_ok(correl))
@@ -830,6 +1142,14 @@ function M.commit(server, conn, correl, payload)
             "commit requires prior subscribe/fetch"))
         return
     end
+    -- A commit moves the group's durable position, so it is checked against
+    -- the group as well as the topic — re-checked here rather than trusted
+    -- from the SUBSCRIBE/FETCH that created the consumer, because the topic
+    -- named in this frame need not be the one that was checked then.
+    if not authorize(conn, correl, acl_m.RES_TOPIC, c.topic, acl_m.OP_READ) then return end
+    if not authorize(conn, correl, acl_m.RES_GROUP, conn.consumer.group_id,
+                     acl_m.OP_READ) then return end
+    if not charge(server, conn, correl, c.topic, quota_m.DIM_REQUESTS, 1) then return end
     -- Bounds-check the partition against the topic before forwarding to
     -- the consumer. Without this, a client could commit to any u32
     -- partition id, and offset persistence (OffsetManager) would store a
@@ -895,6 +1215,15 @@ function M.nack(server, conn, correl, payload)
             "nack requires prior subscribe/fetch"))
         return
     end
+    -- Same pair as COMMIT: a NACK rewinds or advances the group's offsets, and
+    -- may move a record to the dead-letter topic. The DLQ write itself is a
+    -- broker action on the consumer's behalf and is not separately authorized
+    -- (see docs/security.md) — reading the source topic is the permission that
+    -- gates it.
+    if not authorize(conn, correl, acl_m.RES_TOPIC, n.topic, acl_m.OP_READ) then return end
+    if not authorize(conn, correl, acl_m.RES_GROUP, conn.consumer.group_id,
+                     acl_m.OP_READ) then return end
+    if not charge(server, conn, correl, n.topic, quota_m.DIM_REQUESTS, 1) then return end
     local topic, terr = server.broker:get_topic(n.topic)
     if not topic then
         conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
@@ -982,6 +1311,21 @@ function M.create_topic(server, conn, correl, payload)
             "num_partitions out of range (1..1024)"))
         return
     end
+    -- topic:create on the name being created, or cluster:create as the
+    -- blanket grant for an account that provisions topics generally. Kafka
+    -- splits it the same way, and the reason is the same: a prefix rule lets a
+    -- tenant create its own topics without letting it create anyone else's.
+    if not (permitted(conn, acl_m.RES_TOPIC, c.name, acl_m.OP_CREATE)
+            or permitted(conn, acl_m.RES_CLUSTER, nil, acl_m.OP_CREATE)) then
+        metrics.inc("moonmq_authz_denied_total", 1,
+            { resource = acl_m.RES_TOPIC, operation = acl_m.OP_CREATE })
+        log:warn("conn=%s user=%s DENIED create on topic %q",
+            conn.id_short, conn.username or "?", c.name)
+        conn:send(proto.encode_error(correl, proto.ERR_NOT_AUTHORIZED,
+            string.format("not authorized: create on topic %q", c.name)))
+        return
+    end
+    if not charge(server, conn, correl, c.name, quota_m.DIM_REQUESTS, 1) then return end
     -- The "__" prefix is reserved for broker-internal topics
     -- (__consumer_offsets, __producer_state, __transaction_state). Those are
     -- created through the TopicManager directly, and Broker:list_topics hides
@@ -1021,6 +1365,22 @@ function M.list_topics(server, conn, correl, _payload)
     -- iteration order). For the common case the bound is irrelevant —
     -- it only kicks in if max_topics has been raised past max_list_topics.
     local all = server.broker:list_topics()
+
+    -- FILTERED, not refused. A listing that errors because one entry is off
+    -- limits is useless to a tenant, and a listing that includes names the
+    -- caller may not describe leaks the shape of everyone else's deployment —
+    -- topic names are rarely uninteresting. So each name is checked and the
+    -- caller sees exactly its own slice of the broker.
+    if conn.principal then
+        local visible = {}
+        for _, name in ipairs(all) do
+            if permitted(conn, acl_m.RES_TOPIC, name, acl_m.OP_DESCRIBE) then
+                visible[#visible + 1] = name
+            end
+        end
+        all = visible
+    end
+
     table.sort(all)
     if #all > server.max_list_topics then
         local truncated = {}
@@ -1057,6 +1417,10 @@ function M.list_offsets(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
         return
     end
+
+    if not authorize(conn, correl, acl_m.RES_TOPIC, q.topic,
+                     acl_m.OP_DESCRIBE) then return end
+    if not charge(server, conn, correl, q.topic, quota_m.DIM_REQUESTS, 1) then return end
 
     local topic, terr = server.broker:get_topic(q.topic)
     if not topic then
@@ -1137,6 +1501,9 @@ function M.delete_topic(server, conn, correl, payload)
         return
     end
 
+    if not authorize(conn, correl, acl_m.RES_TOPIC, c.name,
+                     acl_m.OP_DELETE) then return end
+
     if server.broker.is_internal(c.name) then
         conn:send(proto.encode_error(correl, proto.ERR_TOPIC_FORBIDDEN,
             string.format("cannot delete internal topic '%s'", c.name)))
@@ -1177,6 +1544,10 @@ function M.describe_topic(server, conn, correl, payload)
         return
     end
 
+    if not authorize(conn, correl, acl_m.RES_TOPIC, c.name,
+                     acl_m.OP_DESCRIBE) then return end
+    if not charge(server, conn, correl, c.name, quota_m.DIM_REQUESTS, 1) then return end
+
     local desc, derr = server.broker:describe_topic(c.name)
     if not desc then
         conn:send(proto.encode_error(correl, proto.ERR_TOPIC_MISSING,
@@ -1196,6 +1567,9 @@ function M.alter_topic_config(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
         return
     end
+
+    if not authorize(conn, correl, acl_m.RES_TOPIC, c.name,
+                     acl_m.OP_ALTER) then return end
 
     if server.broker.is_internal(c.name) then
         conn:send(proto.encode_error(correl, proto.ERR_TOPIC_FORBIDDEN,
@@ -1228,7 +1602,21 @@ end
 -- LIST_GROUPS: every group this broker knows about, live or merely holding
 -- committed offsets. See GroupCoordinator:list for the cluster caveat.
 function M.list_groups(server, conn, correl, _payload)
-    conn:send(proto.encode_group_list(correl, server.coordinator:list()))
+    local groups = server.coordinator:list()
+
+    -- Filtered like LIST_TOPICS, and for the same reason: group names carry
+    -- as much organisational detail as topic names do.
+    if conn.principal then
+        local visible = {}
+        for _, g in ipairs(groups) do
+            if permitted(conn, acl_m.RES_GROUP, g.group_id, acl_m.OP_DESCRIBE) then
+                visible[#visible + 1] = g
+            end
+        end
+        groups = visible
+    end
+
+    conn:send(proto.encode_group_list(correl, groups))
 end
 
 -- DESCRIBE_GROUP: members, their assignments, and the group's durable
@@ -1240,6 +1628,10 @@ function M.describe_group(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
         return
     end
+
+    if not authorize(conn, correl, acl_m.RES_GROUP, c.group_id,
+                     acl_m.OP_DESCRIBE) then return end
+    if not charge(server, conn, correl, nil, quota_m.DIM_REQUESTS, 1) then return end
 
     local desc, derr = server.coordinator:describe(c.group_id)
     if not desc then
@@ -1259,6 +1651,9 @@ function M.delete_group(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, err))
         return
     end
+
+    if not authorize(conn, correl, acl_m.RES_GROUP, c.group_id,
+                     acl_m.OP_DELETE) then return end
 
     local n, derr, not_empty = server.coordinator:delete(c.group_id)
     if not n then
@@ -1287,6 +1682,18 @@ function M.join_group(server, conn, correl, payload)
             "join_group requires at least one topic"))
         return
     end
+    -- Joining is a read on the group AND on every topic being subscribed:
+    -- membership is what gets partitions assigned, so a principal that could
+    -- join a group for a topic it may not read would be handed that topic's
+    -- records by the assignment alone.
+    if not authorize(conn, correl, acl_m.RES_GROUP, j.group_id,
+                     acl_m.OP_READ) then return end
+    for _, topic in ipairs(j.topics) do
+        if not authorize(conn, correl, acl_m.RES_TOPIC, topic,
+                         acl_m.OP_READ) then return end
+    end
+    if not charge(server, conn, correl, nil, quota_m.DIM_REQUESTS, 1) then return end
+
     -- One group membership per connection: a connection already bound to a
     -- different group must LEAVE_GROUP (or reconnect) before joining another.
     if conn.group_id and conn.group_id ~= j.group_id then
@@ -1442,6 +1849,17 @@ function M.txn_offset_commit(server, conn, correl, payload)
         conn:send(proto.encode_error(correl, proto.ERR_BAD_FRAME, derr))
         return
     end
+    -- The consume half of consume-transform-produce: these offsets become the
+    -- group's durable position when the transaction commits, so they need the
+    -- same permissions an ordinary COMMIT would. (The produce half is gated on
+    -- each PRODUCE_IDEMPOTENT inside the transaction.)
+    if not authorize(conn, correl, acl_m.RES_GROUP, t.group,
+                     acl_m.OP_READ) then return end
+    for _, o in ipairs(t.offsets) do
+        if not authorize(conn, correl, acl_m.RES_TOPIC, o.topic,
+                         acl_m.OP_READ) then return end
+    end
+
     local ok, err, code = server.broker.transactions:add_offsets(
         conn.producer_name, conn.pid, conn.epoch, t.group, t.offsets)
     if not ok then
@@ -1460,6 +1878,8 @@ end
 M.BY_OP = {
     [proto.OP_HELLO]              = M.hello,
     [proto.OP_AUTH]               = M.auth,
+    [proto.OP_AUTH_SCRAM]         = M.auth_scram,
+    [proto.OP_AUTH_SCRAM_FINAL]   = M.auth_scram_final,
     [proto.OP_IDENTIFY_CLIENT]    = M.identify_client,
     [proto.OP_PRODUCE]            = M.produce,
     [proto.OP_PRODUCE_BATCH]      = M.produce_batch,

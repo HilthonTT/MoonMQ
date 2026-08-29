@@ -194,6 +194,16 @@ function Server.new(opts)
         "Processing failures reported by consumers via NACK.")
     metrics.describe("moonmq_dlq_records_total", "counter",
         "Records moved to a dead-letter topic.")
+    metrics.describe("moonmq_authz_denied_total", "counter",
+        "Requests refused by an ACL, labelled by resource and operation.")
+    metrics.describe("moonmq_quota_throttled_total", "counter",
+        "Requests refused or delayed by a quota, labelled by scope and dimension.")
+    metrics.describe("moonmq_auth_success_total", "counter",
+        "Successful authentications, labelled by mechanism.")
+    metrics.describe("moonmq_auth_failures_total", "counter",
+        "Failed authentications, labelled by mechanism.")
+    metrics.describe("moonmq_metrics_http_unauthorized_total", "counter",
+        "Metrics-endpoint requests refused for missing or bad credentials.")
 
     local reactor = Reactor.new({ fd_limit = opts.fd_limit })
 
@@ -338,6 +348,12 @@ function Server.new(opts)
 
         authenticator        = opts.authenticator,
         rate_limiter_factory = opts.rate_limiter_factory,
+        -- Per-user / per-topic quotas (src/server/quota.lua). nil disables
+        -- quota accounting entirely, which is the zero-config default.
+        quotas               = opts.quotas,
+        -- Credential/permission gate for the metrics listener. nil leaves
+        -- /metrics and /stats open, as they have always been.
+        metrics_auth         = opts.metrics_auth,
 
         group_commit_linger_s    = opts.group_commit_linger_s
                                    or DEFAULT_GROUP_COMMIT_LINGER_S,
@@ -625,6 +641,11 @@ function Server:start()
             host    = self.metrics_host,
             port    = self.metrics_port,
             server  = self,  -- powers /stats snapshot
+            -- { token = ..., basic = bool }; with an authenticator present,
+            -- Basic credentials are checked against the user store and the
+            -- principal must hold cluster:describe.
+            auth          = self.metrics_auth,
+            authenticator = self.authenticator,
         })
         mh:start()
     end

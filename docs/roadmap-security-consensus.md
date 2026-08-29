@@ -5,6 +5,18 @@ producer-state expiry, cross-broker transactional produce, and cluster-wide
 consumer groups. Both are implementable; neither is a bolt-on. This note
 records the integration points so the work can start without re-scoping.
 
+> **Update (2026-08-29).** The rest of the security backlog has shipped:
+> multiple users with ACLs, SCRAM-SHA-256, per-user/per-topic quotas, and
+> optional authentication on the metrics port — see [security.md](security.md).
+> That changes the TLS argument below in one way worth noting. SCRAM keeps
+> credentials off the wire, so the *password* is no longer exposed by a
+> plaintext deployment; **record payloads still are**, as is every topic and
+> group name. TLS remains the open item, and the plan below is unchanged by
+> the new code — the reactor readiness handling in step (2) is still the whole
+> difficulty. One addition: when TLS lands, SCRAM channel binding becomes
+> available, and `src/server/scram.lua` already validates the gs2 header and
+> the client-final `c=` field so a downgrade would be detectable.
+
 ## TLS (client protocol + inter-broker HTTP)
 
 **Status today:** everything is plaintext — the client TCP protocol, the

@@ -3,6 +3,11 @@ local proto = require("src.wire.protocol")
 local uuid = require("src.core.uuid")
 local msg_m = require("src.record.message")
 local dlq_env = require("src.record.dlq_envelope")
+-- SCRAM: the message grammar and the KDF, both shared with the broker so the
+-- two halves cannot drift. Neither pulls in server state.
+local scram = require("src.server.scram")
+local pbkdf2 = require("src.core.pbkdf2")
+local rng = require("src.core.rng")
 
 local DEFAULT_TIMEOUT = 30
 
@@ -94,21 +99,31 @@ function Client.new(opts)
  
     --  AUTH (skip if no username — server may be in OPEN mode)
     if opts.username then
-        local acorrel = uuid.bytes()
-        ok, err = c:_write(proto.encode_auth(acorrel,
-            opts.username, opts.password or ""))
-        if not ok then c:close(); return nil, "send auth: " .. err end
+        -- Two mechanisms. SCRAM (opts.mechanism = "scram-sha-256") never puts
+        -- the password on the wire and does the PBKDF2 here rather than on the
+        -- broker's single reactor thread — prefer it, especially until TLS
+        -- lands. The default stays "plain" so existing callers are unchanged.
+        local mechanism = tostring(opts.mechanism or "plain"):lower()
+        if mechanism == "scram" or mechanism == "scram-sha-256" then
+            local aerr = c:_auth_scram(opts.username, opts.password or "")
+            if aerr then c:close(); return nil, aerr end
+        else
+            local acorrel = uuid.bytes()
+            ok, err = c:_write(proto.encode_auth(acorrel,
+                opts.username, opts.password or ""))
+            if not ok then c:close(); return nil, "send auth: " .. err end
 
-        op, _, payload, rerr = c:_read_until(acorrel)
-        if not op then c:close(); return nil, "read auth_ok: " .. rerr end
-        if op == proto.OP_ERROR then
-            local e = proto.decode_error(payload)
-            c:close()
-            return nil, "auth: " .. (e and e.message or "?")
-        end
-        if op ~= proto.OP_AUTH_OK then
-            c:close()
-            return nil, string.format("expected AUTH_OK, got 0x%02x", op)
+            op, _, payload, rerr = c:_read_until(acorrel)
+            if not op then c:close(); return nil, "read auth_ok: " .. rerr end
+            if op == proto.OP_ERROR then
+                local e = proto.decode_error(payload)
+                c:close()
+                return nil, "auth: " .. (e and e.message or "?")
+            end
+            if op ~= proto.OP_AUTH_OK then
+                c:close()
+                return nil, string.format("expected AUTH_OK, got 0x%02x", op)
+            end
         end
     end
 
@@ -248,6 +263,70 @@ function Client:_read_until(target_correl)
         end
         -- Anything else (stray correl IDs, unexpected ops) — drop and continue.
     end
+end
+
+-- SCRAM-SHA-256 handshake, client half (RFC 5802; see src/server/scram.lua).
+-- Returns nil on success, or an error string.
+--
+-- The password never leaves this function: what goes on the wire is a proof
+-- computed from it. The PBKDF2 derivation happens HERE, which is the other
+-- half of the point — the broker runs one event loop for every connection, and
+-- a password login makes it do the expensive part on that thread.
+--
+-- The server-final signature is verified before returning. Skipping that check
+-- would authenticate this client to the server without authenticating the
+-- server to this client, which on a plaintext connection is most of what an
+-- attacker in the middle would want.
+function Client:_auth_scram(username, password)
+    local client_nonce = scram.nonce(rng.bytes)
+    local client_first, client_first_bare = scram.client_first(username, client_nonce)
+
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_auth_scram(correl, scram.MECHANISM, client_first))
+    if not ok then return "send scram client-first: " .. tostring(err) end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return "read scram challenge: " .. tostring(rerr) end
+    if op == proto.OP_ERROR then
+        local e = proto.decode_error(payload)
+        return "scram: " .. (e and e.message or "?")
+    end
+    if op ~= proto.OP_AUTH_CHALLENGE then
+        return string.format("expected AUTH_CHALLENGE, got 0x%02x", op)
+    end
+
+    local challenge, cerr = proto.decode_auth_challenge(payload)
+    if not challenge then return "scram challenge: " .. tostring(cerr) end
+
+    local server_first, serr = scram.parse_server_first(challenge.message, client_nonce)
+    if not server_first then return "scram: " .. serr end
+
+    local salted = pbkdf2.pbkdf2_hmac_sha256(password, server_first.salt,
+        server_first.iterations, 32)
+    local client_final, expected_signature = scram.client_final(
+        salted, client_first_bare, challenge.message, server_first.nonce)
+
+    local fcorrel = uuid.bytes()
+    ok, err = self:_write(proto.encode_auth_scram_final(fcorrel, client_final))
+    if not ok then return "send scram client-final: " .. tostring(err) end
+
+    op, _, payload, rerr = self:_read_until(fcorrel)
+    if not op then return "read auth_ok: " .. tostring(rerr) end
+    if op == proto.OP_ERROR then
+        local e = proto.decode_error(payload)
+        return "scram: " .. (e and e.message or "?")
+    end
+    if op ~= proto.OP_AUTH_OK then
+        return string.format("expected AUTH_OK, got 0x%02x", op)
+    end
+
+    local final, ferr = proto.decode_auth_ok(payload)
+    if not final then return "scram server-final: " .. tostring(ferr) end
+    local verified, verr = scram.verify_server_final(final.message, expected_signature)
+    if not verified then return "scram: " .. verr end
+
+    return nil
 end
 
 function Client:_decode_record(payload)

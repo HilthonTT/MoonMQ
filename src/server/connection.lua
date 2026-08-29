@@ -86,6 +86,16 @@ function Connection.new(server, sock, peer, ip)
 
         -- Application state (populated as handshake progresses)
         username = nil,
+        -- The authenticated principal: { username, acl, quota, superuser }.
+        -- Set by AUTH / AUTH_SCRAM and never changed afterwards; every
+        -- authorization decision on this connection reads it. nil means the
+        -- broker has no authenticator configured at all (OPEN mode), which is
+        -- the only case where handlers skip the ACL check.
+        principal = nil,
+        -- In-flight SCRAM exchange (username, nonce, salt, keys, the
+        -- client-first/server-first bytes the proof is computed over).
+        -- Discarded the moment the exchange ends, either way.
+        scram = nil,
         -- Set by the AUTH handler for the duration of the credential
         -- verification. The handshake watchdog waits it out rather than
         -- counting the broker's own PBKDF2 derivation against the peer.
@@ -160,12 +170,19 @@ function Connection:can_handle(op)
     elseif self.state == Connection.STATE_GREETED then
         return op == proto.OP_IDENTIFY_CLIENT
             or op == proto.OP_AUTH
+            or op == proto.OP_AUTH_SCRAM
+            or op == proto.OP_AUTH_SCRAM_FINAL
     elseif self.state == Connection.STATE_AUTHENTICATED then
         -- HELLO is one-shot; re-issuing it post-handshake is malformed. AUTH is
         -- likewise one-shot: re-authenticating on an already-authenticated
         -- connection would re-run the expensive inline PBKDF2 (a reactor-stall
-        -- amplifier) and let a session silently swap its username mid-stream.
-        return op ~= proto.OP_HELLO and op ~= proto.OP_AUTH
+        -- amplifier) and let a session silently swap its username — and with
+        -- it the ACL every later request is checked against — mid-stream. The
+        -- SCRAM frames are barred for the same reason.
+        return op ~= proto.OP_HELLO
+            and op ~= proto.OP_AUTH
+            and op ~= proto.OP_AUTH_SCRAM
+            and op ~= proto.OP_AUTH_SCRAM_FINAL
     end
 
     return false
