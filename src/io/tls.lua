@@ -119,12 +119,12 @@ local function build(block, where, mode)
     -- cert path and getting plaintext because a flag was missing is a trap.
     if field(block, "Enabled", "enabled") == false then return nil, nil end
 
-    if not M.available then
-        return nil, string.format(
-            "%s: TLS is configured but luasec is not installed "
-            .. "(luarocks install luasec)", where)
-    end
-
+    -- NB: no `M.available` check here. Validating a block is a pure function
+    -- of the block plus the files it names, and it stays that way so a host
+    -- without luasec still reports the REAL problem ("cannot read CertFile")
+    -- rather than masking every mistake behind the missing rock. Whether this
+    -- build can actually speak TLS is a separate question, asked by whoever
+    -- is about to open the socket — see M.require_available.
     local params = {
         mode     = mode,
         protocol = field(block, "Protocol", "protocol") or DEFAULT_PROTOCOL,
@@ -240,6 +240,23 @@ function M.client_config(block, where)
     return build(block, where or "Tls", "client")
 end
 
+-- Ask, at the point of use, whether this build can actually speak TLS.
+--
+-- Kept apart from the config functions on purpose: a config that fails to
+-- validate is the operator's mistake and should say so, while a missing rock
+-- is the machine's and should say *that*. Call this once a config has come
+-- back non-nil and you are about to bind or dial with it — a listener the
+-- operator asked to encrypt must refuse to start, never fall back to
+-- plaintext.
+--
+-- Returns true, or (nil, err).
+function M.require_available(where)
+    if M.available then return true end
+    return nil, string.format(
+        "%s: TLS is configured but luasec is not installed "
+        .. "(luarocks install luasec)", where or "Tls")
+end
+
 -- Wrap an already-connected socket. Does NOT handshake: that has to be driven
 -- by whoever owns the scheduler (Reactor:tls_handshake for the broker, a
 -- bounded blocking loop for the client), because a handshake can block in
@@ -275,40 +292,88 @@ function M.check_hostname(sock, host)
     if type(cert.validat) ~= "function" then return true end
     -- luasec exposes OpenSSL's own name matching via extensions/subject; the
     -- portable check here is setverifyext + a subject/SAN scan.
-    local names = {}
+    --
+    -- The three buckets are kept apart rather than concatenated, because RFC
+    -- 6125 matches each against a different kind of host: an IP literal only
+    -- ever against an iPAddress SAN, a name against dNSName, and the CN only
+    -- as a legacy fallback when there is no dNSName at all.
+    local dns_names, ip_names, common_names = {}, {}, {}
+
+    local function collect(into, value)
+        if type(value) == "string" then
+            into[#into + 1] = value
+        elseif type(value) == "table" then
+            for _, entry in ipairs(value) do into[#into + 1] = tostring(entry) end
+        end
+    end
+
     local ok_ext, extensions = pcall(cert.extensions, cert)
     if ok_ext and type(extensions) == "table" then
         local san = extensions["2.5.29.17"]   -- subjectAltName
         if type(san) == "table" then
-            for _, entry in pairs(san.dNSName or {}) do
-                names[#names + 1] = tostring(entry)
-            end
+            collect(dns_names, san.dNSName)
+            -- luasec renders these as text ("127.0.0.1", "::1"), which is the
+            -- form a peer address is configured in. Without this bucket a
+            -- broker reached by IP — how a cluster peer or a replica is
+            -- normally addressed — rejects its own correctly-issued
+            -- certificate, because an IP never appears as a dNSName.
+            collect(ip_names, san.iPAddress)
         end
     end
     local ok_sub, subject = pcall(cert.subject, cert)
     if ok_sub and type(subject) == "table" then
         for _, entry in ipairs(subject) do
             if entry.name == "commonName" or entry.oid == "2.5.4.3" then
-                names[#names + 1] = tostring(entry.value)
+                common_names[#common_names + 1] = tostring(entry.value)
             end
         end
     end
 
-    for _, name in ipairs(names) do
-        if name == host then return true end
-        -- One level of wildcard, the only form worth honouring: *.example.com
-        -- matches a.example.com but not a.b.example.com or example.com.
-        local suffix = name:match("^%*(%.[^%.]+%..+)$")
-        if suffix and #host > #suffix then
-            local head = host:sub(1, #host - #suffix)
-            if host:sub(-#suffix) == suffix and not head:find("%.") then
-                return true
+    -- IPv4 dotted quad, or anything with a colon (IPv6). A host that is an
+    -- address is never matched by a name or a wildcard: "*.example.com" must
+    -- not stand in for 10.0.0.1, and neither must a CN that happens to read
+    -- like one.
+    local is_ip = host:find(":", 1, true) ~= nil
+                  or host:match("^%d+%.%d+%.%d+%.%d+$") ~= nil
+
+    local candidates
+    if is_ip then
+        candidates = ip_names
+    elseif #dns_names > 0 then
+        candidates = dns_names
+    else
+        candidates = common_names
+    end
+
+    local target = host:lower()
+    for _, raw_name in ipairs(candidates) do
+        local name = raw_name:lower()
+        if name == target then return true end
+        if not is_ip then
+            -- One level of wildcard, the only form worth honouring:
+            -- *.example.com matches a.example.com but not a.b.example.com or
+            -- example.com.
+            local suffix = name:match("^%*(%.[^%.]+%..+)$")
+            if suffix and #target > #suffix then
+                local head = target:sub(1, #target - #suffix)
+                if target:sub(-#suffix) == suffix and not head:find("%.") then
+                    return true
+                end
             end
         end
     end
+
+    -- Report everything the certificate carries, not just the bucket that was
+    -- consulted: "presented: localhost" when you dialled an IP is the clue
+    -- that the certificate needs an IP SAN, and that is the whole point of
+    -- the message.
+    local presented = {}
+    for _, n in ipairs(dns_names)    do presented[#presented + 1] = n end
+    for _, n in ipairs(ip_names)     do presented[#presented + 1] = n end
+    for _, n in ipairs(common_names) do presented[#presented + 1] = n end
 
     return false, string.format("certificate is not valid for %q (presented: %s)",
-        host, #names > 0 and table.concat(names, ", ") or "no names")
+        host, #presented > 0 and table.concat(presented, ", ") or "no names")
 end
 
 -- Connect-side handshake for a caller with no event loop — the Lua client in
@@ -382,6 +447,19 @@ function M.http_create(params, timeout, host_override)
             return self.sock:settimeout(timeout)
         end
 
+        -- Defined BEFORE connect, not left to the forwarding loop below.
+        -- socket.http wraps everything from settimeout onwards in a finalizer
+        -- that calls close() on this object, so on a refused connection or a
+        -- failed handshake — the common case for an unreachable peer — the
+        -- forwarding loop has not run yet and close would be nil. That turns
+        -- "connection refused" into a raised "attempt to call a nil value
+        -- (method 'close')", and leaks the descriptor on the way out.
+        -- `self.sock` is rebound by connect, so this reaches the wrapped
+        -- socket once there is one.
+        function conn:close()
+            return self.sock:close()
+        end
+
         function conn:connect(host, port)
             local ok, err = self.sock:connect(host, port)
             if not ok then return nil, err end
@@ -404,8 +482,8 @@ function M.http_create(params, timeout, host_override)
             -- layer sees an ordinary connection from here on.
             local mt = getmetatable(self.sock).__index
             for name, method in pairs(mt) do
-                if type(method) == "function"
-                   and name ~= "connect" and name ~= "settimeout" then
+                if type(method) == "function" and name ~= "connect"
+                   and name ~= "settimeout" and name ~= "close" then
                     self[name] = function(s, ...) return method(s.sock, ...) end
                 end
             end

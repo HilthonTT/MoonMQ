@@ -206,6 +206,150 @@ describe("tls configuration", function()
         assert.is_truthy(tls_m.describe(cfg):find("TLS"))
         assert.is_truthy(tls_m.describe(cfg):find("verify=none"))
     end)
+
+    it("validates without needing luasec installed", function()
+        -- Validation is a pure function of the block and the files it names.
+        -- It has to stay that way: when it also gated on the rock, a host
+        -- without luasec answered every mistake with "luasec is not
+        -- installed" and the operator never learned that their CertFile path
+        -- was wrong. Whether the rock is present is a separate question, and
+        -- require_available is where it is asked.
+        local ok, err = tls_m.require_available("Server.Tls")
+        if tls_m.available then
+            assert.is_true(ok)
+            assert.is_nil(err)
+        else
+            assert.is_nil(ok)
+            assert.is_truthy(err:find("luasec"))
+            assert.is_truthy(err:find("Server.Tls"))
+        end
+
+        -- Either way the config layer reports the CONFIG problem.
+        local cfg, cerr = tls_m.server_config({ Enabled = true }, "Server.Tls")
+        assert.is_nil(cfg)
+        assert.is_truthy(cerr:find("CertFile and KeyFile"))
+    end)
+end)
+
+describe("tls hostname verification", function()
+    -- check_hostname is duck-typed over the certificate object, so these run
+    -- with or without luasec — and they are the only place the matching rules
+    -- are pinned. luasec validates the certificate CHAIN and stops there; if
+    -- this function is wrong, a certificate issued for any name the attacker
+    -- controls is accepted for ours.
+
+    local function fake_sock(dns, ips, cns)
+        local cert = {
+            validat    = function() return true end,
+            extensions = function()
+                return { ["2.5.29.17"] = { dNSName = dns, iPAddress = ips } }
+            end,
+            subject = function()
+                local out = {}
+                for _, cn in ipairs(cns or {}) do
+                    out[#out + 1] =
+                        { name = "commonName", oid = "2.5.4.3", value = cn }
+                end
+                return out
+            end,
+        }
+        return { getpeercertificate = function() return cert end }
+    end
+
+    local CASES = {
+        { "matches a dNSName SAN",
+          { "localhost" }, { "127.0.0.1" }, { "moonmq" }, "localhost", true },
+
+        -- The case that sent this back for a fix: a cluster peer or a replica
+        -- is addressed by IP far more often than by name, and an IP never
+        -- appears as a dNSName. Without the iPAddress bucket a broker
+        -- rejected its own correctly-issued certificate.
+        { "matches an iPAddress SAN when dialled by IP",
+          { "localhost" }, { "127.0.0.1" }, { "moonmq" }, "127.0.0.1", true },
+        { "matches an IPv6 SAN",
+          {}, { "::1" }, {}, "::1", true },
+
+        { "rejects an IP that is not in the SAN",
+          { "localhost" }, { "127.0.0.1" }, {}, "10.0.0.1", false },
+        { "rejects a name that is not in the SAN",
+          { "localhost" }, { "127.0.0.1" }, {}, "evil.example.com", false },
+        { "never matches an IP against a dNSName",
+          { "localhost" }, {}, {}, "127.0.0.1", false },
+
+        -- RFC 6125: the CN is a legacy fallback, consulted only when the
+        -- certificate carries no dNSName at all.
+        { "ignores the CN when a dNSName SAN is present",
+          { "localhost" }, {}, { "moonmq" }, "moonmq", false },
+        { "falls back to the CN when there is no SAN",
+          {}, {}, { "broker.example.com" }, "broker.example.com", true },
+
+        { "honours a one-label wildcard",
+          { "*.example.com" }, {}, {}, "a.example.com", true },
+        { "does not let a wildcard span a dot",
+          { "*.example.com" }, {}, {}, "a.b.example.com", false },
+        { "does not let a wildcard match the bare domain",
+          { "*.example.com" }, {}, {}, "example.com", false },
+        { "never lets a wildcard match an IP",
+          { "*" }, {}, {}, "10.0.0.1", false },
+
+        { "matches names case-insensitively",
+          { "LOCALHOST" }, {}, {}, "localhost", true },
+    }
+
+    for _, case in ipairs(CASES) do
+        local label, dns, ips, cns, host, want = table.unpack(case, 1, 6)
+        it(label, function()
+            local ok, err = tls_m.check_hostname(fake_sock(dns, ips, cns), host)
+            if want then
+                assert.is_truthy(ok, err)
+            else
+                assert.is_falsy(ok)
+                assert.is_truthy(err)
+                assert.is_truthy(err:find(host, 1, true),
+                    "the error names the host that was dialled")
+            end
+        end)
+    end
+
+    it("refuses a peer that presents no certificate at all", function()
+        local sock = { getpeercertificate = function() return nil end }
+        local ok, err = tls_m.check_hostname(sock, "localhost")
+        assert.is_falsy(ok)
+        assert.is_truthy(err:find("no certificate"))
+    end)
+end)
+
+describe("tls http_create", function()
+    it("can be closed before connect succeeds", function()
+        -- socket.http wraps everything from settimeout onwards in a finalizer
+        -- that calls close() on this object. When close was only installed by
+        -- the method-forwarding loop that runs AFTER a successful connect, a
+        -- refused peer — the single most common outcome on an inter-broker
+        -- link — raised "attempt to call a nil value (method 'close')" from
+        -- inside luasocket instead of returning "connection refused", and
+        -- leaked the descriptor.
+        local conn = tls_m.http_create({ mode = "client" }, 1, "127.0.0.1")()
+        assert.is_truthy(conn)
+        assert.are.equal("function", type(conn.close))
+        assert.are.equal("function", type(conn.connect))
+        assert.is_truthy(conn:close())
+    end)
+
+    it("reports a refused connection instead of raising", function()
+        local http  = require("socket.http")
+        local ltn12 = require("ltn12")
+        local cfg = assert(tls_m.client_config({ Insecure = true }, "T"))
+
+        -- Port 1 on loopback: nothing is listening, so connect() fails at once.
+        local ok, res, err = pcall(http.request, {
+            url    = "https://127.0.0.1:1/cluster/ping",
+            create = tls_m.http_create(cfg.params, 2, "127.0.0.1"),
+            sink   = ltn12.sink.table({}),
+        })
+        assert.is_true(ok, "an unreachable peer must not raise: " .. tostring(res))
+        assert.is_nil(res)
+        assert.is_truthy(err)
+    end)
 end)
 
 describe("tls over the reactor", function()

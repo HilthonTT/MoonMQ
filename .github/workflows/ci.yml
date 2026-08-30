@@ -60,6 +60,10 @@ jobs:
           sudo luarocks-5.4 install lua-zlib
           sudo luarocks-5.4 install luaposix
           sudo luarocks-5.4 install luaossl
+          # luasec: without it every TLS connection spec degrades to `pending`
+          # and only the config half runs, which is how a listener-side
+          # handshake regression would reach main unnoticed.
+          sudo luarocks-5.4 install luasec
           sudo luarocks-5.4 install luacheck
 
       - name: Verify toolchain targets Lua 5.4
@@ -89,6 +93,8 @@ jobs:
               "fs backend is " .. fs.backend .. ", expected posix (luaposix missing?)")
             assert(auth.kdf_backend() == "openssl",
               "PBKDF2 backend is " .. auth.kdf_backend() .. ", expected openssl (luaossl missing?)")
+            assert(require("src.io.tls").available,
+              "TLS is unavailable (luasec missing?) - the connection specs would silently skip")
             local crc32 = require("src.core.crc32")
             local blob, t0 = ("moonmq"):rep(700000), os.clock()
             crc32(blob)

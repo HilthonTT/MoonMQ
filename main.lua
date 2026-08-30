@@ -151,6 +151,17 @@ local function build_tls(block, where, mode)
         client_cfg = cfg
     end
 
+    -- The block validated, but a broker built without luasec cannot honour
+    -- it. Same fatal treatment: the alternative is a port the operator
+    -- believes is encrypted and isn't.
+    if server_cfg or client_cfg then
+        local ok, err = tls_m.require_available(where)
+        if not ok then
+            log:error("%s", err)
+            os.exit(1)
+        end
+    end
+
     return server_cfg, client_cfg
 end
 

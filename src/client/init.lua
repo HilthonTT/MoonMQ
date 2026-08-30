@@ -49,6 +49,11 @@ function Client.new(opts)
             sock:close()
             return nil, terr or "tls: nothing configured"
         end
+        local ok, aerr = tls_m.require_available("client tls")
+        if not ok then
+            sock:close()
+            return nil, aerr
+        end
         sock:settimeout(opts.timeout or DEFAULT_TIMEOUT)
         local secured, herr = tls_m.connect_handshake(
             sock, cfg, host, opts.timeout or DEFAULT_TIMEOUT)
