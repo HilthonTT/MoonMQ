@@ -3,19 +3,6 @@ local Action = require("src.autobalancer.common.action")
 
 local ActionType = Action.ActionType
 
--- Balances one resource's load evenly across brokers, mirroring AutoMQ's
--- AbstractResourceUsageDistributionGoal. The acceptable band is
--- mean * (1 ± avg_deviation); a broker above the upper bound sheds its hottest
--- replicas onto brokers that are below the mean and have headroom, until it is
--- back inside the band. Subclasses just fix `resource` and the thresholds.
---
--- Fields (set by subclass / config):
---   resource        Resource.* this goal balances
---   detect_threshold  minimum cluster mean load before the goal acts (an idle
---                     cluster isn't worth reassigning)
---   avg_deviation   half-width of the acceptable band, as a fraction of mean
---   trusted_only    skip replicas whose sample series isn't trusted yet
---   max_actions     optional cap on actions produced per optimize() pass
 local G = Goal.derive({})
 
 function G.new(fields)
@@ -27,8 +14,6 @@ function G.new(fields)
     return setmetatable(self, G)
 end
 
--- mean and population standard deviation of the resource load across active
--- brokers. Exposed for the detector's metrics/logging.
 function G:distribution_stats(cluster)
     local ids = cluster:active_broker_ids()
     if #ids == 0 then return 0, 0 end
@@ -43,9 +28,6 @@ function G:distribution_stats(cluster)
     return mean, math.sqrt(sq / #ids)
 end
 
--- Candidate destinations for a replica of load `rep_load`, coldest first: a
--- broker below the mean that won't blow past the upper bound once it takes the
--- replica. Ordering coldest-first spreads load toward the emptiest brokers.
 function G:_candidate_dests(cluster, ids, src, rep_load, mean, upper)
     local cands = {}
     for _, id in ipairs(ids) do
@@ -72,7 +54,6 @@ function G:optimize(cluster, goals_by_priority)
 
     local upper = mean * (1 + self.avg_deviation)
 
-    -- Overloaded brokers, hottest first.
     local over = {}
     for _, id in ipairs(ids) do
         if bload(id) > upper then over[#over + 1] = id end
@@ -80,8 +61,6 @@ function G:optimize(cluster, goals_by_priority)
     table.sort(over, function(a, b) return bload(a) > bload(b) end)
 
     for _, src in ipairs(over) do
-        -- Shed the biggest contributors first; recompute the replica list each
-        -- time we enter a src since previous moves changed placement.
         local reps = cluster:replicas_of(src)
         table.sort(reps, function(a, b)
             return a:get_load(self.resource) > b:get_load(self.resource)
@@ -111,6 +90,25 @@ function G:optimize(cluster, goals_by_priority)
     end
 
     return actions
+end
+
+function G.define(spec)
+    return {
+        new = function(opts)
+            opts = opts or {}
+            return G.new({
+                name             = spec.name,
+                resource         = spec.resource,
+                priority         = opts.priority or spec.priority,
+                weight           = opts.weight or 1.0,
+                is_hard          = false,
+                detect_threshold = opts.detect_threshold or spec.detect_threshold,
+                avg_deviation    = opts.avg_deviation or spec.avg_deviation,
+                trusted_only     = spec.trusted_only and (opts.trusted_only ~= false) or false,
+                max_actions      = opts.max_actions,
+            })
+        end,
+    }
 end
 
 return G

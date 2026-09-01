@@ -57,14 +57,11 @@ describe("serialize_message", function()
         assert.is_nil(err)
         assert.is_string(bytes)
 
-        -- payload size = #key + #value = 2 + 4 = 6
-        -- total (excluding length prefix) = 13 + 4 + 6 + 4 = 27
         assert.are.equal(8 + 27, #bytes)
 
         local total = string.unpack(">I8", bytes, 1)
         assert.are.equal(27, total)
 
-        -- header = attrs(1) | k_size(4) | ts(8), starting at byte 9.
         local attrs = string.unpack(">B", bytes, 9)
         assert.are.equal(0, attrs)
 
@@ -98,7 +95,6 @@ describe("serialize_message", function()
         local attrs = message_m.CODEC_SNAPPY | message_m.ATTR_CONTROL
         local m = Message.new("k", "v", 5, attrs)
         local bytes = serialize(m)
-        -- Strip the 8-byte length prefix and decode the body.
         local decoded, derr = message_m.decode_body(bytes:sub(9))
         assert.is_nil(derr)
         assert.are.equal("k", decoded.key)
@@ -112,7 +108,6 @@ describe("serialize_message", function()
         local m = Message.new("k", "value", 5)
         local bytes = serialize(m)
         local body = bytes:sub(9)
-        -- Flip a byte in the payload region (last payload byte before its CRC).
         local i = #body - 4
         local corrupted = body:sub(1, i - 1)
             .. string.char((body:byte(i) ~ 0xFF) & 0xFF)

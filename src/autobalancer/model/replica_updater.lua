@@ -1,10 +1,6 @@
 local Resource         = require("src.autobalancer.common.resource")
 local WindowedSamples  = require("src.autobalancer.model.sample.windowed_samples")
 
--- Replica is the immutable, per-detection view of one topic-partition on one
--- broker: a bag of resource loads that goals read and that ClusterModelSnapshot
--- shuffles between brokers when it applies an Action. It carries the real Topic
--- object (Action.new requires it) plus the partition id.
 local Replica = {}
 Replica.__index = Replica
 
@@ -13,8 +9,8 @@ function Replica.new(topic, partition, broker_id, loads, trusted)
         topic     = topic,
         partition = partition,
         broker_id = broker_id,
-        loads     = loads,     -- resource -> number
-        trusted   = trusted,   -- resource -> bool
+        loads     = loads,
+        trusted   = trusted,
     }, Replica)
 end
 
@@ -34,8 +30,6 @@ function Replica:key()
     return self.topic.name .. "-" .. tostring(self.partition)
 end
 
--- ReplicaUpdater is the live side: it accumulates metric samples over time and
--- freezes them into a Replica on demand.
 local ReplicaUpdater = {}
 ReplicaUpdater.__index = ReplicaUpdater
 
@@ -48,7 +42,7 @@ function ReplicaUpdater.new(topic, partition, broker_id, opts)
         partition = partition,
         broker_id = broker_id,
         opts      = opts or {},
-        samples   = {},   -- resource -> WindowedSamples
+        samples   = {},
     }, ReplicaUpdater)
 end
 
@@ -61,16 +55,12 @@ function ReplicaUpdater:_series(resource)
     return s
 end
 
--- Record one measurement for a measured resource (NW_IN/NW_OUT/DISK).
 function ReplicaUpdater:update(resource, value)
     assert(Resource.is_measured(resource),
         "only measured resources are sampled; PARTITION_COUNT is synthesized")
     self:_series(resource):append(value)
 end
 
--- Freeze into a Replica. percentile selects the smoothing point (e.g. 0.9).
--- PARTITION_COUNT is synthesized to 1 (always trusted); measured resources take
--- the window percentile and inherit the series' trusted flag.
 function ReplicaUpdater:snapshot(percentile)
     local loads, trusted = {}, {}
     for _, r in ipairs(Resource.VALUES) do

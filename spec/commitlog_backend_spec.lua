@@ -1,6 +1,3 @@
--- Integration test: a topic backed by the commitlog storage backend, exercised
--- through the same Broker / Producer / Consumer path the server uses.
-
 local broker_m = require("src.broker")
 local prd_m    = require("src.broker.producer")
 local cons_m   = require("src.broker.consumer")
@@ -46,7 +43,6 @@ describe("commitlog storage backend", function()
         assert.is_nil(err)
 
         local p = b.topic_manager.topics["ct"].partitions[1]
-        -- The adapter exposes the live CommitLog; the default backend would not.
         assert.is_not_nil(p.commitlog)
         assert.are.equal(0, p.offset)
         close_broker(b)
@@ -62,7 +58,7 @@ describe("commitlog storage backend", function()
                 producer:produce("ct", message.Message.new("k", "v" .. i, 1000 + i))
             assert.is_nil(err)
             assert.are.equal(1, part_id)
-            assert.are.equal(i - 1, offset)  -- 0,1,2
+            assert.are.equal(i - 1, offset)
         end
 
         local consumer = cons_m.Consumer.new(b, "g1")
@@ -90,13 +86,11 @@ describe("commitlog storage backend", function()
         end
         close_broker(b1)
 
-        -- Sidecar recorded the backend.
         local cfg = io.open(fs_m.join_path(BASE_DIR, "ct", "topic.config"), "rb")
         assert.is_not_nil(cfg)
         local body = cfg:read("*a"); cfg:close()
         assert.is_not_nil(body:find("backend=commitlog", 1, true))
 
-        -- Reopen: the topic comes back as a commitlog backend with its data.
         local b2 = assert(broker_m.Broker.new(BASE_DIR))
         local p = b2.topic_manager.topics["ct"].partitions[1]
         assert.is_not_nil(p.commitlog)
@@ -113,7 +107,7 @@ describe("commitlog storage backend", function()
 
     it("honours a broker-wide default_backend", function()
         local b = assert(broker_m.Broker.new(BASE_DIR, { default_backend = "commitlog" }))
-        assert(b:create_topic("ct", 2))  -- no per-topic backend opt
+        assert(b:create_topic("ct", 2))
         for _, p in ipairs(b.topic_manager.topics["ct"].partitions) do
             assert.is_not_nil(p.commitlog)
         end
@@ -124,8 +118,8 @@ describe("commitlog storage backend", function()
         local b = assert(broker_m.Broker.new(BASE_DIR))
         assert(b:create_topic("seg", 1))
         local p = b.topic_manager.topics["seg"].partitions[1]
-        assert.is_nil(p.commitlog)              -- not a commitlog adapter
-        assert.is_not_nil(p.active_segment)     -- it's a SegmentedPartition
+        assert.is_nil(p.commitlog)
+        assert.is_not_nil(p.active_segment)
         close_broker(b)
     end)
 end)

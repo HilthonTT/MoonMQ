@@ -1,6 +1,3 @@
--- Regression tests for the defects fixed in this pass. Each names the
--- bug it guards against so a refactor that reintroduces it fails loudly here.
-
 local proto     = require("src.wire.protocol")
 local message   = require("src.record.message")
 local uuid      = require("src.core.uuid")
@@ -23,9 +20,6 @@ local function rmdir(path)
     end
 end
 
--- A socket that yields at most `drip` bytes per receive() and reports the
--- rest as a "timeout" with a partial -- exactly luasocket's behaviour when a
--- frame straddles the short poll window Client:next_record installs.
 local function dripping_sock(stream, drip)
     return {
         pos = 1,
@@ -48,15 +42,12 @@ describe("client frame reassembly", function()
     it("reassembles a frame delivered in short reads instead of desyncing", function()
         local frame = proto.encode_record(uuid.ZERO, "orders", 2, 7, 0, "k", "payload-value")
         local c = setmetatable({ closed = false, timeout = 1, next_seq = {} }, Client)
-        c.sock = dripping_sock(frame, 5)   -- straddles every single read
+        c.sock = dripping_sock(frame, 5)
 
         local op, _, payload
         for _ = 1, 100 do
             local o, _c, p, err = c:_read_frame()
             if o then op, payload = o, p break end
-            -- The only legal failure while the frame is still arriving is a
-            -- timeout. A framing error means bytes were dropped and the
-            -- stream desynced (the bug this guards).
             assert.are.equal("timeout", err)
         end
 
@@ -72,8 +63,6 @@ describe("client frame reassembly", function()
     it("keeps the length prefix and body phases separate across timeouts", function()
         local frame = proto.encode_record(uuid.ZERO, "t", 1, 0, 0, "", "x")
         local c = setmetatable({ closed = false, timeout = 1, next_seq = {} }, Client)
-        -- 3 bytes at a time: the very first read cannot even finish the
-        -- 4-byte length prefix.
         c.sock = dripping_sock(frame, 3)
 
         local op
@@ -93,9 +82,6 @@ describe("segment_verify length-prefix bounds", function()
         os.execute(string.format("mkdir -p '%s'", BASE_DIR))
         local path = BASE_DIR .. "/corrupt.log"
         local f = assert(io.open(path, "wb"))
-        -- current + HEADER_SIZE + total_size used to wrap to a negative Lua
-        -- integer here, sneaking past the "> file_size" guard and driving a
-        -- ~9 exabyte f:read() that raised "not enough memory".
         f:write(string.pack(">I8", math.maxinteger))
         f:write(string.rep("x", 40))
         f:close()
@@ -117,10 +103,6 @@ describe("reserved internal topic prefix", function()
 
     it("hides __ topics from list_topics, so the cap must reject them up front", function()
         local b = assert(brk.Broker.new(BASE_DIR))
-        -- The CREATE_TOPIC handler counts list_topics() against max_topics.
-        -- Internal topics are excluded from that count by design, which is
-        -- why the handler now refuses the "__" prefix outright: without the
-        -- refusal a client could create unbounded uncounted topics.
         assert.are.equal(0, #b:list_topics())
         assert(b:create_topic("__uncounted", 1))
         assert.are.equal(0, #b:list_topics())
@@ -157,8 +139,6 @@ describe("commitlog build_index length-prefix bounds", function()
 
     it("treats a near-2^63 length prefix as a torn tail and trims it", function()
         os.execute(string.format("mkdir -p '%s'", BASE_DIR))
-        -- One good record, then a corrupt prefix whose
-        -- `position + 8 + total_size` wraps to a negative Lua integer.
         local good = assert(message.serialize_message(
             message.Message.new("k", "v", 1)))
         local f = assert(io.open(BASE_DIR .. "/00000000000000000000.log", "wb"))
@@ -171,8 +151,6 @@ describe("commitlog build_index length-prefix bounds", function()
         assert.is_true(ok)
         assert.is_nil(err)
         assert.is_not_nil(seg)
-        -- The good record survived; everything from the corrupt prefix on was
-        -- trimmed, so the segment stays appendable.
         assert.are.equal(1, seg.next_offset - seg.base_offset)
         assert.are.equal(#good, seg.position)
         local msg = seg:read_at(0)
@@ -195,7 +173,7 @@ describe("abort index epoch handling", function()
     it("collapses a duplicate add instead of growing the file", function()
         local ix = new_index()
         assert(ix:add("orders", 1, 7, 0, 10, 20))
-        assert(ix:add("orders", 1, 7, 0, 10, 20))   -- recovery retry
+        assert(ix:add("orders", 1, 7, 0, 10, 20))
         assert(ix:add("orders", 1, 7, 0, 10, 20))
         assert.are.equal(1, #ix:entries("orders", 1))
     end)
@@ -211,10 +189,6 @@ describe("abort index epoch handling", function()
         assert(ix:add("orders", 1, 7, 0, 10, 20))
         assert.is_true(ix:is_aborted("orders", 1, 7, 0, 15))
 
-        -- Rewrite the sidecar with epoch as a JSON string, as a hand-edit or a
-        -- forward-version writer might. Untyped, this loaded a string epoch
-        -- that never compared equal to the number is_aborted is called with,
-        -- silently un-filtering every aborted record in the partition.
         local json = require("dkjson")
         local p = BASE_DIR .. "/" .. AbortIndex.FILE_NAME
         local fh = assert(io.open(p, "wb"))
@@ -243,8 +217,6 @@ describe("replica_server record bounds", function()
     it("still accepts a well-formed record body", function()
         local good = assert(message.serialize_message(
             message.Message.new("k", "v", 1)))
-        -- No broker wired in, so it must get PAST the framing check and fail
-        -- on topic lookup instead -- proving the bound didn't reject it.
         local _, err = replica_srv._apply(
             { broker = { get_topic = function() return nil, "nope" end } },
             "t", 1, good)

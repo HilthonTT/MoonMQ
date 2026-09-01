@@ -1,6 +1,7 @@
 local brk_m       = require("src.broker")
 local prodstate_m = require("src.storage.producer_state")
 local os_utils    = require("src.core.os")
+local time_m      = require("src.core.time")
 
 local BASE_DIR = os_utils.IS_WINDOWS and "C:\\Temp\\moonmq_prodstate_test"
                                       or "/tmp/moonmq_prodstate_test"
@@ -13,7 +14,6 @@ local function rmdir(path)
     end
 end
 
--- Flush the internal producer-state topic so a rebuilt broker sees the writes.
 local function flush(broker)
     for _, p in ipairs(broker.topic_manager.topics[prodstate_m.STATE_TOPIC].partitions) do
         if p.sync then p:sync() end
@@ -53,7 +53,6 @@ describe("durable producer state", function()
         local named = assert(ps:get_or_create_producer("n"))
         assert.are_not.equal(a, named)
         assert.are_not.equal(b, named)
-        -- Ephemeral pids are not durable identities.
         assert.is_nil(ps:current_epoch(a))
     end)
 
@@ -65,7 +64,6 @@ describe("durable producer state", function()
             local pid, epoch = assert(ps:get_or_create_producer("payments"))
             pid_before = pid
             assert.are.equal(0, epoch)
-            -- Record a produced sequence memo (pid, topic) -> seq/offset/partition.
             assert(ps:record_produce(pid, "payments", 2, 4096, 3))
             flush(broker)
         end
@@ -73,20 +71,16 @@ describe("durable producer state", function()
         local broker2 = assert(brk_m.Broker.new(BASE_DIR))
         local ps2 = broker2.producer_state
 
-        -- Reconnect with the same name: same pid, epoch bumped to 1.
         local pid2, epoch2 = assert(ps2:get_or_create_producer("payments"))
         assert.are.equal(pid_before, pid2)
         assert.are.equal(1, epoch2)
 
-        -- The seq memo replayed, so an idempotent retry of seq 2 replays the
-        -- original ack instead of appending a duplicate.
         local memo = ps2:lookup_memo(pid_before, "payments")
         assert.is_not_nil(memo)
         assert.are.equal(2, memo.last_seq)
         assert.are.equal(4096, memo.last_offset)
         assert.are.equal(3, memo.last_partition)
 
-        -- next_pid advanced past the persisted max so a new name gets a fresh pid.
         local other = assert(ps2:get_or_create_producer("other"))
         assert.are_not.equal(pid_before, other)
     end)
@@ -99,8 +93,7 @@ describe("durable producer state", function()
             pid = assert(ps:get_or_create_producer("stale-writer"))
             assert(ps:record_produce(pid, "t", 0, 10, 1))
 
-            -- One day + 1ms in the future: past the idle threshold.
-            local future = os.time() * 1000 + 86400 * 1000 + 1
+            local future = time_m.now_ms() + 86400 * 1000 + 1
             local n = assert(ps:expire_idle(86400 * 1000, { now_ms = future }))
             assert.are.equal(1, n)
             assert.is_nil(ps:pid_for("stale-writer"))
@@ -109,14 +102,11 @@ describe("durable producer state", function()
             flush(broker)
         end
 
-        -- The tombstones replay: a rebuilt broker doesn't resurrect the state.
         local broker2 = assert(brk_m.Broker.new(BASE_DIR))
         local ps2 = broker2.producer_state
         assert.is_nil(ps2:pid_for("stale-writer"))
         assert.is_nil(ps2:lookup_memo(pid, "t"))
 
-        -- Allocator watermark: the expired pid is never re-issued, even though
-        -- its identity record (the old max pid) is gone from the log.
         local fresh = assert(ps2:get_or_create_producer("new-writer"))
         assert.is_true(fresh > pid)
     end)
@@ -126,13 +116,11 @@ describe("durable producer state", function()
         local ps = broker.producer_state
         local pid = assert(ps:get_or_create_producer("busy"))
 
-        -- Not idle long enough: untouched.
-        local soon = os.time() * 1000 + 1000
+        local soon = time_m.now_ms() + 1000
         assert.are.equal(0, (assert(ps:expire_idle(86400 * 1000, { now_ms = soon }))))
         assert.are.equal(pid, ps:pid_for("busy"))
 
-        -- Idle long enough but vetoed by is_active (live connection / open txn).
-        local future = os.time() * 1000 + 2 * 86400 * 1000
+        local future = time_m.now_ms() + 2 * 86400 * 1000
         local n = assert(ps:expire_idle(86400 * 1000, {
             now_ms = future,
             is_active = function(name) return name == "busy" end,
@@ -147,11 +135,10 @@ describe("durable producer state", function()
         local pid, epoch = assert(ps:get_or_create_producer("txn-writer"))
         assert(broker.transactions:begin("txn-writer", pid, epoch))
 
-        local future = os.time() * 1000 + 2 * 86400 * 1000
+        local future = time_m.now_ms() + 2 * 86400 * 1000
         local n = assert(broker:expire_idle_producers(86400 * 1000, { now_ms = future }))
         assert.are.equal(0, n, "ongoing transaction must veto expiry")
 
-        -- Once the txn resolves, the same sweep expires it.
         assert(broker.transactions:end_txn("txn-writer", pid, epoch, true))
         n = assert(broker:expire_idle_producers(86400 * 1000, { now_ms = future }))
         assert.are.equal(1, n)

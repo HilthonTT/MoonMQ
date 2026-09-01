@@ -1,102 +1,34 @@
--- ProducerStateManager — durable producer identities + idempotent-produce
--- sequence memos, stored in an internal topic exactly like OffsetManager
--- (see src/storage/offset_manager.lua for the pattern this mirrors).
---
--- Two things are persisted, both as ordinary compacted records in the internal
--- __producer_state topic (commitlog backend, so latest-per-key wins):
---
---   1. Identity: producer_name -> (pid, epoch). A *named* (a.k.a. durable /
---      transactional) producer keeps the SAME pid across reconnects and broker
---      restarts; each new session bumps the epoch so a zombie old session is
---      fenced (its stale-epoch writes are rejected).
---   2. Sequence memo: (pid, topic) -> (last_seq, last_offset, last_partition),
---      so an idempotent retry that arrives after a reconnect/restart replays the
---      original ack instead of appending a duplicate.
---
--- Ephemeral (unnamed) producers keep today's session-scoped behaviour: they get
--- a pid from the same durable allocator (so pids never repeat across a restart)
--- but NOTHING is persisted — their sequence state lives on the connection.
---
--- Records land in a partition chosen by hash(key) % N, so every record with a
--- given key stays append-ordered within one partition, which is what makes
--- "latest wins" correct on replay.
-
 local msg_m = require("src.record.message")
 local log   = require("src.log.logger").get("producer_state")
+local hash_m = require("src.core.hash")
+local time_m = require("src.core.time")
 
 local STATE_TOPIC = "__producer_state"
 local DEFAULT_PARTITIONS = 16
 
--- Must run on the commitlog backend for the same reason as __consumer_offsets:
--- it's the only backend that key-compacts, so the log stays bounded and a quiet
--- producer never loses its latest state to time-based retention.
 local STATE_BACKEND          = "commitlog"
 local STATE_MAX_SEGMENT_SIZE = 8 * 1024 * 1024
 
--- Record key type tags (first byte of the record key).
-local K_IDENTITY = "\1"   -- "\1" .. producer_name
-local K_MEMO     = "\2"   -- "\2" .. u64 pid .. topic
--- Allocator watermark: a single fixed-key record holding next_pid. Only
--- written when expiry tombstones producer records — without it, deleting the
--- highest pid's identity would let a restart re-issue that pid to a NEW
--- producer while a zombie of the old one still holds it (epoch fencing can't
--- tell them apart: both start their epoch history at 0).
+local K_IDENTITY = "\1"
+local K_MEMO     = "\2"
 local K_ALLOC    = "\3"
 local ALLOC_KEY  = K_ALLOC .. "next_pid"
 local ALLOC_VALUE_FMT = ">I8"
 
--- A zero-length value is a tombstone: the key's prior record is dead. The
--- commitlog compactor drops tombstones (and everything they superseded) on
--- its next pass, so expired producer state actually leaves the disk.
 local TOMBSTONE = ""
 
-local IDENTITY_VALUE_FMT = ">I8I2"        -- pid, epoch
--- Memo carries the epoch that wrote it: dedup state is only valid within the
--- SAME producer session. A reconnect bumps the epoch and the client restarts
--- its sequences at 0 (Kafka KIP-360 semantics); without the epoch scope, the
--- new session's seq 0 would collide with the old session's memo and be
--- swallowed as a "retry" — silently losing the record.
-local MEMO_VALUE_FMT     = ">I4I8I4I2"    -- last_seq, last_offset, last_partition, epoch
-local MEMO_VALUE_FMT_V1  = ">I4I8I4"      -- pre-epoch memos (read-compat only)
+local IDENTITY_VALUE_FMT = ">I8I2"
+local MEMO_VALUE_FMT     = ">I4I8I4I2"
+local MEMO_VALUE_FMT_V1  = ">I4I8I4"
 
--- A memo written by PRODUCE_BATCH appends a tail to the v2 value:
---
---   <v2 value> | u32 base_seq | u32 count | (u32 partition | u64 offset)*
---
--- One record's ack is not enough to answer a duplicate BATCH: a batch spans
--- partitions and offsets are opaque per-backend cursors (on the segmented
--- backend they are byte positions), so offsets cannot be reconstructed from a
--- base. The acks are therefore stored verbatim.
---
--- The tail is strictly additive: string.unpack ignores trailing bytes, so a
--- reader that only knows v2 still parses last_seq/last_offset/last_partition/
--- epoch out of a v3 value exactly as before. Single-record produces keep
--- writing plain v2 values (no tail), which is what makes an interleaving of
--- batch and single produces on one (pid, topic) work without special cases.
-local MEMO_BATCH_HDR_FMT = ">I4I4"        -- base_seq, count
-local MEMO_ACK_FMT       = ">I4I8"        -- partition, offset
--- Matches proto.MAX_IDEMPOTENT_BATCH. Duplicated rather than required so the
--- storage layer keeps no dependency on the wire module; the decoder uses it
--- only to refuse an implausible count from a corrupt record.
+local MEMO_BATCH_HDR_FMT = ">I4I4"
+local MEMO_ACK_FMT       = ">I4I8"
 local MAX_MEMO_ACKS      = 1024
 
--- The identity epoch packs as u16; the 65,536th session of one name would
--- overflow string.pack mid-write. Fail the INIT instead (fresh name = fresh pid).
 local MAX_EPOCH = 0xFFFF
 
 local ProducerStateManager = {}
 ProducerStateManager.__index = ProducerStateManager
-
--- FNV-1a (32-bit), identical to OffsetManager's — deterministic across
--- restarts/platforms so a key never moves partitions between runs.
-local function fnv1a(s)
-    local hash = 2166136261
-    for i = 1, #s do
-        hash = (hash ~ s:byte(i)) & 0xFFFFFFFF
-        hash = (hash * 16777619) & 0xFFFFFFFF
-    end
-    return hash
-end
 
 function ProducerStateManager.new(topic_manager, opts)
     assert(type(topic_manager) == "table", "topic_manager must be a TopicManager")
@@ -121,11 +53,11 @@ function ProducerStateManager.new(topic_manager, opts)
     local self = setmetatable({
         topic       = topic,
         nparts      = #topic.partitions,
-        by_name     = {},   -- producer_name -> { pid=, epoch= }
-        epoch_by_pid= {},   -- pid -> current epoch (fencing)
-        memo        = {},   -- pid -> topic -> { last_seq, last_offset, last_partition }
-        last_active = {},   -- pid -> ms of last identity/memo write (expiry input)
-        next_pid    = 1,    -- monotonic allocator; 0 reserved as "unassigned"
+        by_name     = {},
+        epoch_by_pid= {},
+        memo        = {},
+        last_active = {},
+        next_pid    = 1,
     }, ProducerStateManager)
 
     local rerr = self:recover()
@@ -140,12 +72,11 @@ function ProducerStateManager.topic_name()
 end
 
 function ProducerStateManager:_partition_for(key)
-    return (fnv1a(key) % self.nparts) + 1
+    return (hash_m.fnv1a(key) % self.nparts) + 1
 end
 
--- Append a record and fsync it durable. Returns (true, nil) or (nil, err).
 function ProducerStateManager:_write(key, value, now_ms)
-    local rec  = msg_m.Message.new(key, value, now_ms or os.time() * 1000)
+    local rec  = msg_m.Message.new(key, value, now_ms or time_m.now_ms())
     local part = self.topic.partitions[self:_partition_for(key)]
     local _, werr = part:write_message(rec)
     if werr then
@@ -160,10 +91,6 @@ function ProducerStateManager:_write(key, value, now_ms)
     return true, nil
 end
 
--- get_or_create_producer resolves a *named* producer identity. A brand-new name
--- allocates a fresh pid at epoch 0; a known name keeps its pid and bumps the
--- epoch (a new session — the old one is now fenced). Persists the identity and
--- returns (pid, epoch, nil) or (nil, nil, err).
 function ProducerStateManager:get_or_create_producer(name)
     assert(type(name) == "string" and #name > 0, "producer name must be non-empty")
 
@@ -183,7 +110,7 @@ function ProducerStateManager:get_or_create_producer(name)
         epoch = 0
     end
 
-    local now = os.time() * 1000
+    local now = time_m.now_ms()
     local ok, err = self:_write(K_IDENTITY .. name,
         string.pack(IDENTITY_VALUE_FMT, pid, epoch), now)
     if not ok then return nil, nil, err end
@@ -194,44 +121,27 @@ function ProducerStateManager:get_or_create_producer(name)
     return pid, epoch, nil
 end
 
--- allocate_ephemeral hands out a pid from the same durable allocator but
--- persists nothing (session-scoped producer). Guarantees the pid won't collide
--- with a persisted named pid across a restart.
 function ProducerStateManager:allocate_ephemeral()
     local pid = self.next_pid
     self.next_pid = self.next_pid + 1
     return pid
 end
 
--- current_epoch returns the live epoch for a named pid, or nil if the pid isn't
--- a known durable producer (ephemeral pids are never registered here).
 function ProducerStateManager:current_epoch(pid)
     return self.epoch_by_pid[pid]
 end
 
--- pid_for returns the durable pid bound to a producer name, or nil.
 function ProducerStateManager:pid_for(name)
     local e = self.by_name[name]
     return e and e.pid or nil
 end
 
--- lookup_memo returns the dedup memo for (pid, topic) or nil.
 function ProducerStateManager:lookup_memo(pid, topic)
     local t = self.memo[pid]
     if not t then return nil end
     return t[topic]
 end
 
--- record_produce persists (and memoizes) the sequence/offset for a freshly
--- appended idempotent record, tagged with the epoch of the session that wrote
--- it. Returns (true, nil) or (nil, err).
---
--- batch (optional) = { base_seq = , acks = { { partition, offset }, ... } }:
--- set by the PRODUCE_BATCH path so a duplicate batch can be answered with the
--- original per-record acks. `seq`/`offset`/`partition` must describe the
--- batch's LAST record, which keeps a following single-record produce working
--- off the same last_seq with no knowledge that a batch came before it.
--- Omitting `batch` writes a plain v2 memo and clears any stored batch.
 function ProducerStateManager:record_produce(pid, topic, seq, offset, partition, epoch, batch)
     epoch = epoch or 0
     local key = K_MEMO .. string.pack(">I8", pid) .. topic
@@ -246,7 +156,7 @@ function ProducerStateManager:record_produce(pid, topic, seq, offset, partition,
         end
         val = table.concat(parts)
     end
-    local now = os.time() * 1000
+    local now = time_m.now_ms()
     local ok, err = self:_write(key, val, now)
     if not ok then return nil, err end
 
@@ -260,11 +170,6 @@ function ProducerStateManager:record_produce(pid, topic, seq, offset, partition,
     return true, nil
 end
 
--- Parse the optional batch tail of a v3 memo value. `pos` is the position
--- string.unpack stopped at after the v2 prefix. Returns (base_seq, acks) or
--- nil when there is no tail (v1/v2 value) or it is truncated — a corrupt tail
--- degrades to "no batch memo", i.e. a duplicate batch is rejected as
--- out-of-order rather than replayed with wrong offsets.
 local function decode_batch_tail(value, pos)
     if #value - pos + 1 < 8 then return nil end
     local ok, base_seq, count, p = pcall(string.unpack, MEMO_BATCH_HDR_FMT, value, pos)
@@ -279,32 +184,11 @@ local function decode_batch_tail(value, pos)
     return base_seq, acks
 end
 
--- expire_idle garbage-collects durable producers whose last identity/memo
--- write is at least max_idle_ms old. Expiry tombstones the producer's
--- identity and every sequence memo in __producer_state (compaction later
--- drops both the tombstones and everything they superseded), so a quiet
--- producer no longer pins its state forever.
---
--- opts:
---   now_ms     override for tests (default: wall clock).
---   is_active  fn(name, pid) -> bool. A truthy return vetoes expiry — the
---              broker uses it to protect producers with an unresolved
---              transaction, the server to protect pids bound to a live
---              connection.
---
--- Before the first tombstone, the pid allocator's watermark is persisted:
--- otherwise deleting the highest pid's identity would let a restart hand the
--- same pid to a NEW producer while a zombie session still holds it, and
--- epoch fencing could not tell the two apart.
---
--- Returns (expired_count, nil) or (expired_count_so_far, err) if a write
--- failed mid-sweep (in-memory state stays consistent with what was written;
--- the next sweep retries the rest).
 function ProducerStateManager:expire_idle(max_idle_ms, opts)
     assert(type(max_idle_ms) == "number" and max_idle_ms > 0,
         "max_idle_ms must be a positive number")
     opts = opts or {}
-    local now       = opts.now_ms or os.time() * 1000
+    local now       = opts.now_ms or time_m.now_ms()
     local is_active = opts.is_active
 
     local victims = {}
@@ -329,10 +213,6 @@ function ProducerStateManager:expire_idle(max_idle_ms, opts)
             local mok, merr = self:_write(
                 K_MEMO .. string.pack(">I8", v.pid) .. topic, TOMBSTONE, now)
             if not mok then
-                -- Identity is already tombstoned; drop the in-memory entry so
-                -- serving state never claims more than the log does. Leftover
-                -- memo records are harmless (no identity → pid never revived)
-                -- and get swept next pass.
                 self.by_name[v.name]      = nil
                 self.epoch_by_pid[v.pid]  = nil
                 self.memo[v.pid]          = nil
@@ -351,16 +231,11 @@ function ProducerStateManager:expire_idle(max_idle_ms, opts)
     return expired, nil
 end
 
--- recover replays every internal partition front-to-back, rebuilding the
--- in-memory identity/memo maps (last write per key wins) and the pid allocator.
 function ProducerStateManager:recover()
     local max_pid = 0
-    local alloc_floor = 0   -- persisted allocator watermark (see expire_idle)
+    local alloc_floor = 0
     local restored = 0
 
-    -- Bump a pid's last_active from a record's timestamp (replay is in
-    -- append order per partition, but identity and memo records for one pid
-    -- can land on different partitions — keep the max).
     local function touch(pid, ts)
         local cur = self.last_active[pid]
         if ts and (not cur or ts > cur) then self.last_active[pid] = ts end
@@ -375,8 +250,6 @@ function ProducerStateManager:recover()
             if tag == K_IDENTITY then
                 local name = key:sub(2)
                 if #m.value == 0 then
-                    -- Tombstone: this producer was expired. Per-key replay
-                    -- order guarantees this supersedes any earlier identity.
                     local prev = self.by_name[name]
                     if prev then
                         self.epoch_by_pid[prev.pid] = nil
@@ -395,12 +268,10 @@ function ProducerStateManager:recover()
                     restored = restored + 1
                 end
             elseif tag == K_MEMO then
-                -- key = "\2" .. u64 pid .. topic
                 if #key >= 1 + 8 then
                     local pid = string.unpack(">I8", key, 2)
                     local topic = key:sub(1 + 8 + 1)
                     if #m.value == 0 then
-                        -- Tombstoned memo (producer expiry).
                         local t = self.memo[pid]
                         if t then
                             t[topic] = nil
@@ -411,15 +282,10 @@ function ProducerStateManager:recover()
                     local ok, s, off, prt, ep, vpos =
                         pcall(string.unpack, MEMO_VALUE_FMT, m.value)
                     if not ok then
-                        -- Pre-epoch memo (v1 format). Epoch 0: any session
-                        -- after a reconnect has epoch >= 1 and correctly
-                        -- treats this memo as belonging to an older session.
                         ok, s, off, prt = pcall(string.unpack, MEMO_VALUE_FMT_V1, m.value)
                         ep, vpos = 0, nil
                     end
                     if ok then
-                        -- v3 batch tail, when present: the per-record acks a
-                        -- duplicate PRODUCE_BATCH replays.
                         local base_seq, acks
                         if vpos then base_seq, acks = decode_batch_tail(m.value, vpos) end
                         local t = self.memo[pid]

@@ -1,23 +1,8 @@
--- The user store and the multi-user authenticator.
---
--- What this has to get right, beyond "the right password works":
---
---   * the single-user config that shipped before multi-tenancy must keep
---     behaving identically — one superuser who can do anything;
---   * a bad ACL, a duplicate name, or an unparseable credential must fail the
---     LOAD, not the first request, and certainly not fail open;
---   * an unknown username must be indistinguishable from a known one with the
---     wrong password — same work, same error, and for SCRAM a salt that is
---     stable per username, because a fresh random salt each time announces
---     "this account does not exist".
-
 local users_m = require("src.server.users")
 local auth    = require("src.server.auth")
 local acl_m   = require("src.server.acl")
 local quota_m = require("src.server.quota")
 
--- Cheap iteration count: these tests exercise the store, not the KDF, and
--- spec/auth_kdf_spec.lua already pins the derivation itself.
 local ITER = 1000
 local function cred(password, format)
     return auth.hash_password(password, { iterations = ITER, format = format })
@@ -128,7 +113,6 @@ describe("user store loading", function()
     end)
 
     it("rejects control characters in a username", function()
-        -- They would confuse the SCRAM grammar and truncate comparisons.
         assert.is_nil((users_m.load({
             Users = { { Username = "or\0ders", PasswordHash = cred("a") } },
         })))
@@ -195,26 +179,20 @@ describe("multi-user authenticator", function()
 
     it("bans an IP after repeated failures, across users", function()
         local banned = auth.authenticator({ store = store, max_failures = 3 })
-        -- Failures accumulate per IP, not per account: an attacker rotating
-        -- usernames is the case that matters.
         assert.is_false((banned:verify("a", "x", "10.0.0.9")))
         assert.is_false((banned:verify("b", "x", "10.0.0.9")))
         assert.is_false((banned:verify("c", "x", "10.0.0.9")))
         assert.is_true(banned:is_banned("10.0.0.9"))
 
-        -- Even correct credentials are refused while banned.
         local ok, err = banned:verify("orders", "orders-pw", "10.0.0.9")
         assert.is_false(ok)
         assert.is_truthy(err:find("banned"))
-        -- ...but only from that IP.
         assert.is_true((banned:verify("orders", "orders-pw", "10.0.0.10")))
     end)
 
     it("caches a successful credential per user", function()
         assert.is_true((a:verify("orders", "orders-pw", "10.0.0.1")))
         assert.is_true((a:verify("admin", "admin-pw", "10.0.0.1")))
-        -- Both cache entries survive the other user's login: a single-slot
-        -- cache would thrash between two active clients.
         assert.is_truthy(a.cred_cache["orders"])
         assert.is_truthy(a.cred_cache["admin"])
         assert.is_true((a:verify("orders", "orders-pw", "10.0.0.1")))
@@ -252,8 +230,6 @@ describe("scram credential lookup", function()
     end)
 
     it("keeps the decoy salt stable per username and distinct between them", function()
-        -- A salt that changed between attempts would tell an attacker the
-        -- account does not exist, which is the whole thing the decoy prevents.
         local ghost1 = a:scram_credential("ghost")
         local ghost2 = a:scram_credential("ghost")
         local other  = a:scram_credential("phantom")
@@ -263,7 +239,6 @@ describe("scram credential lookup", function()
     end)
 
     it("gives the decoy the same iteration count as the real credentials", function()
-        -- Otherwise the challenge itself distinguishes the two cases.
         assert.are.equal(a:scram_credential("orders").iterations,
                          a:scram_credential("ghost").iterations)
     end)

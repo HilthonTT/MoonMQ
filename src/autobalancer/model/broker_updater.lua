@@ -1,7 +1,3 @@
--- Broker is the immutable, per-detection view of one broker: identity plus the
--- per-resource loads that ClusterModelSnapshot aggregates from the broker's
--- replicas. Load values are filled in by the snapshot's aggregate() pass, not
--- here, so a broker with no replicas reads as zero load on every resource.
 local Broker = {}
 Broker.__index = Broker
 
@@ -10,7 +6,7 @@ function Broker.new(id, rack, active)
         id     = id,
         rack   = rack,
         active = active,
-        loads  = {},   -- resource -> number, filled by aggregation
+        loads  = {},
     }, Broker)
 end
 
@@ -26,9 +22,6 @@ function Broker:add_load(resource, delta)
     self.loads[resource] = (self.loads[resource] or 0) + delta
 end
 
--- BrokerUpdater is the live side. Brokers have no sampled load of their own in
--- this model (load is the sum of their replicas), so the updater only tracks
--- membership: id, rack, and whether the broker is eligible to hold replicas.
 local BrokerUpdater = {}
 BrokerUpdater.__index = BrokerUpdater
 

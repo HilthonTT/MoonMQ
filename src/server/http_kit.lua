@@ -1,10 +1,3 @@
--- Minimal reactor-friendly HTTP/1.1 server plumbing, shared by the
--- inter-broker endpoints (replica_server, cluster_server). Extracted from
--- replica_server so each endpoint keeps only its routing/business logic.
---
--- All functions are cooperative: they run inside a reactor coroutine and park
--- on reactor:wait_readable / reactor:sleep instead of blocking the process.
-
 local socket = require("socket")
 
 local M = {}
@@ -15,11 +8,9 @@ M.STATUS_TEXT = {
     [200] = "OK", [400] = "Bad Request", [401] = "Unauthorized",
     [404] = "Not Found", [405] = "Method Not Allowed",
     [500] = "Internal Server Error",
+    [503] = "Service Unavailable",
 }
 
--- Read up to and including the header terminator, returning
--- (header_str, leftover_body_bytes) or (nil, err). Leftover is any body bytes
--- that arrived in the same recv as the end of the headers.
 function M.read_headers(reactor, sock, deadline)
     sock:settimeout(0)
     local buf = ""
@@ -33,8 +24,6 @@ function M.read_headers(reactor, sock, deadline)
         local idx = buf:find("\r\n\r\n", 1, true)
         if idx then return buf:sub(1, idx + 3), buf:sub(idx + 4) end
 
-        -- park(), not wait_readable(): on a TLS socket the read may be waiting
-        -- for the socket to become WRITABLE instead (see Reactor:park).
         if reactor.would_block and reactor.would_block(err) then
             reactor:park(sock, err, "read")
         elseif err == "closed" then return nil, "peer closed"
@@ -44,8 +33,6 @@ function M.read_headers(reactor, sock, deadline)
     return nil, "headers too large"
 end
 
--- Read `want` body bytes given the `have` leftover from read_headers.
--- max_body bounds allocation. Returns (body, nil) or (nil, err).
 function M.read_body(reactor, sock, have, want, deadline, max_body)
     if want <= 0 then return have end
     if want > max_body then return nil, "body too large" end
@@ -66,29 +53,26 @@ function M.read_body(reactor, sock, have, want, deadline, max_body)
     return table.concat(parts)
 end
 
--- Write a full response. write_deadline is seconds from now.
-function M.respond(reactor, sock, status, ctype, body, write_deadline)
+function M.respond(reactor, sock, status, ctype, body, opts)
+    if type(opts) == "number" then opts = { deadline = opts } end
+    opts = opts or {}
     local text = M.STATUS_TEXT[status] or "Status"
+    local extra = opts.extra or ""
+    if opts.no_store then extra = "Cache-Control: no-store\r\n" .. extra end
     local response = string.format(
         "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n" ..
-        "Connection: close\r\n\r\n%s",
-        status, text, ctype, #body, body)
-    reactor:send_all(sock, response, socket.gettime() + (write_deadline or 5))
+        "Connection: close\r\n%s\r\n%s",
+        status, text, ctype, #body, extra, body)
+    reactor:send_all(sock, response, socket.gettime() + (opts.deadline or 5))
 end
 
--- Case-insensitive single-line header extraction. Header values are
--- attacker-influenced on unauthenticated endpoints: strip CR/LF is inherent
--- (the pattern stops at \r\n) and callers must validate further.
 function M.header(headers, name)
-    -- Build a case-insensitive pattern for the header name.
     local pat = "[\r\n]" .. name:gsub("%a", function(c)
         return "[" .. c:lower() .. c:upper() .. "]"
     end) .. ":%s*([^\r\n]+)"
     return headers:match(pat)
 end
 
--- Parse "METHOD /path?query" from the request line. Returns (method, path,
--- query_string_or_nil).
 function M.request_line(headers)
     local method, target = headers:match("^(%S+)%s+(%S+)")
     if not method then return nil end
@@ -96,8 +80,6 @@ function M.request_line(headers)
     return method, path, query ~= "" and query or nil
 end
 
--- Decode an application/x-www-form-urlencoded-style query string into a table.
--- Only what the cluster endpoints need: k=v pairs split on &, %XX unescaped.
 function M.parse_query(query)
     local out = {}
     if not query then return out end

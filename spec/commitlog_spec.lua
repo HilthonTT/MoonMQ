@@ -75,15 +75,12 @@ describe("CommitLog", function()
     end)
 
     it("rolls a new segment when the active one is full", function()
-        -- A 1-byte cap forces every record into its own segment (an empty
-        -- segment always accepts at least one record).
         local l = new_log({ max_segment_bytes = 1 })
         for i = 0, 2 do
             l:append_message(msg("k" .. i, "v" .. i, i))
         end
         assert.is_true(#l.segments >= 3,
             string.format("expected >=3 segments, got %d", #l.segments))
-        -- Reads still resolve across segment boundaries.
         for i = 0, 2 do
             local got, _, rerr = l:read_at(i)
             assert.is_nil(rerr)
@@ -115,7 +112,6 @@ describe("CommitLog", function()
             local got = l2:read_at(i)
             assert.are.equal("value" .. i, got.value)
         end
-        -- A fresh append continues from the recovered offset.
         local off = l2:append_message(msg("k4", "value4", 4))
         assert.are.equal(newest, off)
         l2:close()
@@ -130,9 +126,8 @@ describe("CommitLog", function()
             string.format("%020d.log", 0))
         l:close()
 
-        -- Append garbage that looks like the start of a record but is short.
         local f = assert(io.open(seg_path, "ab"))
-        f:write(string.char(0, 0, 0, 0, 0, 0, 0xFF, 0xFF)) -- bogus length prefix
+        f:write(string.char(0, 0, 0, 0, 0, 0, 0xFF, 0xFF))
         f:close()
 
         local l2 = new_log()
@@ -143,25 +138,22 @@ describe("CommitLog", function()
     end)
 
     it("delete cleaner drops oldest segments past the byte budget", function()
-        -- Each record is ~30 bytes; budget keeps only the newest couple.
         local l = new_log({ max_segment_bytes = 1, max_log_bytes = 80 })
         for i = 0, 5 do
             l:append_message(msg("k" .. i, "v" .. i, i))
         end
-        -- The oldest data must have been reclaimed.
         assert.is_true(l:oldest_offset() > 0,
             "expected oldest_offset to advance past 0")
         local got, _, err = l:read_at(0)
         assert.is_nil(got)
         assert.is_not_nil(err)
-        -- The newest record is still readable.
         local newest_record = l:read_at(l:newest_offset() - 1)
         assert.are.equal("v5", newest_record.value)
         l:close()
     end)
 
     it("retains everything when max_log_bytes is unset", function()
-        local l = new_log({ max_segment_bytes = 1 })  -- max_log_bytes -> retain all
+        local l = new_log({ max_segment_bytes = 1 })
         for i = 0, 4 do
             l:append_message(msg("k" .. i, "v" .. i, i))
         end
@@ -186,14 +178,11 @@ describe("CommitLog", function()
     end)
 
     it("each_message walks every survivor across compaction offset gaps", function()
-        -- Compaction renumbers each segment's survivors contiguously from its
-        -- base_offset, leaving GAPS between segments. An offset+1 read loop
-        -- faults at the first gap; each_message must walk the actual records.
         local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
         l:append_message(msg("a", "a-old", 1))
         l:append_message(msg("b", "b-only", 2))
-        l:append_message(msg("a", "a-new", 3))   -- supersedes a-old
-        l:append_message(msg("c", "c-only", 4))  -- forces the compaction pass
+        l:append_message(msg("a", "a-new", 3))
+        l:append_message(msg("c", "c-only", 4))
 
         local seen = {}
         local n = 0
@@ -201,19 +190,14 @@ describe("CommitLog", function()
         assert.are.equal("a-new", seen.a)
         assert.are.equal("b-only", seen.b)
         assert.are.equal("c-only", seen.c)
-        assert.are.equal(3, n)   -- exactly the survivors, no phantom reads
+        assert.are.equal(3, n)
 
-        -- Confirm there really is an offset gap the old read-loop would trip on:
-        -- more offsets span [oldest, newest) than there are surviving records.
         assert.is_true(l:newest_offset() - l:oldest_offset() > n,
             "expected a renumbering gap between segments")
         l:close()
     end)
 
     it("build_index truncates from an interior CRC-corrupt record", function()
-        -- All records land in one 64 MiB segment. Uniform 2-char key/value ->
-        -- each record is a fixed 32 bytes on disk (8 len + 12 hdr + 4 hdr_crc +
-        -- 4 payload + 4 payload_crc).
         local l = new_log()
         for i = 0, 4 do
             l:append_message(msg("k" .. i, "v" .. i, i))
@@ -222,10 +206,6 @@ describe("CommitLog", function()
             string.format("%020d.log", 0))
         l:close()
 
-        -- Flip a byte inside record #2's payload (record 2 starts at byte 64;
-        -- payload begins after 8+12+4 = 24 bytes -> offset 88). The length
-        -- prefix stays valid, so only the CRC check can catch this — the old
-        -- length-only framing would have indexed and served the corruption.
         local f = assert(io.open(seg_path, "r+b"))
         f:seek("set", 88)
         local b = f:read(1):byte()
@@ -234,7 +214,6 @@ describe("CommitLog", function()
         f:close()
 
         local l2 = new_log()
-        -- Records 0 and 1 survive; 2, 3, 4 are truncated at the corruption.
         assert.are.equal(2, l2:newest_offset())
         assert.are.equal("v0", l2:read_at(0).value)
         assert.are.equal("v1", l2:read_at(1).value)
@@ -246,19 +225,16 @@ describe("CommitLog", function()
 
     it("compacts to the latest record per key", function()
         local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
-        -- Same key written twice; only the newest value should survive.
         l:append_message(msg("a", "a-old", 1))
         l:append_message(msg("b", "b-only", 2))
         l:append_message(msg("a", "a-new", 3))
-        -- Force one more roll so the compaction pass runs over the set.
         l:append_message(msg("c", "c-only", 4))
 
-        -- Collect every surviving record by scanning the live segments.
         local seen = {}
         for _, seg in ipairs(l.segments) do
             seg:each(function(_, m) seen[m.key] = m.value end)
         end
-        assert.are.equal("a-new", seen.a)   -- superseded "a-old" dropped
+        assert.are.equal("a-new", seen.a)
         assert.are.equal("b-only", seen.b)
         assert.are.equal("c-only", seen.c)
         l:close()
@@ -268,8 +244,8 @@ describe("CommitLog", function()
         local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
         l:append_message(msg("a", "a-live", 1))
         l:append_message(msg("b", "b-live", 2))
-        l:append_message(msg("a", "", 3))        -- tombstone for "a"
-        l:append_message(msg("c", "c-live", 4))  -- forces the compaction pass
+        l:append_message(msg("a", "", 3))
+        l:append_message(msg("c", "c-live", 4))
 
         local seen = {}
         for _, seg in ipairs(l.segments) do

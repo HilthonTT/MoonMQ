@@ -1,21 +1,5 @@
--- Real fsync + truncate.
---
--- file:flush() only pushes the C runtime's userspace buffer down to the OS
--- — it doesn't tell the OS to flush its own write cache to disk. For the
--- durability claims (acks=1, sync_every) to mean anything, we need fsync
--- on the underlying file descriptor.
---
--- Linux/POSIX: use luaposix (posix.stdio.fileno + posix.unistd.fsync/ftruncate).
--- Windows: fall back to LuaJIT FFI against the C runtime, since luaposix
--- doesn't ship there.
-
 local os_utils = require("src.core.os")
 
--- atomic_rename: POSIX `rename(2)` is atomic over an existing target. On
--- Windows it isn't — the target must not exist, otherwise os.rename fails.
--- We fall back to remove-then-rename there. Not truly atomic, but the
--- checkpoint file's content (a base-10 integer) is safe to read as 0 if
--- a crash lands in the gap: the next recovery just re-scans more.
 local function atomic_rename(from, to)
     assert(type(from) == "string", "from must be a string")
     assert(type(to)   == "string", "to must be a string")
@@ -37,7 +21,7 @@ if not os_utils.IS_WINDOWS then
 
     local function sync(luafile)
         if not luafile then return false, "no file" end
-        luafile:flush()                       -- userspace -> OS
+        luafile:flush()
         local fd = stdio.fileno(luafile)
         if not fd then return false, "fileno failed" end
         local ok, err = unistd.fsync(fd)
@@ -45,10 +29,6 @@ if not os_utils.IS_WINDOWS then
         return true, nil
     end
 
-    -- sync_dir fsyncs a *directory* so a newly created/renamed file inside it
-    -- is durably linked after a crash. On POSIX, fsync(file) does NOT persist
-    -- the directory entry — you must fsync the parent dir too, or a power loss
-    -- can leave a segment/checkpoint that was written but never fully linked.
     local function sync_dir(path)
         if type(path) ~= "string" then return false, "path must be a string" end
         local fd, oerr = fcntl.open(path, fcntl.O_RDONLY)
@@ -78,11 +58,6 @@ if not os_utils.IS_WINDOWS then
     }
 end
 
--- Windows path: requires LuaJIT FFI.
---
--- Trick: LuaJIT's tostring(luafile) returns "file (0x...)"; the hex address
--- is the underlying FILE*. This is the documented idiom for handing a Lua
--- file to libc functions that take FILE*.
 
 local ffi = require("ffi")
 
@@ -131,10 +106,6 @@ local function truncate(luafile, length)
     return true, nil
 end
 
--- Directory fsync is a no-op on Windows: NTFS commits directory metadata as
--- part of the file's own FlushFileBuffers, and the CRT gives us no FILE* for a
--- directory to reach it through. Callers treat dir-fsync failure as non-fatal,
--- so reporting success here keeps the POSIX/Windows contract uniform.
 local function sync_dir(_path)
     return true, nil
 end

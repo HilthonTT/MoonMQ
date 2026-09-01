@@ -1,13 +1,3 @@
--- LIST_OFFSETS in TIMESTAMP mode: resolve the earliest offset whose record
--- timestamp is >= a query time, per partition (Kafka's offsetForTimes).
---
--- The storage layer has implemented offset_for_timestamp on both backends
--- since the time index shipped; until now nothing on the wire could reach it.
--- These specs cover the wire extension, the handler, and the two things that
--- make the extension safe: an old-style request still means "bounds only", and
--- an old-style *reply* is still decodable by a client that knows nothing about
--- the trailing section.
-
 local proto      = require("src.wire.protocol")
 local uuid       = require("src.core.uuid")
 local brk_m      = require("src.broker")
@@ -48,8 +38,6 @@ local function only_reply(conn)
     return op, payload
 end
 
--- Drive the handler through the real encoder so the shipped wire format is
--- what gets exercised.
 local function list_offsets(server, topic, ts)
     local conn = fake_conn()
     local _, _, payload = unframe(proto.encode_list_offsets(uuid.bytes(), topic, ts))
@@ -71,9 +59,6 @@ describe("LIST_OFFSETS timestamp mode: wire format", function()
         local frame = proto.encode_list_offsets(correl, "orders")
         local _, _, payload = unframe(frame)
 
-        -- The bare body is exactly a length-prefixed topic and nothing else.
-        -- That is what makes an upgraded client safe against an old broker:
-        -- there are no extra bytes for it to choke on.
         assert.are.equal(4 + #"orders", #payload)
 
         local q = assert(proto.decode_list_offsets(payload))
@@ -95,9 +80,6 @@ describe("LIST_OFFSETS timestamp mode: wire format", function()
     end)
 
     it("rejects a timestamp mode byte with no timestamp behind it", function()
-        -- An old client never sends the mode byte at all, so a mode byte with
-        -- a missing payload is a malformed frame, not an old client. Silently
-        -- degrading to a bounds query would answer a question nobody asked.
         local truncated = proto.encode_string("orders") ..
             string.pack(">B", proto.LIST_OFFSETS_MODE_TIMESTAMP)
         local q, err = proto.decode_list_offsets(truncated)
@@ -125,8 +107,6 @@ describe("LIST_OFFSETS timestamp mode: wire format", function()
         local _, _, payload = unframe(frame)
 
         local got = assert(proto.decode_offsets(payload))
-        -- The bounds section is untouched: #entries and ipairs still see only
-        -- the two bound entries, so every pre-existing caller is unaffected.
         assert.are.equal(2, #got)
         assert.are.equal(50, got[1].latest)
 
@@ -162,8 +142,6 @@ describe("LIST_OFFSETS timestamp mode: handler", function()
         rmdir(BASE_DIR)
     end)
 
-    -- Write records with known, well-separated timestamps into partition 1 and
-    -- return the offset each landed at.
     local function seed(topic_name, timestamps)
         local topic = assert(broker:create_topic(topic_name, 1))
         local part  = topic.partitions[1]
@@ -185,9 +163,6 @@ describe("LIST_OFFSETS timestamp mode: handler", function()
     end)
 
     it("rounds a between-records timestamp forward, never backward", function()
-        -- 2500 falls in the gap between the 2000 and 3000 records. Kafka's
-        -- semantics are ">= ts", so the answer is the 3000 record: seeking
-        -- must never hand back a record that predates what was asked for.
         local offs = seed("orders", { 1000, 2000, 3000, 4000 })
 
         local ft = offsets_reply(list_offsets(server, "orders", 2500)).for_times
@@ -208,9 +183,6 @@ describe("LIST_OFFSETS timestamp mode: handler", function()
         local reply = offsets_reply(list_offsets(server, "orders", 9999))
 
         assert.is_false(reply.for_times[1].found)
-        -- Not a sentinel: the substituted offset is where the first qualifying
-        -- record WILL land, so "seek to T and follow" works on a partition
-        -- that has not reached T yet.
         assert.are.equal(reply[1].latest, reply.for_times[1].offset)
     end)
 
@@ -225,7 +197,6 @@ describe("LIST_OFFSETS timestamp mode: handler", function()
 
     it("answers every partition, in partition order", function()
         local topic = assert(broker:create_topic("multi", 3))
-        -- Only partition 2 gets a record at/after 5000.
         topic.partitions[1]:write_message(message.Message.new("a", "1", 1000))
         local want = topic.partitions[2]:write_message(
             message.Message.new("b", "2", 6000))
@@ -248,8 +219,6 @@ describe("LIST_OFFSETS timestamp mode: handler", function()
 
         assert.are.equal(1, #reply)
         assert.is_true(reply[1].latest > 0)
-        -- The regression this guards: a bounds request must not start paying
-        -- for a log walk it did not ask for.
         assert.is_nil(reply.for_times)
     end)
 

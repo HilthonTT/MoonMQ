@@ -1,8 +1,5 @@
 local LinearNormalizer = require("src.autobalancer.common.normalizer.linear_normalizer")
 
--- Step normalizer that normalize the value to [0, 1], when value is less than step var, it will be normalized with
--- LinearNormalizer, otherwise it will be normalized with a logarithmic function which approaches 1 while the value
--- approaches infinity.
 local StepNormalizer = {}
 StepNormalizer.__index = StepNormalizer
 
@@ -15,8 +12,6 @@ function StepNormalizer.new(min, step, step_offset, step_value)
   if step_value < 0 or step_value > 1 then
     return nil, "step value must be in [0, 1]"
   end
-  -- delta() divides by log(step + step_offset): ≤ 0 is NaN, == 1 is a
-  -- division by zero. Require the log argument to be strictly > 1.
   if step + step_offset <= 1 then
     return nil, "step + step_offset must be greater than 1"
   end

@@ -9,24 +9,22 @@ Pool.__index = Pool
 
 function Pool.new(opts)
     return setmetatable({
-        opts      = opts,                  -- forwarded to Client.new
+        opts      = opts,
         reactor   = opts.reactor,
         max       = opts.max or 8,
-        available = {},                    -- ready-to-use clients
-        active    = 0,                     -- total clients in existence
-        waiters   = {},                    -- coroutines parked on acquire
+        available = {},
+        active    = 0,
+        waiters   = {},
     }, Pool)
 end
 
 function Pool:acquire()
-    -- Drop dead clients off the available queue.
     while #self.available > 0 do
         local c = table.remove(self.available)
         if not c.closed then return c end
         self.active = self.active - 1
     end
 
-    -- Room to grow?
     if self.active < self.max then
         self.active = self.active + 1
         local c, err = Client.new(self.opts)
@@ -37,12 +35,10 @@ function Pool:acquire()
         return c
     end
 
-    -- Park until something is released.
     local co = assert(coroutine.running(), "Pool:acquire needs a coroutine")
     table.insert(self.waiters, co)
     coroutine.yield()
- 
-    -- We were woken because something was put back.
+
     while #self.available > 0 do
         local c = table.remove(self.available)
         if not c.closed then return c end
@@ -88,15 +84,10 @@ local STATUS = {
 }
 
 local function read_http_request(reactor, sock)
-    -- Non-blocking: the loop below drives readiness through the reactor's
-    -- wait_readable on "timeout". settimeout(0), NOT gettimeout(0) — the
-    -- latter is a getter that ignores its argument and leaves the socket
-    -- blocking, so one slow client would stall the whole gateway.
     sock:settimeout(0)
     local deadline = socket.gettime() + READ_DEADLINE
     local buf = ""
 
-    -- Read until headers terminator
     while not buf:find("\r\n\r\n", 1, true) do
         if #buf > MAX_HEADERS then return nil, "headers too large" end
         local chunk, err, partial = sock:receive(8192)
@@ -105,10 +96,6 @@ local function read_http_request(reactor, sock)
         elseif partial and #partial > 0 then
             buf = buf .. partial
         end
-        -- Check the terminator BEFORE parking on wait_readable: a request
-        -- shorter than the receive window arrives as `partial` + "timeout",
-        -- and the peer sends nothing further until it gets a response —
-        -- waiting first would park this coroutine until the peer gives up.
         if buf:find("\r\n\r\n", 1, true) then break end
         if err == "timeout" then
             if socket.gettime() > deadline then return nil, "read deadline" end
@@ -136,7 +123,6 @@ local function read_http_request(reactor, sock)
         if k then headers[k:lower()] = v end
     end
 
-    -- Read body if Content-Length set.
     local cl = tonumber(headers["content-length"] or "0") or 0
     if cl > MAX_BODY then return nil, "body too large" end
     while #body < cl do
@@ -146,8 +132,6 @@ local function read_http_request(reactor, sock)
         elseif partial and #partial > 0 then
             body = body .. partial
         end
-        -- Same as the header loop: if the partial completed the body, don't
-        -- park on a socket that will never become readable again.
         if #body >= cl then break end
         if err == "timeout" then
             if socket.gettime() > deadline then return nil, "body read deadline" end
@@ -203,7 +187,7 @@ end
 local function healthz(req, pool)
     return 200, "text/plain", "ok\n"
 end
- 
+
 local function list_topics(req, pool)
     local topics, err = pool:with(function(c) return c:list_topics() end)
     if not topics then return err_response(502, err or "list failed") end
@@ -245,7 +229,7 @@ local function fetch(req, pool, topic)
         return err_response(400, "require {group: string, max?: number}")
     end
     local max_records = data.max and math.floor(data.max) or 100
- 
+
     local records, err = pool:with(function(c)
         return c:fetch(topic, data.group, max_records)
     end)
@@ -262,12 +246,8 @@ local function commit(req, pool, topic)
         return err_response(400, "require {group, partition, offset}")
     end
 
-    -- Fetch first to ensure the pool's client subscribes to topic+group.
-    -- We can't share commit state across clients in the pool — each
-    -- needs its own consumer context. For now this is a best-effort
-    -- single-shot commit on a fresh subscription.
     local _, err = pool:with(function(c)
-        local _, ferr = c:fetch(topic, data.group, 0)  -- 0 records, just establishes group
+        local _, ferr = c:fetch(topic, data.group, 0)
         if ferr then return nil, ferr end
         return c:commit(topic, math.floor(data.partition), math.floor(data.offset))
     end)
@@ -286,11 +266,8 @@ local ROUTES = {
 }
 
 local function route(req, pool)
-    -- Strip query string for matching.
     local path = req.path:gsub("%?.*", "")
 
-    -- Method-not-allowed vs not-found: try matching just by pattern
-    -- first; if we hit any pattern but wrong method, return 405.
     local found_pattern = false
     for _, r in ipairs(ROUTES) do
         local caps = { path:match(r.pattern) }
@@ -308,13 +285,13 @@ end
 
 local Gateway = {}
 Gateway.__index = Gateway
- 
+
 function Gateway.new(opts)
     return setmetatable({
         reactor = Reactor.new(),
         host    = opts.host or "0.0.0.0",
         port    = opts.port or 8080,
-        pool_opts = opts.pool_opts,  -- forwarded to Pool.new
+        pool_opts = opts.pool_opts,
     }, Gateway)
 end
 
@@ -324,13 +301,13 @@ function Gateway:_handle(sock, peer)
         pcall(function() sock:close() end)
         return
     end
- 
+
     local ok, status, ctype, body = pcall(route, req, self.pool)
     if not ok then
         status, ctype, body = 500, "application/json",
             json.encode({ error = "handler crashed: " .. tostring(status) }) .. "\n"
     end
- 
+
     pcall(function()
         write_response(self.reactor, sock, status, ctype, body)
         sock:close()
@@ -340,16 +317,16 @@ end
 function Gateway:start()
     self.pool_opts.reactor = self.reactor
     self.pool = Pool.new(self.pool_opts)
- 
+
     local _, lerr = self.reactor:listen(self.host, self.port,
         function(sock, peer, _ip) self:_handle(sock, peer) end)
     if lerr then return nil, lerr end
- 
+
     io.stderr:write(string.format(
         "[gateway] listening on %s:%d → moonmq %s:%d (pool max=%d)\n",
         self.host, self.port,
         self.pool_opts.host, self.pool_opts.port, self.pool_opts.max or 8))
- 
+
     self.reactor:run()
     return true
 end
@@ -363,7 +340,7 @@ if script_is_main() then
     local gcfg = cfg.Gateway or {}
     local scfg = cfg.Server  or {}
     local acfg = cfg.Auth    or {}
- 
+
     local gw = Gateway.new({
         host = gcfg.Host or "0.0.0.0",
         port = gcfg.Port or 8080,
@@ -372,13 +349,13 @@ if script_is_main() then
             host           = gcfg.MoonMQHost or "127.0.0.1",
             port           = gcfg.MoonMQPort or scfg.Port or 9092,
             username       = acfg.Username,
-            password       = gcfg.MoonMQPassword,   -- plaintext for client side
+            password       = gcfg.MoonMQPassword,
             client_name    = "moonmq-gateway",
             client_version = "0.1.0",
             timeout        = gcfg.MoonMQTimeout or 30,
         },
     })
- 
+
     local ok, err = gw:start()
     if not ok then
         io.stderr:write("[gateway] failed to start: " .. tostring(err) .. "\n")

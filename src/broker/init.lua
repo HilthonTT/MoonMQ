@@ -12,10 +12,6 @@ local uuid = require("src.core.uuid")
 local Broker = {}
 Broker.__index = Broker
 
--- opts (optional):
---   default_backend  storage backend for topics that don't request one
---                    ("segmented" | "commitlog"; default "segmented"). Per-topic
---                    `backend` opts and persisted sidecars still take precedence.
 function Broker.new(data_dir, opts)
     assert(type(data_dir) == "string", "data dir must be a string")
     if opts ~= nil then
@@ -32,43 +28,27 @@ function Broker.new(data_dir, opts)
     local broker = setmetatable({
         id = uuid.bytes(),
         topic_manager = topic_manager,
-        -- Per-partition produce/consume byte counters, feeding the
-        -- autobalancer's network goals (see src/metrics/traffic.lua).
         traffic = traffic_m.new(),
     }, Broker)
 
     local lerr = broker:load_topics()
     if lerr then return nil, lerr end
 
-    -- Durable consumer offsets live in an internal __consumer_offsets topic.
-    -- Build the manager after user topics are loaded (load_topics will have
-    -- already recreated the internal topic from disk on a restart; the manager
-    -- detects that and replays it rather than re-creating). opts.offsets is an
-    -- optional { num_partitions = N } passed through to first-time creation.
     local offsets, oerr = offmgr_m.OffsetManager.new(topic_manager, opts.offsets)
     if not offsets then return nil, oerr end
     broker.offsets = offsets
 
-    -- Durable producer state (PIDs, epochs, idempotent-produce memos) lives in
-    -- another internal topic, __producer_state, built the same way. This is what
-    -- lets idempotent/transactional producers survive a reconnect or restart.
     local prod_state, perr =
         prodstate_m.ProducerStateManager.new(topic_manager, opts.producer_state)
     if not prod_state then return nil, perr end
 
     broker.producer_state = prod_state
 
-    -- Transaction coordinator (built LAST: it uses topic_manager, offsets, and
-    -- producer_state during its own crash-recovery pass, which resolves any
-    -- transaction left in flight by a previous crash).
     local txn, terr = txn_m.Coordinator.new(broker, opts.transactions)
     if not txn then return nil, terr end
 
     broker.transactions = txn
 
-    -- Dead-letter queue manager (in-memory attempt counters + lazy
-    -- <topic>.dlq creation; see src/broker/dlq.lua). opts.dlq is an optional
-    -- { suffix, max_deliveries } from the server config.
     broker.dlq = dlq_m.DlqManager.new(broker, opts.dlq)
 
     return broker, nil
@@ -86,19 +66,13 @@ function Broker:load_topics()
         local topic_dir = fs_m.join_path(baseDir, name)
 
         if fs_m.is_dir(topic_dir) then
-            -- Skip names we'd reject anyway. Without this, a file/dir
-            -- left behind by some other tool would crash load.
             local valid = util_m.validate_topic_name(name)
             if valid then
-                -- Each partition lives under topic_dir/partition-<id>/ as
-                -- a directory containing one or more <base_offset>.log
-                -- segment files plus a recovery-checkpoint sidecar.
                 local partition_dirs, gErr = fs_m.glob(topic_dir, "^partition%-(%d+)$")
                 if not partition_dirs then
                     return string.format("failed to glob partitions for topic %s: %s", name, gErr)
                 end
 
-                -- Extract partition IDs from dir names; reject gaps.
                 local ids = {}
                 for _, dir_path in ipairs(partition_dirs) do
                     if fs_m.is_dir(dir_path) then
@@ -111,28 +85,18 @@ function Broker:load_topics()
 
                 if #ids > 0 then
                     local max_id = ids[#ids]
-                    -- Verify contiguous 1..max_id.
                     for i = 1, max_id do
                         if ids[i] ~= i then
                             return string.format("topic %s has non-contiguous partition dirs (missing partition %d)", name, i)
                         end
                     end
 
-                    -- Restore per-topic config from the sidecar. Missing
-                    -- file is normal for topics created before this
-                    -- feature; load() returns {} which means "use
-                    -- defaults" (status quo). Malformed file is loud —
-                    -- we'd rather fail loudly than silently quote-unquote-fix.
                     local opts, oerr = topic_config.load(topic_dir)
                     if not opts then
                         return string.format(
                             "failed to load topic %s config: %s", name, oerr)
                     end
 
-                    -- SegmentedPartition.new performs its own crash recovery
-                    -- (verify_file with checkpoint/clean-shutdown protocol)
-                    -- when it opens the partition dir, so the broker doesn't
-                    -- need a separate recovery pass here.
                     local _, cErr = self.topic_manager:create_topic(name, max_id, opts)
                     if cErr then
                         return string.format("failed to load topic %s: %s", name, cErr)
@@ -145,8 +109,6 @@ function Broker:load_topics()
     return nil
 end
 
--- opts (optional): per-topic config forwarded to the TopicManager. See
--- src/storage/segmentation.lua SegmentedPartition.new for supported keys.
 function Broker:create_topic(name, num_partitions, opts)
     assert(type(name) == "string", "name must be a string")
     assert(type(num_partitions) == "number", "num_partitions must be a number")
@@ -163,35 +125,10 @@ function Broker:create_topic(name, num_partitions, opts)
     return topic, err
 end
 
--- is_internal reports whether `name` is broker-owned state rather than user
--- data (__consumer_offsets, __producer_state). The `__` prefix is already the
--- convention Broker:list_topics and tick_cleaners filter on; this puts a name
--- on it so the admin paths refuse the same set.
 function Broker.is_internal(name)
     return name:sub(1, 2) == "__"
 end
 
--- delete_topic removes a topic and everything that referenced it.
---
--- Deleting the log is the easy half. The rest of this function is the state
--- that would otherwise dangle and quietly misbehave:
---
---   * consumer groups keep a subscribed-topic table and per-member
---     assignments, so a rebalance after deletion would assign partitions of a
---     log that no longer exists. Cleared via the coordinator (installed by the
---     Server; absent in bare-broker tests, hence the nil check).
---   * committed offsets in __consumer_offsets survive independently of the
---     topic. Recreating a topic of the same name would hand every previously
---     subscribed group a stale offset into an unrelated log, so they are
---     tombstoned.
---   * DLQ attempt counters are keyed by (group, topic, partition, offset) and
---     are in-memory only, so they die with the process; they are dropped here
---     anyway so a delete/recreate cycle inside one broker lifetime starts
---     clean.
---
--- Internal topics are refused: they are broker state, and removing them out
--- from under the OffsetManager or ProducerStateManager would corrupt a running
--- broker. Returns (true, nil) or (nil, err).
 function Broker:delete_topic(name)
     assert(type(name) == "string", "name must be a string")
 
@@ -202,8 +139,6 @@ function Broker:delete_topic(name)
         return nil, string.format("topic %s does not exist", name)
     end
 
-    -- Drop the topic out of live consumer groups BEFORE the log goes away, so
-    -- no rebalance can observe a half-deleted topic.
     if self.group_coordinator then
         self.group_coordinator:forget_topic(name)
     end
@@ -211,9 +146,6 @@ function Broker:delete_topic(name)
     local ok, err = self.topic_manager:delete_topic(name)
     if not ok then return nil, err end
 
-    -- Past the point of no return: the log is gone. Any failure below leaves
-    -- stale bookkeeping rather than a live topic, so report it without
-    -- pretending the delete didn't happen.
     if self.offsets then
         local _, oerr = self.offsets:delete_topic_offsets(name)
         if oerr then
@@ -229,9 +161,6 @@ function Broker:delete_topic(name)
     return true, nil
 end
 
--- describe_topic returns { name, num_partitions, config } where `config` is
--- the persisted sidecar (see topic_config.lua). Only keys actually set are
--- present -- an absent key means the partition default applies.
 function Broker:describe_topic(name)
     assert(type(name) == "string", "name must be a string")
 
@@ -248,12 +177,6 @@ function Broker:describe_topic(name)
     }, nil
 end
 
--- Config keys ALTER_TOPIC_CONFIG accepts, and how to parse each one's wire
--- value (values arrive as strings; see encode_alter_topic_config).
---
--- `backend` is deliberately absent: it selects the storage engine, which is
--- baked into the on-disk layout at creation. Changing it on a topic with data
--- would mean reinterpreting existing segments under a different format.
 local ALTERABLE = {
     max_segment_size = "number",
     retention        = "number",
@@ -262,24 +185,12 @@ local ALTERABLE = {
     cleanup_policy   = "string",
 }
 
--- Which alterable keys are also LIVE fields on an open SegmentedPartition, so
--- a change takes effect without a restart. The rest are read at open time and
--- apply on the next one.
 local LIVE_PARTITION_FIELDS = {
     max_segment_size = true,
     retention        = true,
     cleaner_interval = true,
 }
 
--- alter_topic_config merges `changes` into the topic's persisted config and
--- applies what can be applied live.
---
--- The sidecar is the durable source of truth Broker:load_topics restores from,
--- so it is written first: if the process dies between the write and the
--- in-memory update, a restart converges on the new config. The reverse order
--- would lose the change entirely.
---
--- Returns (applied_table, nil) or (nil, err).
 function Broker:alter_topic_config(name, changes)
     assert(type(name) == "string", "name must be a string")
     assert(type(changes) == "table", "changes must be a table")
@@ -308,8 +219,6 @@ function Broker:alter_topic_config(name, changes)
                 return nil, string.format(
                     "config key '%s' must be positive, got %s", key, tostring(n))
             end
-            -- The sidecar writes numbers with %.f and reads them back with
-            -- tonumber, so a fractional value would not round-trip.
             parsed[key] = math.floor(n)
         else
             parsed[key] = tostring(raw)
@@ -336,12 +245,6 @@ function Broker:alter_topic_config(name, changes)
     return parsed, nil
 end
 
--- attach_committer_factory installs a callback `fn(partition)` that the
--- broker invokes on every partition — both those already loaded and any
--- created later via :create_topic. The Server calls this once at startup
--- with a closure that wires the partition to its reactor for group
--- commit. Kept separate from Broker.new so the broker module doesn't
--- need to know about the reactor.
 function Broker:attach_committer_factory(fn)
     assert(type(fn) == "function", "factory must be a function")
     self._committer_factory = fn
@@ -352,10 +255,6 @@ function Broker:attach_committer_factory(fn)
     end
 end
 
--- Inverse of attach_committer_factory: detach every partition's
--- committer (draining any in-flight waiters) and forget the factory so
--- future :create_topic calls don't re-attach. Used at shutdown so the
--- reactor doesn't get fresh sleeps queued while it's stopping.
 function Broker:detach_committers()
     self._committer_factory = nil
     for _, topic in pairs(self.topic_manager.topics) do
@@ -365,30 +264,13 @@ function Broker:detach_committers()
     end
 end
 
--- tick_cleaners pumps every partition's retention/compaction cleaner one
--- step. SegmentedPartition runs its cleaner as a manually-driven coroutine
--- (tick_cleaner is a cheap no-op until the cleaner is due), so nothing ages
--- out segments unless something calls this on a loop — the Server does, from
--- a periodic reactor coroutine. Backends without a cleaner (CommitLogPartition
--- cleans synchronously on roll) expose a no-op tick_cleaner, so this is
--- uniform across backends. Returns the number of partitions that actually ran
--- a cleanup pass on this tick (for logging/metrics).
 function Broker:tick_cleaners()
     local ran = 0
     for name, topic in pairs(self.topic_manager.topics) do
-        -- Skip internal topics (e.g. __consumer_offsets). They are
-        -- compaction-oriented (one live record per key), but the segmented
-        -- backend only does *time-based* retention — so ticking their cleaner
-        -- would delete old offset segments and an idle group could lose its
-        -- last committed offset on restart. Leaving them untouched keeps the
-        -- pre-existing safe behaviour (bounded only by real compaction, which
-        -- is tracked separately) rather than trading a leak for data loss.
         if name:sub(1, 2) ~= "__" then
             for _, p in ipairs(topic.partitions) do
                 if p.tick_cleaner and p:tick_cleaner() then
                     ran = ran + 1
-                    -- Retention just ran: drop aborted-transaction index
-                    -- entries whose whole range aged out with the segments.
                     if self.transactions and p.oldest_offset then
                         self.transactions.aborts:prune(name, p.id, p:oldest_offset())
                     end
@@ -399,20 +281,12 @@ function Broker:tick_cleaners()
     return ran
 end
 
--- expire_idle_producers garbage-collects durable producer identities (and
--- their idempotent-produce memos) idle for at least max_idle_ms, via
--- ProducerStateManager:expire_idle. The broker adds the one veto only it can
--- check: a producer whose transaction is still unresolved is never expired
--- (its epoch is what fences the zombie session during txn recovery). Callers
--- (the Server) layer their own veto on top via opts.is_active — e.g. pids
--- bound to a live connection. Returns (expired_count, err?).
 function Broker:expire_idle_producers(max_idle_ms, opts)
     opts = opts or {}
     local caller_active = opts.is_active
     return self.producer_state:expire_idle(max_idle_ms, {
         now_ms    = opts.now_ms,
         is_active = function(name, pid)
-            -- transactional_id == producer_name (see txn_coordinator.lua).
             if self.transactions and self.transactions:has_unresolved(name) then
                 return true
             end
@@ -421,11 +295,6 @@ function Broker:expire_idle_producers(max_idle_ms, opts)
     })
 end
 
--- serves_partition reports whether this broker currently serves reads/writes
--- for (topic, partition). Always true in a single-broker deployment;
--- cluster-aware once the Server installs the ownership table (see
--- Server.new / src/cluster/assignments.lua). Consumers use this to stop
--- reading the stale local copy of a partition that was reassigned away.
 function Broker:serves_partition(topic_name, partition_id)
     local a = self.cluster_assignments
     if not a then return true end
@@ -446,8 +315,6 @@ end
 function Broker:list_topics()
     local topics = {}
     for topic_name, _ in pairs(self.topic_manager.topics) do
-        -- Hide internal topics (e.g. __consumer_offsets) from the public
-        -- listing and from the topic-count cap that gates CREATE_TOPIC.
         if topic_name:sub(1, 2) ~= "__" then
             topics[#topics + 1] = topic_name
         end
@@ -455,9 +322,6 @@ function Broker:list_topics()
     return topics
 end
 
--- commit_offset / fetch_offset delegate to the OffsetManager. They sit on the
--- Broker so the per-connection Consumer can reach durable storage through the
--- broker reference it already holds, without OffsetManager plumbing of its own.
 function Broker:commit_offset(group, topic, partition, offset)
     return self.offsets:commit(group, topic, partition, offset)
 end

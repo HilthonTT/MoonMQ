@@ -1,29 +1,3 @@
--- Authentication with constant-time credential compare and per-IP
--- failure tracking.
---
--- Two stored credential formats, both salted PBKDF2-SHA256:
---
---   pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
---       The original. <hash> is PBKDF2(password, salt, iterations), which is
---       exactly SCRAM's SaltedPassword — so these credentials work with both
---       mechanisms unchanged. The catch: SaltedPassword is login-equivalent.
---       Someone who reads the config can authenticate as that user without
---       ever recovering the password.
---
---   scram-sha-256$<iterations>$<salt_hex>$<stored_key_hex>$<server_key_hex>
---       Preferred. Stores only what SCRAM verification needs (RFC 5802 §3):
---       StoredKey = H(HMAC(SaltedPassword, "Client Key")) and
---       ServerKey = HMAC(SaltedPassword, "Server Key"). Password AUTH still
---       verifies against it (derive, re-hash, compare StoredKey), and a
---       stolen config no longer yields a working SCRAM proof.
---
--- Both are produced by bin/moonmq-hash.lua; `--scram` selects the second.
---
--- Authentication itself is multi-user (src/server/users.lua): the
--- authenticator holds a STORE, and a successful verify returns the principal
--- — username, ACL, quota — that the rest of the request path authorizes
--- against.
-
 local sha2     = require("src.vendor.sha2")
 local socket   = require("socket")
 local rng      = require("src.core.rng")
@@ -35,10 +9,6 @@ local log      = require("src.log.logger").get("auth")
 
 local M = {}
 
--- PBKDF2 lives in src/core/pbkdf2.lua (the SCRAM client half needs it too, and
--- should not have to require the server's user store to get at one function).
--- Re-exported here because bin/moonmq-hash.lua, the specs, and any operator
--- tooling all reach for it through this module.
 local DEFAULT_PBKDF2_ITERATIONS = pbkdf2_m.DEFAULT_PBKDF2_ITERATIONS
 local MAX_PBKDF2_ITERATIONS     = pbkdf2_m.MAX_PBKDF2_ITERATIONS
 local pbkdf2_pure               = pbkdf2_m.pbkdf2_pure
@@ -54,25 +24,9 @@ M.estimate_verify_seconds   = pbkdf2_m.estimate_verify_seconds
 local DEFAULT_SALT_BYTES = 16
 local DEFAULT_HASH_BYTES = 32
 
--- Boot-time cost check thresholds. Below MIN_ITERATIONS a hash is cheap
--- everywhere and not worth timing (it also keeps the probe out of tests that
--- build throwaway authenticators). Above WARN_SECONDS per login, the operator
--- needs to know before the first client connects, not after.
 local COST_CHECK_MIN_ITERATIONS = 1000
 local COST_WARN_SECONDS         = 1.0
 
--- Constant-time string compare. The HMAC indirection that used to wrap
--- both inputs added no security: the key was a per-process random value
--- with no out-of-band sharing, so it didn't protect against any attacker
--- who couldn't already read process memory. We still want constant time
--- to avoid leaking field length / prefix matches via timing — but the
--- HMAC was pure overhead.
---
--- The `key` parameter is kept for API compatibility; it is ignored.
---
--- The comparison itself now lives in src/core/ct.lua, because SCRAM needs the
--- identical primitive for proof and signature checks and two copies of a
--- timing-sensitive compare is how one of them ends up weaker.
 local function compare_secure(a, b, _key)
     return ct.equal(a, b)
 end
@@ -81,12 +35,6 @@ M.compare_secure = compare_secure
 M.FORMAT_PBKDF2 = "pbkdf2"
 M.FORMAT_SCRAM  = "scram"
 
--- opts.format selects the stored shape:
---   "pbkdf2" (default) — pbkdf2-sha256$...$<salted_password>
---   "scram"            — scram-sha-256$...$<stored_key>$<server_key>
---
--- Prefer "scram" for new credentials: it verifies password AUTH just as well
--- and is not login-equivalent if the config leaks.
 function M.hash_password(password, opts)
     opts = opts or {}
     local iterations = opts.iterations or DEFAULT_PBKDF2_ITERATIONS
@@ -97,8 +45,6 @@ function M.hash_password(password, opts)
     local hash = pbkdf2_hmac_sha256(password, salt, iterations, hash_len)
 
     if opts.format == M.FORMAT_SCRAM then
-        -- SaltedPassword must be the full SHA-256 digest length for the SCRAM
-        -- derivations to match what any RFC 5802 client computes.
         assert(hash_len == DEFAULT_HASH_BYTES,
             "scram credentials require a 32-byte derived key")
         local stored_key, server_key = scram.keys_from_salted(hash)
@@ -116,9 +62,6 @@ local function check_iterations(iter_s)
     if not iterations or iterations < 1 then
         return nil, "invalid iterations"
     end
-    -- Sanity cap. Stored hashes are server-controlled so this isn't a
-    -- DoS vector in practice, but a corrupted/typo'd config shouldn't
-    -- be able to wedge auth in a 2^31-iter PBKDF2 loop.
     if iterations > MAX_PBKDF2_ITERATIONS then
         return nil, string.format("iterations exceeds maximum (%d)", MAX_PBKDF2_ITERATIONS)
     end
@@ -173,8 +116,6 @@ local function parse_scram(stored)
     local server_key, verr = unhex(server_hex, "server key")
     if not server_key then return nil, verr end
 
-    -- Both keys are SHA-256 outputs; a wrong length here means the credential
-    -- was hand-edited, and would fail every login with an opaque error.
     if #stored_key ~= 32 or #server_key ~= 32 then
         return nil, "scram credential keys must be 32 bytes"
     end
@@ -188,9 +129,6 @@ local function parse_scram(stored)
     }, nil
 end
 
--- Parse either stored format. Returns a table carrying `kind` plus whatever
--- that format holds; callers use scram_keys/verify_password rather than
--- reaching into it.
 function M.parse_credential(stored)
     if type(stored) ~= "string" then return nil, "credential not a string" end
 
@@ -204,11 +142,6 @@ function M.parse_credential(stored)
     return parsed, nil
 end
 
--- The (StoredKey, ServerKey) pair for a parsed credential — what the SCRAM
--- exchange needs and all it needs. For a pbkdf2 credential the stored hash IS
--- SaltedPassword, so the keys derive with two HMACs and no PBKDF2: SCRAM
--- authentication costs the broker microseconds regardless of the iteration
--- count, which is the whole point of moving the derivation to the client.
 function M.scram_keys(parsed)
     if parsed.kind == M.FORMAT_SCRAM then
         return parsed.stored_key, parsed.server_key
@@ -216,9 +149,6 @@ function M.scram_keys(parsed)
     return scram.keys_from_salted(parsed.hash)
 end
 
--- Verify a plaintext password (the PLAIN/AUTH mechanism) against either
--- format. Both paths run one PBKDF2 derivation of the stored iteration count;
--- this is the expensive path SCRAM exists to avoid.
 function M.verify_password(parsed, password, opts)
     local derived = pbkdf2_hmac_sha256(password, parsed.salt, parsed.iterations,
         parsed.kind == M.FORMAT_SCRAM and 32 or #parsed.hash, opts)
@@ -233,14 +163,6 @@ end
 local Auth = {}
 Auth.__index = Auth
 
--- Tell the operator, at boot, what a login is going to cost. Getting this
--- wrong is silent otherwise: the credential carries its own iteration count,
--- so a 600k hash generated by `make hash` on a host with luaossl will still be
--- accepted by a broker without it — and then take minutes per AUTH, blocking
--- the reactor, with nothing in the log to explain why.
---
--- With many users the number that matters is the WORST one, since that is the
--- login that stalls the loop.
 local function report_kdf_cost(store)
     local worst, worst_user = 0, nil
     for _, name in ipairs(store:names_sorted()) do
@@ -265,8 +187,6 @@ local function report_kdf_cost(store)
     return worst
 end
 
--- opts.store: a user store (src/server/users.lua). Everything else tunes the
--- per-IP lockout and the reactor-stall mitigations, exactly as before.
 function M.authenticator(opts)
     local store = assert(opts.store, "authenticator: store required")
     assert(store:count() > 0, "authenticator: store is empty")
@@ -283,26 +203,11 @@ function M.authenticator(opts)
         failures_n     = 0,
         last_sweep     = socket.gettime(),
 
-        -- Reactor-stall mitigations (see the note at the top of the file).
         max_inflight   = opts.max_inflight or 4,
         inflight       = 0,
-        yield_fn       = nil,               -- installed by the Server
-        -- Per-process random key for the success-digest cache. HMAC keying
-        -- means the cache never stores anything derivable from the password
-        -- by an attacker who can read a memory dump of just the cache slot.
+        yield_fn       = nil,
         cred_key       = rng.bytes(32),
-        cred_cache     = {},                -- username -> digest of last good
-        -- Decoy credential for unknown usernames. Without it, "no such user"
-        -- returns in microseconds while a real user costs a full PBKDF2
-        -- derivation — a timing oracle that enumerates the user list. The
-        -- decoy carries the store's worst iteration count so the wrong answer
-        -- costs what the right one does.
-        --
-        -- Built from random bytes rather than by hashing a random password:
-        -- the derivation is what we want to SPEND at verify time, not at boot
-        -- (at 600k pure-Lua iterations, hashing one here would add minutes to
-        -- startup). No password matches a random 32-byte target, so the decoy
-        -- always fails, at exactly the right price.
+        cred_cache     = {},
         decoy_key      = rng.bytes(32),
         decoy          = {
             kind       = M.FORMAT_PBKDF2,
@@ -313,10 +218,6 @@ function M.authenticator(opts)
     }, Auth)
 end
 
--- Compatibility shim for the single-user configuration this module started
--- with (and for tests that build a throwaway authenticator). The user it
--- creates is a superuser, which is what a lone `Auth.Username` has always
--- meant in practice.
 function M.static_authenticator(opts)
     assert(type(opts.username) == "string", "username required")
 
@@ -345,9 +246,6 @@ function M.static_authenticator(opts)
         superuser  = true,
     }
 
-    -- A one-entry store, inline rather than via src/server/users.lua: that
-    -- module builds stores from config and requires THIS one to parse
-    -- credentials, so depending on it here would be a cycle.
     local names = { opts.username }
     local store = {
         get           = function(_, name) return name == opts.username and user or nil end,
@@ -365,20 +263,15 @@ function M.static_authenticator(opts)
         max_failure_entries = opts.max_failure_entries,
         max_inflight   = opts.max_inflight,
     })
-    -- Historical field, still read by anything that introspects the
-    -- authenticator (and by tests).
     a.username      = opts.username
     a.password_hash = password_hash
     return a
 end
 
--- Install a cooperative-yield callback (the Server passes one that parks the
--- current coroutine on the reactor for a tick). With it installed, a PBKDF2
--- verification no longer freezes the event loop for its full duration.
 function Auth:set_yield_fn(fn)
     self.yield_fn = fn
 end
- 
+
 function Auth:_maybe_sweep(now)
     if now - self.last_sweep < 30 then return end
     self.last_sweep = now
@@ -393,10 +286,6 @@ function Auth:_maybe_sweep(now)
     end
 end
 
--- Emergency eviction: caller exceeded max_failure_entries. Drop the
--- oldest non-banned entries until we're back under the cap. This bounds
--- memory under a rotating-IP attack at the cost of forgetting some
--- recent failures (those entries' attacker just got luckier).
 function Auth:_evict_oldest(now)
     local victims = {}
     for ip, rec in pairs(self.failures) do
@@ -453,9 +342,6 @@ function Auth:_record_failure(ip, now)
     end
 end
 
--- The authorization-relevant view of a user: no credential material, so it
--- can be attached to a connection, logged, and passed to handlers freely.
--- Memoized on the user record — it is read on every gated request.
 local function principal_of(user)
     if not user.principal then
         user.principal = {
@@ -469,13 +355,10 @@ local function principal_of(user)
 end
 M.principal_of = principal_of
 
--- Keyed digest of a credential pair for the success cache. \0 separates the
--- fields so ("ab","c") can't collide with ("a","bc").
 function Auth:_cred_digest(user, pass)
     return sha2.hmac(sha2.sha256, self.cred_key, (user or "") .. "\0" .. (pass or ""))
 end
 
--- Clear an IP's failure record after a success.
 function Auth:note_success(ip)
     ip = ip or "?"
     if self.failures[ip] ~= nil then
@@ -484,8 +367,6 @@ function Auth:note_success(ip)
     end
 end
 
--- Record a failed attempt against an IP (public: the SCRAM handler in
--- src/server/handlers.lua drives its own exchange and reports the outcome).
 function Auth:note_failure(ip)
     self:_record_failure(ip or "?", socket.gettime())
 end
@@ -495,8 +376,6 @@ function Auth:principal(username)
     return user and principal_of(user) or nil
 end
 
--- Returns (ok, err, principal). The principal is what the request path
--- authorizes against; nil on failure.
 function Auth:verify(user, pass, ip)
     local now = socket.gettime()
     self:_maybe_sweep(now)
@@ -510,11 +389,6 @@ function Auth:verify(user, pass, ip)
 
     local record = self.store:get(user)
 
-    -- Fast path: exactly the credentials that last verified successfully for
-    -- this user. Skips the expensive PBKDF2 for legitimate reconnects; a wrong
-    -- guess never matches (the digest is HMAC-keyed and success-only).
-    -- Revealing "these are the good credentials" via the faster path is moot —
-    -- a successful AUTH reveals that anyway.
     local digest = self:_cred_digest(user, pass)
     if record and self.cred_cache[user]
        and compare_secure(digest, self.cred_cache[user]) then
@@ -522,22 +396,13 @@ function Auth:verify(user, pass, ip)
         return true, nil, principal_of(record)
     end
 
-    -- Concurrency gate on the expensive derivation. Rejected attempts do NOT
-    -- count toward the IP ban — the gate trips under an attacker's parallel
-    -- flood, and a legitimate user caught in it should retry, not get banned.
     if self.inflight >= self.max_inflight then
         return false, "auth busy, retry"
     end
 
-    -- An unknown username is verified against the decoy credential so it costs
-    -- the same derivation a real one does. Without this, response time answers
-    -- "does this account exist?" for free, and a user list is the first half of
-    -- a credential-stuffing run.
     local parsed = record and record.parsed or self.decoy
 
     self.inflight = self.inflight + 1
-    -- pcall guards the inflight counter — a yield_fn that throws at shutdown
-    -- must not leak a slot.
     local ok, pass_ok = pcall(M.verify_password, parsed, pass or "",
         { yield_fn = self.yield_fn })
     self.inflight = self.inflight - 1
@@ -555,23 +420,7 @@ function Auth:verify(user, pass, ip)
     return false, "invalid credentials"
 end
 
-------------------------------------------------------------------------------
--- SCRAM support
---
--- The handler owns the exchange (it spans three frames and lives on the
--- connection); the authenticator owns the credential lookup and the lockout
--- bookkeeping, so both mechanisms share one ban table.
-------------------------------------------------------------------------------
 
--- What the server needs to answer a client-first message. For an unknown user
--- this returns a DECOY whose salt and iteration count are derived from the
--- username — stable across attempts, indistinguishable from a real account,
--- and guaranteed to fail at proof verification. A server that answered "no
--- such user" here, or that produced a fresh random salt each time, would leak
--- the user list to anyone who can open a socket.
---
--- Returns (credential, principal_or_nil) where credential =
--- { salt, iterations, stored_key, server_key }.
 function Auth:scram_credential(username)
     local record = self.store:get(username)
     if record then

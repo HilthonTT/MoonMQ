@@ -1,6 +1,3 @@
--- read_committed isolation + Last Stable Offset (docs/transactions.md §2 —
--- the previously deferred half of the transactions design).
-
 local brk_m      = require("src.broker")
 local txn_m      = require("src.broker.txn_coordinator")
 local consumer_m = require("src.broker.consumer")
@@ -18,9 +15,6 @@ local function rmdir(path)
     end
 end
 
--- Transactional produce exactly like the produce handler: enrol first (the
--- coordinator captures the pre-append LEO), then append a record marked with
--- ATTR_TXN + the producer session.
 local function txn_produce(broker, txn_id, pid, epoch, topic_name, partition_id, key, value)
     local topic = assert(broker:get_topic(topic_name))
     assert(broker.transactions:add_partition(txn_id, pid, epoch, topic_name, partition_id))
@@ -41,7 +35,6 @@ local function poll_values(consumer)
     return out
 end
 
--- Drain every available record (poll returns at most one per partition pass).
 local function drain(consumer, max_polls)
     local all = {}
     for _ = 1, max_polls or 20 do
@@ -127,16 +120,12 @@ describe("read_committed isolation", function()
         plain_produce(broker, "out", 1, "k", "stable")
         assert(broker.transactions:begin("t-open", pid, epoch))
         txn_produce(broker, "t-open", pid, epoch, "out", 1, "k", "pending")
-        -- A non-txn record written AFTER the open transaction's first record
-        -- is above the LSO too — read_committed must hold it back to preserve
-        -- offset order.
         plain_produce(broker, "out", 1, "k", "later")
 
         local rc = consumer_m.Consumer.new(broker, "g", { isolation = "read_committed" })
         assert(rc:subscribe("out"))
         assert.are.same({ "stable" }, drain(rc))
 
-        -- Commit resolves the txn: everything becomes readable.
         assert(broker.transactions:end_txn("t-open", pid, epoch, true))
         assert.are.same({ "pending", "later" }, drain(rc))
     end)
@@ -171,7 +160,6 @@ describe("read_committed isolation", function()
             local pid, epoch = assert(broker.producer_state:get_or_create_producer("t-orphan"))
             assert(broker.transactions:begin("t-orphan", pid, epoch))
             txn_produce(broker, "t-orphan", pid, epoch, "out", 1, "k", "orphan")
-            -- Crash: no end_txn.
             for _, p in ipairs(assert(broker:get_topic("out")).partitions) do
                 if p.sync then p:sync() end
             end
@@ -198,8 +186,8 @@ describe("read_committed isolation", function()
         txn_produce(broker, "t-A", pid_a, epoch_a, "out", 1, "k", "a1")
         txn_produce(broker, "t-B", pid_b, epoch_b, "out", 1, "k", "b1")
         txn_produce(broker, "t-A", pid_a, epoch_a, "out", 1, "k", "a2")
-        assert(broker.transactions:end_txn("t-A", pid_a, epoch_a, false))  -- abort A
-        assert(broker.transactions:end_txn("t-B", pid_b, epoch_b, true))   -- commit B
+        assert(broker.transactions:end_txn("t-A", pid_a, epoch_a, false))
+        assert(broker.transactions:end_txn("t-B", pid_b, epoch_b, true))
 
         local rc = consumer_m.Consumer.new(broker, "g", { isolation = "read_committed" })
         assert(rc:subscribe("out"))
@@ -216,7 +204,7 @@ describe("read_committed isolation", function()
         local leo_before = part.offset
 
         assert(broker.transactions:begin("t-lso", pid, epoch))
-        assert.is_nil(broker.transactions:lso("out", 1))   -- nothing enrolled yet
+        assert.is_nil(broker.transactions:lso("out", 1))
         txn_produce(broker, "t-lso", pid, epoch, "out", 1, "k", "v1")
         assert.are.equal(leo_before, broker.transactions:lso("out", 1))
 

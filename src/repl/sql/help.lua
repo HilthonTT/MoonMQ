@@ -1,7 +1,3 @@
--- Help text for the SQL-like console, keyed by the leading command word.
--- Shown by `HELP;` (overview) and `HELP <command>;` (one entry). Kept plain so
--- it renders the same with or without a color-capable terminal.
-
 return {
     _order = {
         "connect", "disconnect", "create", "list",

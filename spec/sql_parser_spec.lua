@@ -1,6 +1,5 @@
 local Parser = require("src.repl.sql.parser")
 
--- Parse a single statement and return its AST node (asserting success).
 local function one(src)
     local stmts, err = Parser.parse(src)
     assert(stmts, err and err.message)

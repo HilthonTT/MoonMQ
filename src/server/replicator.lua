@@ -1,31 +1,11 @@
--- Replicator — leader-side replication to statically-configured followers.
---
--- Single-leader, no automatic election: the broker is told its role and its
--- peers via config. On the leader, every produced record is serialized and
--- shipped to each follower's POST /replicate endpoint (src/server/replica_server).
--- Per (topic, partition) we track each follower's log-end offset (LEO) as it
--- acks, which gives:
---   * an in-sync-replica (ISR) view: a follower is in-sync while its LEO is
---     within `lag_max` of the leader's LEO.
---   * a high-watermark: the min LEO across in-sync followers.
--- acks=all uses wait_for() to block a produce until every follower has the
--- record (or the ack timeout fires).
---
--- Followers are injected as { { id=, client= }, ... } where `client:send(topic,
--- partition, leader_id, payload)` returns (follower_leo, err). Production passes
--- ReplicaClient (src/server/replica.lua); tests inject a mock. Sends are drained
--- by per-follower worker coroutines on the reactor (blocking HTTP, fine on a
--- LAN/loopback); wait_for parks on reactor:sleep between checks.
-
 local log = require("src.log.logger").get("replicator")
 
 local Replicator = {}
 Replicator.__index = Replicator
 
 local DEFAULT_ACK_TIMEOUT = 5
-local DEFAULT_LAG_MAX     = 0   -- follower must be fully caught up to count in-sync
+local DEFAULT_LAG_MAX     = 0
 
--- reactor may be nil in unit tests that drive _drain() synchronously.
 function Replicator.new(reactor, replica_id, followers, opts)
     assert(type(replica_id) == "number", "replica_id must be a number")
     assert(type(followers) == "table", "followers must be a list")
@@ -34,10 +14,10 @@ function Replicator.new(reactor, replica_id, followers, opts)
     local self = setmetatable({
         reactor     = reactor,
         replica_id  = replica_id,
-        followers   = followers,   -- { { id=, client= }, ... }
+        followers   = followers,
         ack_timeout = opts.ack_timeout or DEFAULT_ACK_TIMEOUT,
         lag_max     = opts.lag_max or DEFAULT_LAG_MAX,
-        tp          = {},          -- "topic\0partition" -> state
+        tp          = {},
     }, Replicator)
     return self
 end
@@ -59,9 +39,6 @@ function Replicator:_state(topic, partition)
     return s
 end
 
--- replicate ships one already-serialized record to every follower. `leo` is the
--- leader's log-end offset AFTER this record (what a follower must reach to be
--- considered to have the record). Non-blocking: enqueues and wakes a worker.
 function Replicator:replicate(topic, partition, leo, bytes)
     if #self.followers == 0 then return end
     local s = self:_state(topic, partition)
@@ -76,14 +53,12 @@ function Replicator:replicate(topic, partition, leo, bytes)
             if self.reactor then
                 self.reactor:spawn(function() self:_drain(topic, partition, i) end)
             else
-                self:_drain(topic, partition, i)   -- synchronous (tests)
+                self:_drain(topic, partition, i)
             end
         end
     end
 end
 
--- _drain empties one follower's queue, POSTing each record in order (so
--- per-follower ordering holds) and advancing that follower's known LEO.
 function Replicator:_drain(topic, partition, i)
     local s  = self:_state(topic, partition)
     local fs = s.followers[i]
@@ -106,13 +81,10 @@ function Replicator:_drain(topic, partition, i)
     fs.running = false
 end
 
--- in_sync reports whether follower `i` is within lag_max of the leader LEO.
 function Replicator:_in_sync(s, i)
     return (s.leo - s.followers[i].last_leo) <= self.lag_max
 end
 
--- high_watermark: the min LEO across in-sync followers, or nil when none are
--- in-sync. (Observability / future read_committed; acks=all uses all_reached.)
 function Replicator:high_watermark(topic, partition)
     local s = self:_state(topic, partition)
     local hwm, any = math.huge, false
@@ -135,8 +107,6 @@ function Replicator:in_sync_count(topic, partition)
     return n
 end
 
--- all_reached: have ALL followers acked up to `leo`? This is the acks=all
--- predicate (every configured replica must have the record).
 function Replicator:all_reached(topic, partition, leo)
     local s = self:_state(topic, partition)
     for i = 1, #self.followers do
@@ -145,10 +115,6 @@ function Replicator:all_reached(topic, partition, leo)
     return true
 end
 
--- wait_for blocks (yielding to the reactor) until every follower has reached
--- `leo`, or the ack timeout elapses. Returns (true, nil) or (nil, err).
--- Requires a reactor. If there are no followers it errors — acks=all is
--- meaningless with nothing to replicate to.
 function Replicator:wait_for(topic, partition, leo)
     if #self.followers == 0 then
         return nil, "acks=all requires configured replicas, none are set"
@@ -168,8 +134,6 @@ function Replicator:wait_for(topic, partition, leo)
     end
 end
 
--- Indirection so the deadline math is testable without a wall clock; the
--- reactor's socket lib provides gettime in production.
 function Replicator:_now()
     if self._now_override then return self._now_override() end
     return require("socket").gettime()

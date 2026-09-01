@@ -14,7 +14,6 @@ local function rmdir(path)
     end
 end
 
--- Count COMMIT / ABORT control markers in a partition.
 local function markers(part)
     local commits, aborts = 0, 0
     part:scan(function(_off, m)
@@ -27,10 +26,6 @@ local function markers(part)
     return commits, aborts
 end
 
--- Simulate a transactional produce the way the produce handler does: enrol the
--- partition BEFORE the append (so the coordinator captures the pre-append LEO
--- as the txn's first offset there), then write a record carrying the
--- transactional attr + producer session.
 local function txn_produce(broker, txn_id, pid, epoch, topic_name, partition_id, value)
     local topic = assert(broker:get_topic(topic_name))
     assert(broker.transactions:add_partition(txn_id, pid, epoch, topic_name, partition_id))
@@ -74,7 +69,6 @@ describe("transactions (atomic multi-partition)", function()
         local c2 = markers(out.partitions[2])
         assert.are.equal(1, c1, "partition 1 should have one COMMIT marker")
         assert.are.equal(1, c2, "partition 2 should have one COMMIT marker")
-        -- Buffered offset was applied on commit.
         assert.are.equal(99, broker:fetch_offset("grp", "in", 1))
         assert.are.equal(txn_m.STATES.COMPLETE_COMMIT,
             broker.transactions:current("txn-1").state)
@@ -102,7 +96,6 @@ describe("transactions (atomic multi-partition)", function()
     it("fences a producer with a stale epoch", function()
         local broker = assert(brk_m.Broker.new(BASE_DIR))
         local pid = assert(broker.producer_state:get_or_create_producer("txn-3"))
-        -- A new session bumps the epoch to 1; epoch 0 is now a zombie.
         local _, epoch1 = assert(broker.producer_state:get_or_create_producer("txn-3"))
         assert.are.equal(1, epoch1)
         local ok, err, code = broker.transactions:begin("txn-3", pid, 0)
@@ -127,7 +120,6 @@ describe("transactions (atomic multi-partition)", function()
             local pid, epoch = assert(broker.producer_state:get_or_create_producer("txn-5"))
             assert(broker.transactions:begin("txn-5", pid, epoch))
             txn_produce(broker, "txn-5", pid, epoch, "out", 1, "orphan")
-            -- No end_txn: simulate a crash mid-transaction.
             flush_txn_state(broker)
             for _, p in ipairs(assert(broker:get_topic("out")).partitions) do
                 if p.sync then p:sync() end
@@ -151,8 +143,6 @@ describe("transactions (atomic multi-partition)", function()
             txn_produce(broker, "txn-6", pid, epoch, "out", 1, "z")
             assert(broker.transactions:add_offsets("txn-6", pid, epoch, "grp",
                 { { topic = "in", partition = 1, offset = 77 } }))
-            -- Simulate a crash AFTER the commit decision was made durable
-            -- (PREPARE_COMMIT) but BEFORE markers/offsets were finished.
             local t = broker.transactions:current("txn-6")
             t.state = txn_m.STATES.PREPARE_COMMIT
             assert(broker.transactions:_persist("txn-6"))

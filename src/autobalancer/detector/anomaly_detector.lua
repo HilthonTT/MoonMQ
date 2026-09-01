@@ -2,23 +2,9 @@ local constants = require("src.autobalancer.common.constants")
 local Resource  = require("src.autobalancer.common.resource")
 local Log       = require("src.log.logger")
 
--- The AnomalyDetector runs one detection pass: freeze the live ClusterModel,
--- run each goal in priority order against the shared snapshot (so a later goal
--- sees the moves an earlier one made), collect the resulting Actions into a
--- rebalance plan, and optionally hand that plan to an executor. Mirrors
--- AutoMQ's AnomalyDetector, minus the built-in scheduler: the host drives
--- run_once() from its own loop (e.g. a reactor coroutine), keeping this module
--- free of any I/O or timing assumptions.
 local AnomalyDetector = {}
 AnomalyDetector.__index = AnomalyDetector
 
--- opts:
---   goals                   ordered goal list (required; see config.build_goals)
---   max_actions_per_detect  hard cap on plan size (default: unlimited)
---   emit_metrics            publish gauges/counters to src/metrics (default true)
---   execute                 optional fn(actions) -> ok, err; run per pass with
---                           the plan. Absent = dry-run (plan only).
---   metrics                 metrics module override (mostly for tests)
 function AnomalyDetector.new(cluster_model, opts)
     assert(cluster_model, "cluster_model required")
     opts = opts or {}
@@ -34,7 +20,7 @@ function AnomalyDetector.new(cluster_model, opts)
         max_actions_per_detect = opts.max_actions_per_detect,
         emit_metrics           = emit,
         execute                = opts.execute,
-        metrics                = opts.metrics,   -- lazily required if nil
+        metrics                = opts.metrics,
         log                    = Log.get(constants.AUTO_BALANCER_LOGGER_CLAZZ),
         last_plan              = {},
     }, AnomalyDetector)
@@ -46,13 +32,6 @@ function AnomalyDetector:_metrics()
     return self.metrics
 end
 
--- Compute the rebalance plan without executing it. Returns (actions, snapshot)
--- so callers can inspect the post-plan cluster state the goals converged on.
---
--- Goals apply their accepted actions to the shared snapshot as they generate
--- them, so when the plan cap truncates a goal's output the EXCESS actions must
--- be undone in the snapshot — otherwise later goals (and the published
--- metrics) would reason from placements the executed plan never creates.
 function AnomalyDetector:detect()
     local snapshot = self.cluster_model:snapshot()
     local actions = {}
@@ -65,8 +44,6 @@ function AnomalyDetector:detect()
             actions[#actions + 1] = produced[i]
         end
         if #produced > room then
-            -- Revert the dropped tail, newest first, so the snapshot matches
-            -- exactly the actions that made it into the plan.
             for i = #produced, room + 1, -1 do
                 local undone, uerr = snapshot:apply_action(produced[i]:undo())
                 if not undone then
@@ -115,14 +92,10 @@ function AnomalyDetector:_publish(snapshot, actions)
     if swaps > 0 then m.inc("moonmq_autobalancer_actions_total", swaps, { type = "SWAP" }) end
 end
 
--- One full pass: detect -> publish metrics -> execute (if wired). Returns
--- (actions, err). A dry-run (no execute hook) returns the plan with err = nil.
 function AnomalyDetector:run_once()
     local actions, snapshot = self:detect()
     self.last_plan = actions
 
-    -- Note: metrics reflect the POST-plan snapshot (goals mutate it in place),
-    -- i.e. the balanced state the plan is designed to reach.
     self:_publish(snapshot, actions)
 
     if #actions == 0 then

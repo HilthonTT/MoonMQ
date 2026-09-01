@@ -1,11 +1,3 @@
--- End-to-end authorization and quota enforcement, at the handler layer.
---
--- The unit tests for src/server/acl.lua prove the ACL answers correctly. This
--- file proves the handlers ASK — which is the failure mode that matters, since
--- a gate nobody calls tests green in every other file. Every handler that
--- names a topic or a group gets a case here for both outcomes, and the
--- filtered listings get one for each direction.
-
 local proto      = require("src.wire.protocol")
 local uuid       = require("src.core.uuid")
 local brk_m      = require("src.broker")
@@ -32,7 +24,6 @@ end
 
 local function unframe(frame) return proto.parse_frame(frame:sub(5)) end
 
--- A connection carrying a principal, which is all the gates read from it.
 local function conn_with(acl_rules, quota)
     local principal
     if acl_rules ~= "open" then
@@ -56,7 +47,6 @@ local function conn_with(acl_rules, quota)
     }
 end
 
--- op of the LAST frame a connection sent, and its payload.
 local function last_reply(conn)
     local op, _, payload = unframe(conn.sent[#conn.sent])
     return op, payload
@@ -113,7 +103,6 @@ describe("handler authorization", function()
 
     after_each(function() rmdir(BASE_DIR) end)
 
-    -- The tenant may read and write orders.*, and describe it; nothing else.
     local TENANT = {
         { Resource = "topic", Name = "orders.*",
           Operations = { "read", "write", "describe" } },
@@ -137,8 +126,6 @@ describe("handler authorization", function()
             local conn = call(handlers.produce, conn_with(TENANT),
                 proto.encode_produce(uuid.bytes(), "billing", "k", "v"))
             local e = expect_denied(conn)
-            -- The message names the operation and resource, so the operator
-            -- knows which rule is missing.
             assert.is_truthy(e.message:find("write"))
             assert.is_truthy(e.message:find("billing"))
         end)
@@ -172,8 +159,6 @@ describe("handler authorization", function()
         end)
 
         it("refuses a fetch through a forbidden group", function()
-            -- The topic is allowed; borrowing another tenant's group to read it
-            -- would let this principal wreck that group's committed position.
             local conn = call(handlers.fetch, conn_with(TENANT),
                 proto.encode_fetch(uuid.bytes(), "orders.eu", "someone-else", 10))
             local e = expect_denied(conn)
@@ -193,7 +178,6 @@ describe("handler authorization", function()
         end)
 
         it("refuses a join_group naming a forbidden topic", function()
-            -- The assignment alone would hand this member the topic's records.
             local conn = call(handlers.join_group, conn_with(TENANT),
                 proto.encode_join_group(uuid.bytes(), "orders-eu", "", { "billing" }))
             expect_denied(conn)
@@ -211,7 +195,6 @@ describe("handler authorization", function()
             local conn = call(handlers.delete_topic, conn_with(TENANT),
                 proto.encode_delete_topic(uuid.bytes(), "orders.eu"))
             expect_denied(conn)
-            -- And the topic is still there.
             assert.is_truthy(broker.topic_manager.topics["orders.eu"])
         end)
 
@@ -361,7 +344,6 @@ describe("handler quota enforcement", function()
         assert.are.equal(proto.OP_ERROR, op)
         local e = assert(proto.decode_error(payload))
         assert.are.equal(proto.ERR_RATE_LIMITED, e.code)
-        -- The client is told how long to wait, not merely that it failed.
         assert.is_truthy(e.message:find("retry in"))
         assert.is_truthy(e.message:find("user"))
     end)
@@ -378,9 +360,6 @@ describe("handler quota enforcement", function()
     end)
 
     it("meters per principal, not per connection", function()
-        -- Two connections, one user: opening a second socket must not double
-        -- the budget. This is the whole reason quotas exist alongside the
-        -- per-connection rate limiter.
         local c1, c2 = conn_with("all"), conn_with("all")
         for _ = 1, 3 do produce(c1) end
         produce(c2)
@@ -391,8 +370,6 @@ describe("handler quota enforcement", function()
     end)
 
     it("refuses a fetch from a consumer carrying delivery debt", function()
-        -- Delivery is metered after the fact, so an oversized batch leaves the
-        -- bucket in debt; the next FETCH is what pays for it.
         server.quotas = quota_m.new({
             default       = assert(quota_m.spec({ FetchRecordsPerSec = 2 })),
             burst_seconds = 1,
@@ -408,17 +385,15 @@ describe("handler quota enforcement", function()
             handlers.fetch(server, conn, uuid.bytes(), payload)
         end
 
-        fetch()   -- delivers up to 6 records against a 2-record bucket
+        fetch()
         assert.are.equal(proto.OP_OK, (last_reply(conn)))
 
-        fetch()   -- the debt is now owed
+        fetch()
         local op, payload = last_reply(conn)
         assert.are.equal(proto.OP_ERROR, op)
         assert.are.equal(proto.ERR_RATE_LIMITED,
             assert(proto.decode_error(payload)).code)
 
-        -- An empty poll must not be billed: after enough time the bucket is
-        -- back in credit and the fetch goes through even with no records left.
         clock.now = clock.now + 10
         fetch()
         assert.are.equal(proto.OP_OK, (last_reply(conn)))
@@ -459,8 +434,6 @@ describe("metrics endpoint authentication", function()
         assert.is_false((e:_authorized(headers("Bearer wrong"), "1.2.3.4")))
         assert.is_false((e:_authorized(headers(), "1.2.3.4")))
         assert.is_false((e:_authorized(headers("Basic YWRtaW46YWRtaW4="), "1.2.3.4")))
-        -- A prefix of the token must not pass: the compare is over the whole
-        -- string, in constant time.
         assert.is_false((e:_authorized(headers("Bearer s3cret"), "1.2.3.4")))
     end)
 
@@ -482,8 +455,6 @@ describe("metrics endpoint authentication", function()
     end)
 
     it("requires cluster:describe, not merely a valid password", function()
-        -- A tenant with topic ACLs has no business reading broker-wide
-        -- counters, or the topic names /stats lists.
         local store = assert(users_m.load({
             Users = {
                 { Username = "tenant", PasswordHash =

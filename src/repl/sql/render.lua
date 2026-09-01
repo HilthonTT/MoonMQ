@@ -1,12 +1,7 @@
--- Rendering helpers for the SQL-like console: an ASCII result-set table and
--- coloring. Colors are optional — if the `term` module isn't available the
--- functions degrade to plain text, which keeps this module usable in tests.
-
 local ok_colors, colors = pcall(require, "term.colors")
 
 local M = {}
 
--- Apply a color function/escape if colors are available, else return s.
 local function paint(color, s)
     if not ok_colors then return s end
     local c = colors[color]
@@ -18,7 +13,6 @@ end
 M.paint = paint
 
 local function display_width(s)
-    -- Records may carry newlines; collapse them so a cell stays one line.
     return #(tostring(s):gsub("[\r\n]", " "))
 end
 
@@ -26,9 +20,6 @@ local function one_line(s)
     return (tostring(s):gsub("[\r\n]", " "))
 end
 
--- Render a result set as a bordered table. `columns` is an array of header
--- strings; `rows` is an array of arrays of cell values. Returns a string
--- (no trailing newline).
 function M.table(columns, rows)
     local widths = {}
     for i, h in ipairs(columns) do

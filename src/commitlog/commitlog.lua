@@ -1,18 +1,3 @@
--- CommitLog: an append-only, segmented message log, a Lua port of jocko's
--- commitlog/commitlog.go (https://github.com/travisjeffery/jocko).
---
--- A log is a directory of segments. Each segment is a "<base_offset>.log" file
--- (a run of self-framing, CRC-protected records — see src/record/message.lua)
--- paired with a "<base_offset>.index" sidecar (offset -> byte position). The
--- active (newest) segment receives appends; when it fills past
--- max_segment_bytes a new one is rolled and a cleaner runs over the set to
--- enforce the cleanup policy (delete old data by byte budget, or compact by
--- key). Offsets are message counts and increase monotonically across the log.
---
--- This is a self-contained storage subsystem. The production server path uses
--- src/storage/segmentation.lua (SegmentedPartition) instead; CommitLog is the
--- direct jocko analogue, exposed via src/commitlog/init.lua.
-
 local compact_cleaner = require("src.commitlog.compact_cleaner")
 local delete_cleaner  = require("src.commitlog.delete_cleaner")
 local segment_m       = require("src.commitlog.segment")
@@ -34,18 +19,10 @@ local CleanupPolicy = {
 local LogFileSuffix   = ".log"
 local IndexFileSuffix = ".index"
 
--- Rolled when the active segment would exceed this. jocko leaves a 0 here as a
--- TODO; we pick a concrete default so a zero/omitted option still rolls.
-local DEFAULT_MAX_SEGMENT_BYTES = 64 * 1024 * 1024  -- 64 MiB
+local DEFAULT_MAX_SEGMENT_BYTES = 64 * 1024 * 1024
 
--- max_log_bytes == -1 means "retain everything" (the DeleteCleaner skips). We
--- map a 0 (the zero value of the option) to that so an unconfigured log never
--- silently discards data on the first roll.
 local RETAIN_ALL = -1
 
--- ---------------------------------------------------------------------------
--- Options
--- ---------------------------------------------------------------------------
 local Options = {}
 Options.__index = Options
 
@@ -66,9 +43,6 @@ function Options.new(path, max_segment_bytes, max_log_bytes, cleanup_policy)
     }, Options)
 end
 
--- ---------------------------------------------------------------------------
--- CommitLog
--- ---------------------------------------------------------------------------
 local CommitLog = {}
 CommitLog.__index = CommitLog
 
@@ -79,7 +53,6 @@ function CommitLog.new(options)
         return nil, "path is empty"
     end
 
-    -- Fill defaults for the zero values jocko left as TODOs.
     if options.max_segment_bytes == 0 then
         options.max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES
     end
@@ -87,13 +60,6 @@ function CommitLog.new(options)
         options.max_log_bytes = RETAIN_ALL
     end
 
-    -- The index stores each record's byte position as a big-endian u32
-    -- (src/commitlog/index.lua). If a segment is allowed to grow past 4 GiB, a
-    -- record positioned beyond 2^32-1 makes string.pack(">I4", position) raise
-    -- an uncaught error inside the append path and crash the writer. Reject the
-    -- misconfiguration up front rather than failing on a future append. A
-    -- segment can slightly overshoot its cap before rolling, so bound with a
-    -- margin below the u32 ceiling.
     local MAX_SEGMENT_BYTES_LIMIT = 0xFFFFFFFF - (64 * 1024 * 1024)
     if options.max_segment_bytes > MAX_SEGMENT_BYTES_LIMIT then
         return nil, string.format(
@@ -138,24 +104,12 @@ function CommitLog:init()
     return nil
 end
 
--- open scans the log directory, loads every ".log" segment, drops any orphan
--- ".index" (one whose ".log" is gone), and — if the directory is empty —
--- creates an initial segment at offset 0. Segments are sorted by base_offset
--- and the newest becomes active.
 function CommitLog:open()
     local files, ferr = fs_m.read_dir(self.path)
     if not files then
         return string.format("read dir failed: %s", tostring(ferr))
     end
 
-    -- Recover from a crash mid-compaction. Segment:replace renames the
-    -- ".cleaned" twin over the canonical name, but on Windows that rename is
-    -- remove-then-rename (non-atomic). A crash in the gap can leave the
-    -- canonical ".log" gone with only "<base>.log.cleaned" — the fully-written,
-    -- fsync'd replacement — surviving. Promote such an orphan; if the canonical
-    -- ".log" still exists, compaction didn't complete and the twin is
-    -- discardable. ".index.cleaned" is always discardable (indexes rebuild from
-    -- the log). Re-read the directory afterward so the promoted names are seen.
     local CLEANED = ".cleaned"
     local repaired = false
     for _, name in ipairs(files) do
@@ -188,8 +142,6 @@ function CommitLog:open()
 
     for _, name in ipairs(files) do
         if string_m.endswith(name, IndexFileSuffix) then
-            -- Orphan-index check: a ".index" with no matching ".log" is
-            -- leftover junk (e.g. a crashed compaction). Remove it.
             local log_name = string_m.trimsuffix(name, IndexFileSuffix) .. LogFileSuffix
             local log_full = fs_m.join_path(self.path, log_name)
             if not fs_m.exists(log_full) then
@@ -215,8 +167,6 @@ function CommitLog:open()
         self.segments[#self.segments + 1] = segment
     end
 
-    -- read_dir order isn't guaranteed; segment logic relies on ascending
-    -- base_offset.
     table.sort(self.segments, function(a, b)
         return a.base_offset < b.base_offset
     end)
@@ -225,24 +175,15 @@ function CommitLog:open()
     return nil
 end
 
--- check_split reports whether the active segment is full and a roll is due.
 function CommitLog:check_split()
     return self.active_segment:is_full()
 end
 
--- split rolls a new active segment at the current newest offset and runs the
--- cleaner over the full segment set, replacing the kept list. Mirrors jocko's
--- split(): the cleaner may delete (DeleteCleaner) or rewrite (CompactCleaner)
--- segments. Returns nil on success, err string otherwise.
 function CommitLog:split()
     local segment, serr = Segment.new(self.path, self:newest_offset(),
                                       self.options.max_segment_bytes)
     if not segment then return serr end
 
-    -- Persist the new segment's directory entry: on POSIX the freshly created
-    -- .log/.index files aren't crash-durable until the parent dir is fsynced.
-    -- Non-fatal — the empty segment is reconstructable, but fsyncing here means
-    -- a crash right after a roll can't lose the fact that the roll happened.
     local dok, derr = io_sync.sync_dir(self.path)
     if not dok then
         log:warn("dir fsync after segment roll failed: %s", tostring(derr))
@@ -252,26 +193,15 @@ function CommitLog:split()
     for i = 1, #self.segments do segments[i] = self.segments[i] end
     segments[#segments + 1] = segment
 
-    -- The cleaner may return a valid segment list ALONGSIDE an error (partial
-    -- compaction — see CompactCleaner:clean). Adopt whatever list it says is
-    -- live before propagating the error, so self.segments never points at
-    -- closed/renamed-over segment objects.
     local cleaned, cerr = self.cleaner:clean(segments)
     if cleaned then
         self.segments = cleaned
-        -- The newest segment is always the last of the returned list. We can't
-        -- reuse the local `segment` handle directly: the CompactCleaner replaces
-        -- each segment (including this fresh one) with a ".cleaned" twin and
-        -- closes the original, so the live active is whatever sits at the tail.
         self.active_segment = cleaned[#cleaned]
     end
     if cerr then return cerr end
     return nil
 end
 
--- append writes one pre-serialized record, assigning it the next offset.
--- Returns (offset, nil) or (nil, err). Use append_message for the common case
--- of appending a Message.
 function CommitLog:append(record)
     assert(type(record) == "string", "record must be a string")
 
@@ -287,12 +217,6 @@ function CommitLog:append(record)
     local ok, werr = seg:write(record)
     if not ok then return nil, werr end
 
-    -- Index the record after the log write succeeds, so we never point the
-    -- index at bytes that failed to land. If indexing fails, roll the log
-    -- write back: otherwise the segment's next_offset/position would count a
-    -- record the index can't resolve, and a later read of that tail offset
-    -- would fault. `offset` is the pre-write next_offset, so it's exactly the
-    -- counter value to restore.
     local ierr = seg.index:write_entry(offset, position)
     if ierr then
         seg:rewind(position, offset)
@@ -302,8 +226,6 @@ function CommitLog:append(record)
     return offset, nil
 end
 
--- append_message serializes `msg` (a src/record/message.lua Message) and
--- appends it. Returns (offset, nil) or (nil, err).
 function CommitLog:append_message(msg)
     assert(getmetatable(msg) == message_m.Message, "msg must be a Message instance")
     local record, serr = message_m.serialize_message(msg)
@@ -313,8 +235,6 @@ function CommitLog:append_message(msg)
     return self:append(record)
 end
 
--- segment_for_offset returns the segment owning `offset`
--- (base_offset <= offset < next_offset), or nil.
 function CommitLog:segment_for_offset(offset)
     for i = 1, #self.segments do
         local s = self.segments[i]
@@ -325,20 +245,10 @@ function CommitLog:segment_for_offset(offset)
     return nil
 end
 
--- next_readable_offset returns the smallest offset >= `offset` that a segment
--- actually owns, or nil if `offset` is at/after the tail. Compaction renumbers
--- each segment's survivors contiguously from its base_offset, leaving GAPS
--- between segments; a consumer whose cursor lands in such a gap gets an
--- "out of range" error from read_at forever. This lets the caller skip the gap
--- to the next real record instead. Within a segment offsets are dense, so a gap
--- only ever sits before some segment's base_offset.
 function CommitLog:next_readable_offset(offset)
     for i = 1, #self.segments do
         local s = self.segments[i]
         if offset < s.next_offset then
-            -- This is the first segment ending after `offset`. Either it owns
-            -- `offset` (offset >= base_offset) or `offset` sits in the gap just
-            -- before it; the next readable record is at max(offset, base_offset).
             if offset >= s.base_offset then
                 return offset
             end
@@ -348,9 +258,6 @@ function CommitLog:next_readable_offset(offset)
     return nil
 end
 
--- read_at returns (Message, next_offset, nil) for the record at `offset`, or
--- (nil, nil, err). next_offset is offset+1 (message-count offsets), the value
--- to pass on the next call to stream forward.
 function CommitLog:read_at(offset)
     assert(type(offset) == "number", "offset must be a number")
 
@@ -371,13 +278,6 @@ function CommitLog:read_at(offset)
     return msg, offset + 1, nil
 end
 
--- each_message iterates every retained record in offset order, calling
--- fn(offset, msg). Unlike read_at(offset)+offset arithmetic, it walks each
--- segment's records directly, so it is robust to the offset *gaps* compaction
--- leaves between segments (a compacted segment renumbers its survivors
--- contiguously from its base_offset, so offsets are not dense across the log).
--- Each segment stops at its first torn/corrupt record. Used for full-log replay
--- (e.g. OffsetManager recovery).
 function CommitLog:each_message(fn)
     assert(type(fn) == "function", "fn must be a function")
     for i = 1, #self.segments do
@@ -387,20 +287,14 @@ function CommitLog:each_message(fn)
     end
 end
 
--- newest_offset is the offset the next appended record will receive (jocko's
--- NewestOffset == activeSegment.NextOffset).
 function CommitLog:newest_offset()
     return self.active_segment.next_offset
 end
 
--- oldest_offset is the base offset of the oldest retained segment.
 function CommitLog:oldest_offset()
     return self.segments[1].base_offset
 end
 
--- sync fsyncs the active segment's log to disk. The index is rebuildable from
--- the log on recovery, so only the log needs the durability barrier. Used by
--- the acks=1 path. Returns (true, nil) or (false, err).
 function CommitLog:sync()
     if not self.active_segment then
         return false, "no active segment"
@@ -416,7 +310,6 @@ function CommitLog:close()
     return nil
 end
 
--- delete removes the whole log directory and its contents.
 function CommitLog:delete()
     self:close()
     local ok, err = fs_m.remove_all(self.path)
@@ -424,10 +317,6 @@ function CommitLog:delete()
     return nil
 end
 
--- truncate removes every segment whose base_offset is below `offset`,
--- discarding that data (jocko's Truncate granularity is a whole segment).
--- If the cut would remove the active segment too, a fresh empty segment is
--- opened at `offset` so the log stays writable. Returns nil on success.
 function CommitLog:truncate(offset)
     assert(type(offset) == "number", "offset must be a number")
 
@@ -442,9 +331,6 @@ function CommitLog:truncate(offset)
         end
     end
 
-    -- If the active segment itself was below the cut, it's still in `kept`
-    -- (we never delete the active one above) — drop it now and start fresh
-    -- so reads below `offset` truly fail.
     if self.active_segment and self.active_segment.base_offset < offset then
         self.active_segment:delete()
         local fresh = {}

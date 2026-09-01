@@ -35,13 +35,8 @@ import requests
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway, start_http_server
 from prometheus_client.parser import text_string_to_metric_families
 
-# Own registry so we control exactly what gets pushed/exposed (and don't drag in
-# the default process/GC collectors when pushing to a gateway).
 REGISTRY = CollectorRegistry()
 
-# Derived lag gauges. MoonMQ does not break delivery down by partition or
-# consumer group over HTTP, so these are labelled by topic only — claiming a
-# partition/consumer_group dimension we can't actually observe would be a lie.
 consumer_lag_messages = Gauge(
     "moonmq_consumer_lag_messages",
     "Broker backlog: records produced but not yet delivered to a consumer",
@@ -82,9 +77,8 @@ class MoonMQLagMonitor:
         self.request_timeout = request_timeout
         self.logger = logging.getLogger(__name__)
 
-        # Counters are monotonic; to get a rate we remember the previous scrape.
-        self._prev_fetched = {}   # topic -> fetch_records_total
-        self._prev_time = None    # time.time() of the previous scrape
+        self._prev_fetched = {}
+        self._prev_time = None
 
     def scrape_counts(self):
         """Scrape /metrics and return per-topic {produced, fetched} totals.
@@ -138,8 +132,6 @@ class MoonMQLagMonitor:
             produced = totals["produced"]
             fetched = totals["fetched"]
 
-            # Backlog can't be negative; a consumer can't fetch more than was
-            # produced. Counter resets (broker restart) are clamped to 0 here.
             backlog = max(0.0, produced - fetched)
 
             rate = 0.0

@@ -1,19 +1,3 @@
--- TLS: configuration validation, and a real encrypted connection driven by
--- the reactor.
---
--- The configuration half matters because a TLS block that silently does not
--- apply is worse than no TLS at all — the operator believes the port is
--- encrypted. Every one of those cases is a hard error at load, and each is
--- pinned below.
---
--- The connection half matters because the interesting part of TLS on this
--- codebase is not the crypto, it is the event loop: a non-blocking TLS read
--- can need the socket to become WRITABLE (and vice versa), which no plaintext
--- socket ever does. So these run a genuine handshake and genuine traffic
--- through Reactor:read_exact / send_all, including a payload large enough to
--- span many TLS records and force partial writes — the exact shape that
--- breaks when want-states are mishandled.
-
 local tls_m   = require("src.io.tls")
 local Reactor = require("src.server.reactor")
 local socket  = require("socket")
@@ -36,10 +20,6 @@ local function exists(path)
     return false
 end
 
--- A throwaway self-signed certificate for 127.0.0.1/localhost. Generated
--- rather than committed: a private key in the repository is a key that ends up
--- trusted somewhere it should not be, and `openssl req` is present anywhere
--- luasec built.
 local CERT = BASE_DIR .. "/cert.pem"
 local KEY  = BASE_DIR .. "/key.pem"
 local OTHER_CERT = BASE_DIR .. "/other-cert.pem"
@@ -66,16 +46,12 @@ describe("tls configuration", function()
     it("returns nothing when no block is given", function()
         assert.is_nil((tls_m.server_config(nil, "Server.Tls")))
         assert.is_nil((tls_m.server_config({ Enabled = false }, "Server.Tls")))
-        -- Both halves of the return are nil: no config AND no error, which is
-        -- how callers tell "not asked for" from "asked for and broken".
         local cfg, err = tls_m.server_config(nil, "Server.Tls")
         assert.is_nil(cfg)
         assert.is_nil(err)
     end)
 
     it("treats a block with no Enabled key as enabled", function()
-        -- Writing out cert paths and getting plaintext because a flag was
-        -- missing is the trap this avoids.
         if not have_certs then return end
         local cfg = assert(tls_m.server_config(
             { CertFile = CERT, KeyFile = KEY }, "Server.Tls"))
@@ -154,12 +130,9 @@ describe("tls configuration", function()
     end)
 
     it("accepts `true` as shorthand, verifying against the system CA store", function()
-        -- luasec has no default trust store, so without this a bare
-        -- `tls = true` would either fail to start or — far worse — have to
-        -- default to not verifying anything.
         local cfg, err = tls_m.client_config(true, "T")
         if not cfg and err and err:find("CaFile") then
-            return   -- no system bundle on this host; the error is correct
+            return
         end
         assert.is_truthy(cfg, err)
         assert.are.equal("client", cfg.params.mode)
@@ -168,9 +141,6 @@ describe("tls configuration", function()
     end)
 
     it("never falls back to the system store for a listener", function()
-        -- Verify=required on a listener means mTLS against a private CA.
-        -- Accepting anything signed by a public CA on the box instead would
-        -- be a silent, severe widening.
         if not have_certs then return end
         local cfg, err = tls_m.server_config(
             { CertFile = CERT, KeyFile = KEY, Verify = "required" }, "T")
@@ -187,7 +157,6 @@ describe("tls configuration", function()
         for _, banned in ipairs({ "no_sslv2", "no_sslv3", "no_tlsv1", "no_tlsv1_1" }) do
             assert.is_true(opts[banned], banned .. " must be disabled")
         end
-        -- "any" rather than a pinned version, so TLS 1.3 is still reachable.
         assert.are.equal("any", cfg.params.protocol)
     end)
 
@@ -208,12 +177,6 @@ describe("tls configuration", function()
     end)
 
     it("validates without needing luasec installed", function()
-        -- Validation is a pure function of the block and the files it names.
-        -- It has to stay that way: when it also gated on the rock, a host
-        -- without luasec answered every mistake with "luasec is not
-        -- installed" and the operator never learned that their CertFile path
-        -- was wrong. Whether the rock is present is a separate question, and
-        -- require_available is where it is asked.
         local ok, err = tls_m.require_available("Server.Tls")
         if tls_m.available then
             assert.is_true(ok)
@@ -224,7 +187,6 @@ describe("tls configuration", function()
             assert.is_truthy(err:find("Server.Tls"))
         end
 
-        -- Either way the config layer reports the CONFIG problem.
         local cfg, cerr = tls_m.server_config({ Enabled = true }, "Server.Tls")
         assert.is_nil(cfg)
         assert.is_truthy(cerr:find("CertFile and KeyFile"))
@@ -232,11 +194,6 @@ describe("tls configuration", function()
 end)
 
 describe("tls hostname verification", function()
-    -- check_hostname is duck-typed over the certificate object, so these run
-    -- with or without luasec — and they are the only place the matching rules
-    -- are pinned. luasec validates the certificate CHAIN and stops there; if
-    -- this function is wrong, a certificate issued for any name the attacker
-    -- controls is accepted for ours.
 
     local function fake_sock(dns, ips, cns)
         local cert = {
@@ -260,10 +217,6 @@ describe("tls hostname verification", function()
         { "matches a dNSName SAN",
           { "localhost" }, { "127.0.0.1" }, { "moonmq" }, "localhost", true },
 
-        -- The case that sent this back for a fix: a cluster peer or a replica
-        -- is addressed by IP far more often than by name, and an IP never
-        -- appears as a dNSName. Without the iPAddress bucket a broker
-        -- rejected its own correctly-issued certificate.
         { "matches an iPAddress SAN when dialled by IP",
           { "localhost" }, { "127.0.0.1" }, { "moonmq" }, "127.0.0.1", true },
         { "matches an IPv6 SAN",
@@ -276,8 +229,6 @@ describe("tls hostname verification", function()
         { "never matches an IP against a dNSName",
           { "localhost" }, {}, {}, "127.0.0.1", false },
 
-        -- RFC 6125: the CN is a legacy fallback, consulted only when the
-        -- certificate carries no dNSName at all.
         { "ignores the CN when a dNSName SAN is present",
           { "localhost" }, {}, { "moonmq" }, "moonmq", false },
         { "falls back to the CN when there is no SAN",
@@ -321,13 +272,6 @@ end)
 
 describe("tls http_create", function()
     it("can be closed before connect succeeds", function()
-        -- socket.http wraps everything from settimeout onwards in a finalizer
-        -- that calls close() on this object. When close was only installed by
-        -- the method-forwarding loop that runs AFTER a successful connect, a
-        -- refused peer — the single most common outcome on an inter-broker
-        -- link — raised "attempt to call a nil value (method 'close')" from
-        -- inside luasocket instead of returning "connection refused", and
-        -- leaked the descriptor.
         local conn = tls_m.http_create({ mode = "client" }, 1, "127.0.0.1")()
         assert.is_truthy(conn)
         assert.are.equal("function", type(conn.close))
@@ -340,7 +284,6 @@ describe("tls http_create", function()
         local ltn12 = require("ltn12")
         local cfg = assert(tls_m.client_config({ Insecure = true }, "T"))
 
-        -- Port 1 on loopback: nothing is listening, so connect() fails at once.
         local ok, res, err = pcall(http.request, {
             url    = "https://127.0.0.1:1/cluster/ping",
             create = tls_m.http_create(cfg.params, 2, "127.0.0.1"),
@@ -359,18 +302,12 @@ describe("tls over the reactor", function()
         return
     end
 
-    -- Run one client exchange against a TLS echo listener, entirely inside the
-    -- reactor. Returns whatever the client function returned.
-    --
-    -- Both halves go through the reactor's own I/O, so the want-state handling
-    -- in read_exact/send_all is on the hot path of every case below.
     local function exchange(server_block, client_block, client_fn, port)
         local reactor = Reactor.new()
         local server_cfg = assert(tls_m.server_config(server_block, "test server"))
         local result, failure
 
         local _, lerr = reactor:listen("127.0.0.1", port, function(sock)
-            -- Echo server: read a length prefix, then that many bytes back.
             local header = reactor:read_exact(sock, 4, socket.gettime() + 5)
             if header then
                 local n = string.unpack(">I4", header)
@@ -400,7 +337,6 @@ describe("tls over the reactor", function()
             reactor:stop()
         end)
 
-        -- Safety net: never hang the suite if something goes wrong.
         reactor:spawn(function()
             reactor:sleep(20)
             reactor:stop()
@@ -436,11 +372,7 @@ describe("tls over the reactor", function()
     end)
 
     it("carries a payload spanning many TLS records", function()
-        -- A TLS record holds at most 16 KiB, so this is ~64 records. It is the
-        -- case that exercises partial writes and the want-state loops: a
-        -- reactor that mishandled "wantwrite" would truncate or hang here
-        -- rather than fail cleanly.
-        local payload = string.rep("MoonMQ/", 150000)   -- ~1 MB
+        local payload = string.rep("MoonMQ/", 150000)
         local out = exchange(
             { CertFile = CERT, KeyFile = KEY },
             { CaFile = CERT, Verify = "peer" },
@@ -451,7 +383,6 @@ describe("tls over the reactor", function()
     end)
 
     it("refuses a server whose certificate is signed by another CA", function()
-        -- The client trusts OTHER_CERT; the listener presents CERT.
         local out = exchange(
             { CertFile = CERT, KeyFile = KEY },
             { CaFile = OTHER_CERT, Verify = "peer" },
@@ -462,8 +393,6 @@ describe("tls over the reactor", function()
     end)
 
     it("connects to an untrusted server when verification is off", function()
-        -- The same pairing as above, with Insecure — which is exactly why
-        -- Insecure has to be spelled out rather than defaulted.
         local out = exchange(
             { CertFile = CERT, KeyFile = KEY },
             { Insecure = true },
@@ -478,11 +407,6 @@ describe("tls over the reactor", function()
             { CaFile = CERT, Verify = "peer" },
             echo_once("no client cert"), 19305)
 
-        -- The assertion is on the OUTCOME, not on which side notices first.
-        -- Under TLS 1.3 the client finishes its handshake without waiting for
-        -- the server's verdict, so the refusal surfaces as a dead connection
-        -- on the next read rather than as a handshake error — either way, no
-        -- data crosses, which is the property that matters.
         assert.is_nil(out.echoed,
             "a listener demanding client certs must not carry data without one")
     end)
@@ -497,9 +421,6 @@ describe("tls over the reactor", function()
     end)
 
     it("refuses a plaintext client on a TLS listener", function()
-        -- Not a crash, and not a hang: the handshake fails and the connection
-        -- is dropped, which is what an accidental `http://` on a TLS port
-        -- should look like.
         local reactor = Reactor.new()
         local server_cfg = assert(tls_m.server_config(
             { CertFile = CERT, KeyFile = KEY }, "test server"))
@@ -515,7 +436,6 @@ describe("tls over the reactor", function()
             local raw = assert(socket.connect("127.0.0.1", 19307))
             raw:settimeout(3)
             raw:send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-            -- The broker answers a non-TLS hello by dropping the connection.
             local _, err = raw:receive(1)
             closed = err
             raw:close()
@@ -531,10 +451,6 @@ describe("tls over the reactor", function()
     end)
 
     it("closes the socket when a handshake fails", function()
-        -- A failed handshake is the COMMON case on a public port — a plaintext
-        -- client, a scanner, a peer that dies mid-negotiation. Leaking the
-        -- descriptor on that path is a slow, self-inflicted fd exhaustion, so
-        -- this counts them directly.
         local function open_fds()
             local p = io.popen("ls /proc/self/fd 2>/dev/null | wc -l")
             if not p then return nil end
@@ -543,7 +459,7 @@ describe("tls over the reactor", function()
             return n
         end
 
-        if not open_fds() then return end   -- no /proc; nothing to measure
+        if not open_fds() then return end
 
         local reactor = Reactor.new()
         local server_cfg = assert(tls_m.server_config(
@@ -563,8 +479,6 @@ describe("tls over the reactor", function()
                     raw:close()
                 end
                 reactor:sleep(0.02)
-                -- Measure after the first few, so one-off allocations (the
-                -- listener, the SSL context) are not counted as growth.
                 if i == 5 then before = open_fds() end
             end
             reactor:sleep(0.2)
@@ -577,8 +491,6 @@ describe("tls over the reactor", function()
         reactor:shutdown()
 
         assert.is_truthy(before)
-        -- 20 more failed handshakes after the baseline. A leak would show up
-        -- as ~20 extra descriptors; a couple of transient ones is noise.
         assert.is_true(after - before < 5,
             string.format("descriptors grew by %d across %d failed handshakes",
                 after - before, attempts - 5))
@@ -596,14 +508,14 @@ describe("tls over the reactor", function()
             tls = server_cfg,
             pre_tls = function(_sock, _peer, ip)
                 pre_called = ip
-                return false   -- stand in for a banned IP
+                return false
             end,
         }))
 
         reactor:spawn(function()
             local raw = assert(socket.connect("127.0.0.1", 19308))
             raw:settimeout(2)
-            raw:receive(1)     -- expect an immediate close
+            raw:receive(1)
             raw:close()
             reactor:sleep(0.1)
             reactor:stop()
@@ -621,10 +533,6 @@ end)
 describe("reactor want-state handling", function()
 
     it("parks on the direction TLS asks for, not the one the caller wanted", function()
-        -- The whole TLS/event-loop interaction reduces to this: a read that
-        -- reports "wantwrite" has to wait for WRITABILITY. Waiting for
-        -- readability instead would hang until the deadline on every
-        -- renegotiation.
         local reactor = Reactor.new()
         local sock = { name = "fake" }
 

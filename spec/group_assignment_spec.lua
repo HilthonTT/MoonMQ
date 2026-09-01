@@ -1,9 +1,3 @@
--- Proves consumer-group assignment is ENFORCED on the read path: a member
--- only polls the partitions the coordinator assigned it. Before the fix the
--- coordinator computed assignments but the Consumer ignored them and every
--- member read every partition (the group guarantee was decorative). See
--- Consumer:set_assignment / Consumer:owns and Server:_apply_group_assignment.
-
 local brk_m      = require("src.broker")
 local group_m    = require("src.broker.groups")
 local consumer_m = require("src.broker.consumer")
@@ -21,9 +15,6 @@ local function rmdir(path)
     end
 end
 
--- Write one record straight into a specific partition so we know exactly which
--- partition each record lives in (the producer's hash partitioner wouldn't let
--- us target partitions deterministically).
 local function seed_partition(broker, topic, pid, value)
     local t = assert(broker:get_topic(topic))
     local part = t.partitions[pid]
@@ -31,8 +22,6 @@ local function seed_partition(broker, topic, pid, value)
     assert(not err, err)
 end
 
--- Collect the set of partition ids a consumer returns across one poll per
--- partition (poll reads at most one record per partition per call).
 local function polled_partitions(consumer)
     local records = assert(consumer:poll())
     local seen = {}
@@ -59,7 +48,6 @@ describe("consumer-group assignment enforcement", function()
         assert(g:join("m1", { "orders" }))
         assert(g:join("m2", { "orders" }))
 
-        -- range strategy: 3 partitions / 2 members -> m1:{1,2}, m2:{3}
         assert.are.same({ 1, 2 }, g.members["m1"].partitions["orders"])
         assert.are.same({ 3 },    g.members["m2"].partitions["orders"])
 
@@ -74,7 +62,6 @@ describe("consumer-group assignment enforcement", function()
         local p1 = polled_partitions(c1)
         local p2 = polled_partitions(c2)
 
-        -- Each member reads exactly its assignment — no overlap, full coverage.
         assert.is_true(p1[1] and p1[2] and not p1[3], "m1 must read {1,2} only")
         assert.is_true(p2[3] and not p2[1] and not p2[2], "m2 must read {3} only")
     end)
@@ -83,7 +70,6 @@ describe("consumer-group assignment enforcement", function()
         local broker = setup()
         local c = consumer_m.Consumer.new(broker, "g1")
         assert(c:subscribe("orders"))
-        -- No set_assignment call: backward-compatible "own everything".
         local seen = polled_partitions(c)
         assert.is_true(seen[1] and seen[2] and seen[3], "must read all 3")
     end)
@@ -92,7 +78,7 @@ describe("consumer-group assignment enforcement", function()
         local broker = setup()
         local c = consumer_m.Consumer.new(broker, "g1")
         assert(c:subscribe("orders"))
-        c:set_assignment({})  -- what Server:_apply_group_assignment pins an evicted member to
+        c:set_assignment({})
         local records = assert(c:poll())
         assert.are.equal(0, #records)
     end)

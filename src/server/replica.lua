@@ -1,20 +1,17 @@
 local socket = require("socket")
 local http   = require("socket.http")
 local ltn12  = require("ltn12")
-local json   = require("dkjson")        -- only needs json.decode
+local json   = require("dkjson")
 local msg_m  = require("src.record.message")
 local tls_m  = require("src.io.tls")
 local log    = require("src.log.logger").get("replicate")
 
 local DEFAULT_QUEUE_SIZE = 1000
-local DEFAULT_TIMEOUT_IN_SECONDS = 5 -- seconds
+local DEFAULT_TIMEOUT_IN_SECONDS = 5
 
 local ReplicaClient = {}
 ReplicaClient.__index = ReplicaClient
 
--- opts.tls (optional): a client-side TLS config from src/io/tls.lua. Set it
--- when the follower's /replicate listener is encrypted; the two are configured
--- from the same Replication.Tls block, so they cannot disagree by accident.
 function ReplicaClient.new(address, timeout, opts)
     assert(type(address) == "string", "address must be a string")
     opts = opts or {}
@@ -26,13 +23,6 @@ function ReplicaClient.new(address, timeout, opts)
     }, ReplicaClient)
 end
 
--- POST a serialized message to the replica's /replicate endpoint.
--- Returns (offset, nil) on 200 OK with valid JSON, otherwise (nil, err).
---
--- We previously set socket.http.TIMEOUT module-globally, which races
--- when multiple replica coroutines share the same scheduler. The custom
--- `create` below binds the timeout to *this* request's TCP socket, so
--- concurrent senders no longer clobber each other.
 function ReplicaClient:send(topic_name, partition_id, sender_replica_id, payload)
     local timeout = self.timeout
     local response_body = {}
@@ -50,10 +40,6 @@ function ReplicaClient:send(topic_name, partition_id, sender_replica_id, payload
         },
         source = ltn12.source.string(payload),
         sink   = ltn12.sink.table(response_body),
-        -- The TLS variant wraps and handshakes inside connect(), then forwards
-        -- every method to the wrapped socket, so LuaSocket's HTTP layer above
-        -- it is unchanged. It honours `timeout` per request, which luasec's
-        -- own ssl.https create does not.
         create = self.tls
             and tls_m.http_create(self.tls.params, timeout, self.tls.server_name)
             or function()
@@ -90,10 +76,10 @@ function PartitionReplica.new(id, client)
         id          = id,
         client      = client,
         last_offset = -1,
-        queue       = {},     -- ring of pending payloads
+        queue       = {},
         head        = 1,
         tail        = 0,
-        suspended   = nil,    -- worker coroutine when waiting for work
+        suspended   = nil,
         running     = false,
     }, PartitionReplica)
 end
@@ -105,11 +91,7 @@ end
 local ReplicatedPartition = {}
 ReplicatedPartition.__index = ReplicatedPartition
 
--- replica_addresses can be:
---   * a 1-indexed array { [1] = "host:port", [2] = "host:port", ... }, or
---   * a map keyed by replica id { [id] = "host:port", ... }.
--- Entries whose key equals replica_id are skipped (don't replicate to self).
-function ReplicatedPartition.new(partition, replica_id, is_leader, replica_addresses, opts) 
+function ReplicatedPartition.new(partition, replica_id, is_leader, replica_addresses, opts)
     assert(type(partition) == "table",  "partition must be a Partition instance")
     assert(type(replica_id) == "number", "replica_id must be a number")
     assert(type(is_leader) == "boolean", "is_leader must be a boolean")
@@ -136,9 +118,6 @@ function ReplicatedPartition.new(partition, replica_id, is_leader, replica_addre
     return self
 end
 
--- Mark the partition as live. Call before spawning workers; serves the
--- same role as `go rp.replicationLoop()` in the Go constructor but
--- without actually creating coroutines (the caller owns that).
 function ReplicatedPartition:start()
     if not self.is_leader then return end
     self.running = true
@@ -147,10 +126,6 @@ function ReplicatedPartition:start()
     end
 end
 
--- Write locally, then enqueue the serialized payload for every replica.
--- Returns (offset, nil) on local-write success, (-1, err) on failure.
--- Replication failures do NOT propagate; they're logged. Local write
--- success means the leader's log is durable enough for `acks=1`.
 function ReplicatedPartition:write(scheduler, msg)
     local offset, err = self.partition:write_message(msg)
     if err then return -1, err end
@@ -161,7 +136,6 @@ function ReplicatedPartition:write(scheduler, msg)
 
     local payload, serr = msg_m.serialize_message(msg)
     if not payload then
-        -- Local write already succeeded; we can't unwind it. Log and move on.
         log:error("partition %d: serialize failed: %s",
             self.partition.id, serr)
         return offset, nil
@@ -170,9 +144,6 @@ function ReplicatedPartition:write(scheduler, msg)
     for i = 1, #self.replicas do
         local replica = self.replicas[i]
         if replica:_queue_len() >= self.max_queue then
-            -- Same back-pressure semantics as Go's buffered chan(1000)
-            -- when full: drop, since we can't block the writer without
-            -- killing throughput.
             log:warn("partition %d replica %d: queue full, dropping",
                 self.partition.id, replica.id)
         else
@@ -190,19 +161,8 @@ function ReplicatedPartition:write(scheduler, msg)
     return offset, nil
 end
 
--- Long-lived worker for one replica. Run as a coroutine on your scheduler,
--- one per entry in self.replicas:
---
---   rp:start()
---   for i = 1, #rp.replicas do
---       local r = rp.replicas[i]
---       scheduler.spawn(function() rp:run_replica(scheduler, r) end)
---   end
 function ReplicatedPartition:run_replica(scheduler, replica)
     while replica.running do
-        -- Drain the queue. Each send is synchronous within this coroutine,
-        -- so per-replica ordering is preserved and a slow replica only
-        -- stalls itself.
 
         while replica.head <= replica.tail and replica.running do
             local payload = replica.queue[replica.head]
@@ -223,9 +183,6 @@ function ReplicatedPartition:run_replica(scheduler, replica)
             end
         end
 
-        -- Sleep until write() wakes us. The check-then-yield is safe
-        -- because write() only resumes us if suspended is set, and
-        -- we set it before yielding.
         if replica.running then
             replica.suspended = coroutine.running()
             coroutine.yield()
@@ -233,8 +190,6 @@ function ReplicatedPartition:run_replica(scheduler, replica)
     end
 end
 
--- Stop accepting new replication and wake any sleeping workers so they
--- can exit their loop. Idempotent.
 function ReplicatedPartition:close(scheduler)
     self.running = false
     for i = 1, #self.replicas do

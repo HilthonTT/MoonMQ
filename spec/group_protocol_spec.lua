@@ -1,8 +1,6 @@
 local proto = require("src.wire.protocol")
 local uuid  = require("src.core.uuid")
 
--- Strip the u32 length prefix an encode_* frame carries and hand the body
--- to parse_frame, the same way the reader coroutine does on the wire.
 local function unframe(frame)
     return proto.parse_frame(frame:sub(5))
 end
@@ -69,7 +67,6 @@ describe("consumer-group wire protocol", function()
     end)
 
     it("rejects a JOIN_GROUP claiming more topics than it carries", function()
-        -- group_id="g", member_id="", topic_count=5, but zero topic strings.
         local body = proto.encode_string("g") .. proto.encode_string("")
             .. string.pack(">I4", 5)
         local res, err = proto.decode_join_group(body)

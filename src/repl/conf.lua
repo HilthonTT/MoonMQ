@@ -31,7 +31,6 @@ function merge(t1, t2, seen)
 end
 
 local default = {
-    -- TODO: unused
     keybinding = {
         command_get_next_history = {
             "key_down",
@@ -81,7 +80,6 @@ local default = {
     }
 }
 
--- Read from ~/.croissantrc
 local user = {}
 local file, _ = io.open(os.getenv "HOME" .. "/.croissantrc", "r")
 
@@ -97,10 +95,8 @@ if file then
     end
 end
 
--- Merge default and user
 local conf = merge(default, user)
 
--- Convert colors to escape codes
 for k, v in pairs(conf.syntaxColors) do
     local color = ""
 
@@ -111,7 +107,6 @@ for k, v in pairs(conf.syntaxColors) do
     conf.syntaxColors[k] = color
 end
 
--- Convert keybding to escape codes
 for command, bindings in pairs(conf.keybinding) do
     local bds = {}
 

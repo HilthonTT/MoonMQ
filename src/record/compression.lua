@@ -1,16 +1,3 @@
--- Compression codecs for stored record values. Both codecs are OPTIONAL and
--- loaded lazily so a broker missing lua-zlib and/or libsnappy still boots and
--- only rejects produce requests that ask for the unavailable codec.
---
---   * gzip   — via lua-zlib (pure C rock).
---   * snappy — via src/record/snappy.lua (LuaJIT FFI + libsnappy).
---
--- Codec ids are the same integers stored in the record's `attrs` byte (see
--- src/record/message.lua): 0 none, 1 gzip, 2 snappy. This module is the single
--- place that turns a codec id + bytes into compressed/decompressed bytes; the
--- broker produce/deliver paths call M.compress / M.decompress and never touch
--- the underlying libraries directly.
-
 local msg_m = require("src.record.message")
 
 local CompressionType = {
@@ -19,9 +6,6 @@ local CompressionType = {
     CompressionSnappy = msg_m.CODEC_SNAPPY,
 }
 
--- Lazy zlib handle. nil = not yet probed, false = probed & unavailable,
--- table = the loaded module. Deferred so `require`ing this module never fails
--- on a host without lua-zlib.
 local zlib_state = nil
 local function get_zlib()
     if zlib_state == nil then
@@ -31,10 +15,8 @@ local function get_zlib()
     return zlib_state or nil
 end
 
-local snappy = require("src.record.snappy")  -- load-safe; self-reports availability
+local snappy = require("src.record.snappy")
 
--- available reports whether `codec_id` can be used on this host right now.
--- CompressionNone is always available.
 local function available(codec_id)
     if codec_id == msg_m.CODEC_NONE   then return true end
     if codec_id == msg_m.CODEC_GZIP   then return get_zlib() ~= nil end
@@ -42,8 +24,6 @@ local function available(codec_id)
     return false
 end
 
--- codec_id maps a human name ("none"/"gzip"/"snappy") to its integer id, or
--- returns (nil, err) for an unknown name. Case-insensitive.
 local NAME_TO_ID = {
     none   = msg_m.CODEC_NONE,
     gzip   = msg_m.CODEC_GZIP,
@@ -67,8 +47,6 @@ end
 local function gzip_compress(data)
     local zlib = get_zlib()
     if not zlib then return nil, "gzip unavailable (lua-zlib not installed)" end
-    -- window_size = 31 selects the gzip wrapper (15 base + 16 gzip flag).
-    -- pcall'd because lua-zlib raises on bad input rather than returning err.
     local stream = zlib.deflate(zlib.BEST_COMPRESSION, 31)
     local ok, out = pcall(stream, data, "finish")
     if not ok then
@@ -80,7 +58,6 @@ end
 local function gzip_decompress(data)
     local zlib = get_zlib()
     if not zlib then return nil, "gzip unavailable (lua-zlib not installed)" end
-    -- windowBits = 31 = gzip-only inflate, matching our compress side.
     local stream = zlib.inflate(31)
     local ok, out = pcall(stream, data, "finish")
     if not ok then
@@ -89,8 +66,6 @@ local function gzip_decompress(data)
     return out, nil
 end
 
--- compress returns (bytes, nil) or (nil, err). CompressionNone is a pass-through
--- so callers can hand any codec id through uniformly.
 local function compress(codec_id_, data)
     assert(type(data) == "string", "data must be a string")
     if codec_id_ == msg_m.CODEC_NONE then
@@ -103,7 +78,6 @@ local function compress(codec_id_, data)
     return nil, string.format("unknown compression codec id %s", tostring(codec_id_))
 end
 
--- decompress is the inverse of compress. (bytes, nil) or (nil, err).
 local function decompress(codec_id_, data)
     assert(type(data) == "string", "data must be a string")
     if codec_id_ == msg_m.CODEC_NONE then

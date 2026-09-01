@@ -1,11 +1,3 @@
--- The SQL-like console loop for MoonMQ.
---
--- Reads statements terminated by ';' (spanning as many lines as needed),
--- lexes + parses each with src/repl/sql/{lexer,parser}, runs it through a
--- Session executor, and renders the result. The loop is factored so its core
--- (`M.run`) takes an injected `read_line`/`out` pair — that keeps it drivable
--- from a script in tests and from a real line-editor in production.
-
 local Lexer   = require("src.repl.sql.lexer")
 local Parser  = require("src.repl.sql.parser")
 local Session = require("src.repl.sql.executor")
@@ -19,8 +11,6 @@ local M = {}
 local PROMPT      = "mq> "
 local CONTINUATION = "..> "
 
--- Locate the last semicolon token so we can split "complete statements" from a
--- trailing partial one still being typed.
 local function last_semicolon(tokens)
     local found
     for _, t in ipairs(tokens) do
@@ -29,7 +19,6 @@ local function last_semicolon(tokens)
     return found
 end
 
--- Show a lexer/parser error with a caret under the offending column.
 local function print_error(err, src, out)
     out(paint("red", "error: " .. (err.message or "syntax error")) .. "\n")
     if err.line and src then
@@ -86,8 +75,6 @@ local function banner(out)
     out(paint("magenta", "MoonMQ SQL console") .. " — type HELP; for commands, EXIT; to leave.\n")
 end
 
--- Run everything up to and including the last complete statement in `chunk`.
--- Returns `finished` (true if a QUIT statement ran).
 local function run_chunk(session, chunk, out)
     local statements, err = Parser.parse(chunk)
     if not statements then
@@ -104,11 +91,6 @@ local function run_chunk(session, chunk, out)
     return false
 end
 
--- opts:
---   read_line(prompt, is_continuation) -> string | nil   (nil = EOF/quit)
---   out(string)                                           (defaults to io.write)
---   session_opts                                          (passed to Session.new)
---   autoconnect = false                                   (attempt a default CONNECT)
 function M.run(opts)
     opts = opts or {}
     local read_line = assert(opts.read_line, "read_line is required")
@@ -142,7 +124,6 @@ function M.run(opts)
         local tokens, lerr = Lexer.tokenize(pending)
         if not tokens then
             if lerr.message == "unterminated string literal" then
-                -- keep reading continuation lines
             else
                 print_error(lerr, pending, out)
                 pending = ""
@@ -157,7 +138,6 @@ function M.run(opts)
                 end
                 pending = rest:match("%S") and rest or ""
             end
-            -- no semicolon yet → fall through and read another line
         end
     end
 

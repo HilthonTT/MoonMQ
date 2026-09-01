@@ -1,7 +1,3 @@
--- Record batching: PRODUCE_BATCH / PRODUCE_BATCH_ACK, batched FETCH replies
--- (RECORD_BATCH), and the multi-record-per-partition poll that feeds them.
--- See docs/batching.md.
-
 local proto      = require("src.wire.protocol")
 local uuid       = require("src.core.uuid")
 local brk_m      = require("src.broker")
@@ -26,9 +22,6 @@ local function unframe(frame)
     return proto.parse_frame(frame:sub(5))
 end
 
--- A Connection stand-in that records every frame the handler sends. Carries
--- the same fields the real one exposes to handlers (producer identity,
--- consumer, subscriptions, mode).
 local function fake_conn()
     return {
         id_short      = "test",
@@ -42,7 +35,6 @@ local function fake_conn()
     }
 end
 
--- A Server stand-in: the pieces handlers actually reach through.
 local function fake_server(broker, acks)
     return {
         broker      = broker,
@@ -52,7 +44,6 @@ local function fake_server(broker, acks)
     }
 end
 
--- Decode the single frame a handler is expected to have sent.
 local function only_reply(conn)
     assert(#conn.sent == 1,
         string.format("expected exactly 1 frame, got %d", #conn.sent))
@@ -73,8 +64,6 @@ local function batch_ack(conn)
     return assert(proto.decode_produce_batch_ack(payload))
 end
 
--- Build the PRODUCE_BATCH payload a handler consumes, straight from the
--- encoder (so the test exercises the real wire format, not a hand-rolled one).
 local function batch_payload(topic, records, opts)
     local _, _, payload =
         unframe(proto.encode_produce_batch(uuid.bytes(), topic, records, opts))
@@ -170,21 +159,18 @@ describe("batching wire format", function()
     end)
 
     it("keeps FETCH backward-compatible: isolation and flags are both optional", function()
-        -- A pre-batching client sends topic|group|max_records|isolation.
         local legacy = proto.encode_string("orders") .. proto.encode_string("g")
             .. string.pack(">I4", 10) .. string.pack(">B", proto.ISOLATION_READ_COMMITTED)
         local f = assert(proto.decode_fetch(legacy))
         assert.are.equal(proto.ISOLATION_READ_COMMITTED, f.isolation)
         assert.is_false(f.batched)
 
-        -- An older one still sends no isolation byte at all.
         local ancient = proto.encode_string("orders") .. proto.encode_string("g")
             .. string.pack(">I4", 10)
         local f2 = assert(proto.decode_fetch(ancient))
         assert.are.equal(proto.ISOLATION_READ_UNCOMMITTED, f2.isolation)
         assert.is_false(f2.batched)
 
-        -- A batching client sets the flag after isolation.
         local _, _, payload = unframe(proto.encode_fetch(uuid.bytes(), "orders", "g",
             10, proto.ISOLATION_READ_COMMITTED, proto.FETCH_FLAG_BATCHED))
         local f3 = assert(proto.decode_fetch(payload))
@@ -214,8 +200,6 @@ describe("Producer:produce_batch", function()
         assert.is_nil(err)
         assert.are.equal(5, #acks)
 
-        -- A fixed key hashes to one partition, so all five land together and
-        -- read back in the order they were produced.
         local partition_id = acks[1].partition
         for i = 2, 5 do assert.are.equal(partition_id, acks[i].partition) end
 
@@ -249,9 +233,6 @@ describe("Producer:produce_batch", function()
         assert(broker:create_topic("orders", 4))
         local topic = assert(broker:get_topic("orders"))
 
-        -- Count request_sync calls per partition. acks=1 (AckLeader) is the
-        -- mode that pays for durability, and the point of batching is that it
-        -- pays once per partition rather than once per record.
         local syncs = {}
         for _, p in ipairs(topic.partitions) do
             local real = p.request_sync
@@ -381,7 +362,6 @@ describe("PRODUCE_BATCH handler", function()
         assert.are.equal(0, first.code)
         assert.are.equal(5, #first.acks)
 
-        -- Same batch, same base sequence: a retry after a lost ack.
         conn.sent = {}
         handlers.produce_batch(server, conn, uuid.bytes(),
             batch_payload("orders", batch, opts))
@@ -389,7 +369,6 @@ describe("PRODUCE_BATCH handler", function()
         assert.are.equal(0, replay.code)
         assert.are.same(first.acks, replay.acks)
 
-        -- Nothing was appended the second time.
         local total = 0
         for _, p in ipairs(assert(broker:get_topic("orders")).partitions) do
             p:scan(function() total = total + 1 end)
@@ -409,7 +388,6 @@ describe("PRODUCE_BATCH handler", function()
             batch_payload("orders", records(3), { pid = conn.pid, base_seq = 0 }))
         assert.are.equal(0, batch_ack(conn).code)
 
-        -- The next batch must start at 3; a gap or an overlap is rejected.
         conn.sent = {}
         handlers.produce_batch(server, conn, uuid.bytes(),
             batch_payload("orders", records(2), { pid = conn.pid, base_seq = 5 }))
@@ -435,12 +413,10 @@ describe("PRODUCE_BATCH handler", function()
         local conn = fake_conn()
         conn.pid, conn.epoch = broker.producer_state:allocate_ephemeral(), 0
 
-        -- Batch takes sequences 0..2 ...
         handlers.produce_batch(server, conn, uuid.bytes(),
             batch_payload("orders", records(3), { pid = conn.pid, base_seq = 0 }))
         assert.are.equal(0, batch_ack(conn).code)
 
-        -- ... so a following single record must be sequence 3.
         conn.sent = {}
         local _, _, single = unframe(proto.encode_produce_idempotent(
             uuid.bytes(), conn.pid, 3, "orders", "k", "after-batch", 0, 0))
@@ -448,8 +424,6 @@ describe("PRODUCE_BATCH handler", function()
         local op = only_reply(conn)
         assert.are.equal(proto.OP_PRODUCE_ACK, op)
 
-        -- And re-sending sequence 3 replays that single record's ack. Compare
-        -- payloads, not frames — each call gets a fresh correlation id.
         local _, first_ack = only_reply(conn)
         conn.sent = {}
         handlers.produce_idempotent(server, conn, uuid.bytes(), single)
@@ -488,7 +462,6 @@ describe("PRODUCE_BATCH handler", function()
         local conn = fake_conn()
         conn.pid, conn.epoch, conn.producer_name = pid, epoch, "app"
 
-        -- A newer session takes over the identity, bumping the epoch.
         assert(broker.producer_state:get_or_create_producer("app"))
 
         handlers.produce_batch(server, conn, uuid.bytes(),
@@ -520,7 +493,6 @@ describe("PRODUCE_BATCH handler", function()
             end
         end
 
-        -- Reopen: the memo (with its per-record acks) is replayed off disk.
         local broker = assert(brk_m.Broker.new(BASE_DIR))
         local server = fake_server(broker)
         local pid = assert(broker.producer_state:pid_for("app"))
@@ -528,8 +500,6 @@ describe("PRODUCE_BATCH handler", function()
         assert.are.equal(0, memo.base_seq)
         assert.are.same(acks_before, memo.acks)
 
-        -- The original session (epoch 0) retrying its batch gets the same acks
-        -- back rather than a second copy of the records.
         local conn = fake_conn()
         conn.pid, conn.epoch, conn.producer_name = pid, memo.epoch, "app"
         handlers.produce_batch(server, conn, uuid.bytes(),
@@ -579,7 +549,6 @@ describe("Consumer:poll batching", function()
         local records = assert(consumer:poll({ max_per_partition = 4 }))
         assert.are.equal(12, #records)
 
-        -- Per partition the records come back in log order.
         local by_partition = {}
         for _, r in ipairs(records) do
             by_partition[r.partition] = by_partition[r.partition] or {}
@@ -603,7 +572,6 @@ describe("Consumer:poll batching", function()
         local records = assert(consumer:poll({ max_records = 12 }))
         assert.are.equal(12, #records)
 
-        -- 12 across 4 partitions is 3 each: no partition monopolises the batch.
         local counts = {}
         for _, r in ipairs(records) do
             counts[r.partition] = (counts[r.partition] or 0) + 1
@@ -642,8 +610,6 @@ describe("Consumer:poll batching", function()
         assert(consumer:subscribe("orders"))
         consumer:set_assignment({ orders = { 2 } })
 
-        -- One owned partition out of four: the whole allowance goes to it,
-        -- rather than a quarter of it.
         local records = assert(consumer:poll({ max_records = 6 }))
         assert.are.equal(6, #records)
         for _, r in ipairs(records) do
@@ -673,8 +639,6 @@ describe("FETCH batching", function()
         handlers.fetch(server, conn, uuid.bytes(), payload)
     end
 
-    -- Pull the records out of a reply, whichever shape it took, and assert the
-    -- reply ends with the OK that closes a FETCH.
     local function collect(conn)
         local out, saw_ok = {}, false
         for _, frame in ipairs(conn.sent) do
@@ -700,7 +664,6 @@ describe("FETCH batching", function()
 
         fetch(server, conn, 10, proto.FETCH_FLAG_BATCHED)
 
-        -- Exactly two frames: the batch and the closing OK.
         assert.are.equal(2, #conn.sent)
         local op = select(1, unframe(conn.sent[1]))
         assert.are.equal(proto.OP_RECORD_BATCH, op)
@@ -714,7 +677,6 @@ describe("FETCH batching", function()
 
         fetch(server, conn, 10, 0)
 
-        -- 10 RECORD frames + OK.
         assert.are.equal(11, #conn.sent)
         for i = 1, 10 do
             assert.are.equal(proto.OP_RECORD, select(1, unframe(conn.sent[i])))
@@ -763,7 +725,6 @@ describe("FETCH batching", function()
         local second = collect(conn)
         assert.are.equal(6, #second)
 
-        -- The two fetches together cover all 12 records exactly once.
         local seen = {}
         for _, set in ipairs({ first, second }) do
             for _, r in ipairs(set) do
@@ -778,8 +739,6 @@ describe("FETCH batching", function()
         seed(broker, 1, 10)
         local server, conn = fake_server(broker), fake_conn()
 
-        -- max_records=3 on a single partition: the poll may read more, and
-        -- everything past the limit must come back on the next fetch.
         fetch(server, conn, 3, proto.FETCH_FLAG_BATCHED)
         assert.are.same({ "p1-1", "p1-2", "p1-3" }, values(collect(conn)))
 

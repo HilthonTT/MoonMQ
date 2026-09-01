@@ -1,12 +1,3 @@
--- fs.lua has two live backends on a POSIX host: luaposix syscalls (the fast
--- path the broker actually runs on) and the `test -d` / `ls` shell fallback.
--- Both must answer identically, so this spec loads the module twice — once
--- normally, once with MOONMQ_FS_BACKEND=shell forcing the fallback — and runs
--- the same suite against each.
---
--- Loading twice means clearing package.loaded; that is safe here because
--- fs.lua holds no state beyond its backend probe.
-
 local os_utils = require("src.core.os")
 
 local BASE = os_utils.IS_WINDOWS and "C:\\Temp\\lua_fs_test" or "/tmp/lua_fs_test"
@@ -105,7 +96,6 @@ local function suite(fs)
             assert.is_nil(err)
             assert.is_false(fs.is_dir(BASE))
 
-            -- Absent is success (Go's os.RemoveAll contract).
             local ok2, err2 = fs.remove_all(BASE)
             assert.is_true(ok2)
             assert.is_nil(err2)
@@ -139,9 +129,6 @@ describe("fs", function()
     end)
 end)
 
--- Second pass against the forced shell fallback. Only meaningful when the
--- primary backend was something else; when MOONMQ_FS_BACKEND=shell is already
--- set the two passes are the same code and the duplication is harmless.
 describe("fs (fallback)", function()
     local primary = require("src.io.fs").backend
     if primary == "shell" or os_utils.IS_WINDOWS then
@@ -149,8 +136,6 @@ describe("fs (fallback)", function()
         return
     end
 
-    -- posix.stdlib.setenv is how we flip the probe without a wrapper script;
-    -- without luaposix there is no way to force it from inside the process.
     local ok_stdlib, stdlib = pcall(require, "posix.stdlib")
     if not ok_stdlib then
         pending("luaposix (posix.stdlib) unavailable, cannot force the fallback")
@@ -162,7 +147,7 @@ describe("fs (fallback)", function()
     local shell_fs = require("src.io.fs")
     stdlib.setenv("MOONMQ_FS_BACKEND", nil)
     package.loaded["src.io.fs"] = nil
-    require("src.io.fs")  -- restore the normal module for every other spec
+    require("src.io.fs")
 
     assert(shell_fs.backend == "shell", "expected the forced shell backend")
     suite(shell_fs)

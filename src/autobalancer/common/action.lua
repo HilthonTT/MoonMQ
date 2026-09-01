@@ -13,11 +13,6 @@ local ACTION_TYPE_NAMES = {
 local Action = {}
 Action.__index = Action
 
--- src_partition / dest_partition identify *which* partition of the topic moves.
--- They are optional (default 0) so a caller balancing whole topics can omit
--- them, but a partition-level balancer (see src/autobalancer/model) threads them
--- through so a MOVE/SWAP names an exact topic-partition replica, mirroring
--- AutoMQ's Action-over-TopicPartition.
 function Action.new(action_type, src_topic, src_broker_id, dest_broker_id, dest_topic,
         src_partition, dest_partition)
     assert(action_type == ActionType.MOVE or action_type == ActionType.SWAP,
@@ -37,7 +32,7 @@ function Action.new(action_type, src_topic, src_broker_id, dest_broker_id, dest_
     return setmetatable({
         action_type    = action_type,
         src_topic      = src_topic,
-        dest_topic     = dest_topic,   -- nil for MOVE
+        dest_topic     = dest_topic,
         src_broker_id  = src_broker_id,
         dest_broker_id = dest_broker_id,
         src_partition  = src_partition or 0,
@@ -45,30 +40,23 @@ function Action.new(action_type, src_topic, src_broker_id, dest_broker_id, dest_
     }, Action)
 end
 
--- Return the inverse action. For MOVE, the same topic moves back (broker roles
--- swapped, no dest topic). For SWAP, each topic-partition returns to where it
--- started: after applying the SWAP, src_topic sits on dest_broker and
--- dest_topic on src_broker, so the inverse keeps the topics with their
--- partitions and swaps ONLY the broker sides. (Swapping the topics as well
--- would describe the already-swapped state and fail to apply.)
 function Action:undo()
     if self.action_type == ActionType.MOVE then
         return Action.new(
             self.action_type,
             self.src_topic,
-            self.dest_broker_id,   -- was dest, now src
-            self.src_broker_id,    -- was src, now dest
+            self.dest_broker_id,
+            self.src_broker_id,
             nil,
-            self.src_partition)    -- same partition moves back
+            self.src_partition)
     end
 
-    -- SWAP
     return Action.new(
         self.action_type,
-        self.src_topic,            -- now living on dest_broker...
+        self.src_topic,
         self.dest_broker_id,
-        self.src_broker_id,        -- ...moves back to src_broker
-        self.dest_topic,           -- and vice versa
+        self.src_broker_id,
+        self.dest_topic,
         self.src_partition,
         self.dest_partition)
 end

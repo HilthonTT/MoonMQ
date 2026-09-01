@@ -37,7 +37,6 @@ describe("consumer group lifecycle (FSM-driven)", function()
 
         local assigned = assert(g:join("m1", { "orders" }))
         assert.are.equal(STATES.STABLE, g:state())
-        -- A lone member owns every partition.
         assert.are.same({ 1, 2, 3, 4 }, assigned["orders"])
     end)
 
@@ -49,7 +48,6 @@ describe("consumer group lifecycle (FSM-driven)", function()
         local a2 = assert(g:join("m2", { "orders" }))
         assert.are.equal(STATES.STABLE, g:state())
 
-        -- range strategy: 4 partitions / 2 members = 2 each.
         assert.are.same({ 1, 2 }, g.members["m1"].partitions["orders"])
         assert.are.same({ 3, 4 }, a2["orders"])
     end)
@@ -72,7 +70,6 @@ describe("consumer group lifecycle (FSM-driven)", function()
         assert(g:leave("m1"))
 
         assert.are.equal(STATES.STABLE, g:state())
-        -- m2 now owns everything again.
         assert.are.same({ 1, 2, 3, 4 }, g.members["m2"].partitions["orders"])
     end)
 
@@ -84,11 +81,9 @@ describe("consumer group lifecycle (FSM-driven)", function()
         assert.is_nil(ok)
         assert.matches("nope", err)
 
-        -- No phantom member, and the FSM is not stranded in a rebalance.
         assert.are.equal(STATES.EMPTY, g:state())
         assert.is_nil(g.members["m1"])
 
-        -- A subsequent valid join still works cleanly.
         local a = assert(g:join("m1", { "orders" }))
         assert.are.equal(STATES.STABLE, g:state())
         assert.are.same({ 1, 2, 3, 4 }, a["orders"])
@@ -118,7 +113,6 @@ describe("consumer group lifecycle (FSM-driven)", function()
         assert(g:join("m1", { "orders" }))
         assert(g:join("m2", { "orders" }))
 
-        -- Backdate m1's heartbeat past the 30s deadline.
         g.members["m1"].last_heartbeat = g.members["m1"].last_heartbeat - 31
 
         local expired = g:check_heartbeats()

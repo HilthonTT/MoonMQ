@@ -6,12 +6,8 @@ import requests
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway, start_http_server
 from prometheus_client.parser import text_string_to_metric_families
 
-# Own registry so we control exactly what gets pushed/exposed (and don't drag in
-# the default process/GC collectors when pushing to a gateway).
 REGISTRY = CollectorRegistry()
 
-# Host-level gauges (psutil). Labelled by `instance` (the broker's host:port) so
-# several monitored brokers don't collide in a shared Pushgateway/Prometheus.
 host_cpu_percent = Gauge(
     "moonmq_host_cpu_usage_percent",
     "Host CPU usage percentage",
@@ -54,8 +50,6 @@ host_network_out = Gauge(
     registry=REGISTRY,
 )
 
-# Broker-level gauges derived from MoonMQ's own counters. MoonMQ exposes these as
-# monotonic counters only; we re-export per-second rates, which it does not.
 broker_bytes_sent_rate = Gauge(
     "moonmq_broker_bytes_sent_per_sec",
     "Bytes sent to clients per second",
@@ -91,8 +85,6 @@ broker_topic_count = Gauge(
     registry=REGISTRY,
 )
 
-# Counter series (literal names — MoonMQ emits no # TYPE lines, so the parser
-# keeps the `_total` suffix verbatim) summed across labels into a broker rate.
 _RATE_COUNTERS = {
     "moonmq_bytes_sent_total": broker_bytes_sent_rate,
     "moonmq_produce_records_total": broker_produce_rate,
@@ -188,10 +180,9 @@ class MoonMQPerformanceMonitor:
         self.saturation_threshold = saturation_threshold
         self.logger = logging.getLogger(__name__)
 
-        # Counters are monotonic; to get a rate we remember the previous scrape.
-        self._prev_counters = {}  # counter name -> summed value
-        self._prev_net = None     # psutil net counters from the previous cycle
-        self._prev_time = None    # time.time() of the previous scrape
+        self._prev_counters = {}
+        self._prev_net = None
+        self._prev_time = None
 
     def collect_host_metrics(self, instance, cpu_percent, dt):
         """Record host-level psutil metrics under the given instance label."""
@@ -227,12 +218,10 @@ class MoonMQPerformanceMonitor:
             current = counters.get(name)
             previous = self._prev_counters.get(name)
             if current is not None and previous is not None and dt and dt > 0:
-                # max(0, ...) clamps counter resets (broker restart) to 0.
                 gauge.labels(instance=instance).set(max(0.0, (current - previous) / dt))
             if current is not None:
                 self._prev_counters[name] = current
 
-        # Point-in-time broker gauges come straight from /stats.
         if stats:
             conns = stats.get("connections") or {}
             topics = stats.get("topics") or {}
@@ -295,7 +284,6 @@ class MoonMQPerformanceMonitor:
 
     def monitor_once(self):
         """Run a single collect/analyze/export cycle."""
-        # One cpu_percent sample per cycle (blocks ~1s); reused for analysis.
         cpu_percent = psutil.cpu_percent(interval=1)
 
         now = time.time()
@@ -308,8 +296,6 @@ class MoonMQPerformanceMonitor:
             self.logger.error("failed to describe cluster via %s: %s", self.admin.stats_url, exc)
             cluster, stats = None, None
 
-        # Single broker per process; the loop mirrors a Kafka cluster sweep and
-        # degrades to the base URL when /stats is unreachable.
         brokers = cluster["brokers"] if cluster else [{"node_id": self.admin.base_url}]
         for broker in brokers:
             instance = broker["node_id"]

@@ -28,18 +28,12 @@ describe("durable consumer offsets", function()
     end)
 
     it("backs __consumer_offsets with the compacting commitlog engine", function()
-        -- The segmented backend ignores cleanup_policy and only does time/byte
-        -- *retention*, which would eventually delete a quiet group's latest
-        -- commit (losing its offset) and never bound a busy one. The offsets
-        -- topic must therefore run on the commitlog backend, which compacts.
         local broker = assert(brk_m.Broker.new(BASE_DIR))
         local topic  = broker.topic_manager.topics[offmgr_m.OFFSETS_TOPIC]
         for _, p in ipairs(topic.partitions) do
             assert.are.equal(clp_m, getmetatable(p),
                 "offsets partition must be a CommitLogPartition")
         end
-        -- And the backend is persisted, so a restart restores it rather than
-        -- silently reverting to the default segmented engine.
         local broker2 = assert(brk_m.Broker.new(BASE_DIR))
         local topic2  = broker2.topic_manager.topics[offmgr_m.OFFSETS_TOPIC]
         for _, p in ipairs(topic2.partitions) do
@@ -53,7 +47,6 @@ describe("durable consumer offsets", function()
 
         assert(broker:commit_offset("g1", "orders", 2, 4096))
         assert.are.equal(4096, broker:fetch_offset("g1", "orders", 2))
-        -- Unknown keys read as nil, not error.
         assert.is_nil(broker:fetch_offset("g1", "orders", 3))
         assert.is_nil(broker:fetch_offset("other", "orders", 2))
     end)
@@ -74,7 +67,6 @@ describe("durable consumer offsets", function()
             assert(broker:commit_offset("g1", "orders", 1, 100))
             assert(broker:commit_offset("g1", "orders", 2, 200))
             assert(broker:commit_offset("g2", "orders", 1, 999))
-            -- flush partition files before we drop the broker
             for _, p in ipairs(broker.topic_manager.topics[offmgr_m.OFFSETS_TOPIC].partitions) do
                 if p.sync then p:sync() end
             end
@@ -93,7 +85,6 @@ describe("durable consumer offsets", function()
 
         local c = consumer_m.Consumer.new(broker, "grp")
         assert(c:subscribe("events"))
-        -- partition 1 resumes from the committed offset; partition 2 from 0.
         assert.are.equal(512, c.offsets["events"][1])
         assert.are.equal(0, c.offsets["events"][2])
     end)

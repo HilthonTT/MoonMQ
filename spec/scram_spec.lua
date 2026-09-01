@@ -1,17 +1,3 @@
--- SCRAM-SHA-256 (RFC 5802 / RFC 7677), both halves.
---
--- The anchor is the worked example from RFC 7677 §3: a full exchange with
--- fixed nonces, salt, and iteration count, for the password "pencil". If our
--- proof and server signature match those bytes, this implementation
--- interoperates with anything else that reads the same RFC — which is the only
--- meaningful definition of "correct" for a wire protocol. Round-tripping
--- against ourselves would pass just as happily with a subtly wrong auth
--- message.
---
--- The rest of the file is the adversarial half: replayed nonces, tampered
--- proofs, stripped channel binding, and the base64 strictness that stops two
--- different strings from decoding to the same nonce.
-
 local scram    = require("src.server.scram")
 local auth     = require("src.server.auth")
 local users_m  = require("src.server.users")
@@ -48,17 +34,16 @@ describe("base64", function()
     end)
 
     it("rejects malformed input rather than guessing at it", function()
-        assert.is_nil((b64.decode("Zm9vYmF")))    -- length not a multiple of 4
-        assert.is_nil((b64.decode("Zm9vYmF!")))   -- character outside alphabet
-        assert.is_nil((b64.decode("Zm=vYmFy")))   -- padding in the middle
-        assert.is_nil((b64.decode("Zh==")))       -- non-canonical trailing bits
-        assert.is_nil((b64.decode("Zm9v YmFy")))  -- whitespace is not ignored
+        assert.is_nil((b64.decode("Zm9vYmF")))
+        assert.is_nil((b64.decode("Zm9vYmF!")))
+        assert.is_nil((b64.decode("Zm=vYmFy")))
+        assert.is_nil((b64.decode("Zh==")))
+        assert.is_nil((b64.decode("Zm9v YmFy")))
     end)
 end)
 
 describe("SCRAM-SHA-256 against the RFC 7677 vector", function()
 
-    -- RFC 7677 §3.
     local PASSWORD     = "pencil"
     local CLIENT_NONCE = "rOprNGfwEbeRWgbNEkqO"
     local COMBINED     = "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0"
@@ -117,8 +102,6 @@ describe("SCRAM message parsing", function()
     end)
 
     it("rejects an authzid rather than silently ignoring it", function()
-        -- Acting as another principal is what the ACL is for; quietly dropping
-        -- the request to do so would be a confusing half-feature.
         local ok, err = scram.parse_client_first("n,a=admin,n=user,r=abc")
         assert.is_nil(ok)
         assert.is_truthy(err:find("authzid"))
@@ -141,14 +124,10 @@ describe("SCRAM message parsing", function()
 
     it("rejects an invalid escape instead of passing it through", function()
         assert.is_nil((scram.unescape_username("a=ZZb")))
-        -- A trailing bare "=" is too short to look like an escape; a
-        -- pattern-based implementation would leave it alone.
         assert.is_nil((scram.unescape_username("ab=")))
     end)
 
     it("takes the first value of a duplicated field", function()
-        -- A second r= is an attempt to make the parser and the proof
-        -- verification read different values.
         local first = assert(scram.parse_client_first("n,,n=user,r=aaa,r=bbb"))
         assert.are.equal("aaa", first.nonce)
     end)
@@ -158,7 +137,6 @@ describe("SCRAM message parsing", function()
         assert.is_nil(ok)
         assert.is_truthy(err:find("extend"))
 
-        -- Equal is not "extends": the server must contribute entropy.
         assert.is_nil((scram.parse_server_first("r=mynonce,s=YWJj,i=4096", "mynonce")))
         assert.is_truthy(scram.parse_server_first("r=mynonceXYZ,s=YWJj,i=4096", "mynonce"))
     end)
@@ -179,7 +157,6 @@ describe("SCRAM exchange", function()
 
     local ITER = 2048
 
-    -- Drive both halves for a given stored credential format.
     local function exchange(credential, password, opts)
         opts = opts or {}
         local parsed = assert(auth.parse_credential(credential))
@@ -227,13 +204,10 @@ describe("SCRAM exchange", function()
     end)
 
     it("produces identical keys from both stored formats of one password", function()
-        -- Both formats must accept the same proofs, or migrating a credential
-        -- would silently invalidate it.
         local pb = auth.hash_password("s3cret", { iterations = ITER })
         local parsed = assert(auth.parse_credential(pb))
         local sk1, vk1 = auth.scram_keys(parsed)
 
-        -- Rebuild the scram form from the SAME salt and salted password.
         local sk2, vk2 = scram.keys_from_salted(parsed.hash)
         assert.are.equal(sk1, sk2)
         assert.are.equal(vk1, vk2)
@@ -250,10 +224,6 @@ describe("SCRAM exchange", function()
     end)
 
     it("rejects a client-final replayed against a fresh challenge", function()
-        -- The proof covers the server-first message, nonce and all. Capturing
-        -- a valid client-final off the wire and replaying it into a new
-        -- connection therefore fails, because that connection issued a
-        -- different nonce and computes a different auth message.
         local cred = auth.hash_password("s3cret", { iterations = ITER })
         local parsed = assert(auth.parse_credential(cred))
         local stored_key = auth.scram_keys(parsed)
@@ -269,12 +239,10 @@ describe("SCRAM exchange", function()
         local captured = scram.client_final(salted, bare, server_first_1, sf1.nonce)
         local final = assert(scram.parse_client_final(captured))
 
-        -- Sanity: it verifies on the connection it belongs to.
         assert.is_true(scram.verify_proof(stored_key,
             scram.auth_message(first.bare, server_first_1, final.without_proof),
             final.proof))
 
-        -- Replayed into a second exchange with its own nonce: refused.
         local server_first_2 = scram.server_first(
             first.nonce .. scram.nonce(rng.bytes), parsed.salt, parsed.iterations)
         assert.are_not.equal(server_first_1, server_first_2)
@@ -286,17 +254,13 @@ describe("SCRAM exchange", function()
     it("detects a stripped gs2 header via the c= field", function()
         local first = assert(scram.parse_client_first("n,,n=alice,r=abc"))
         assert.is_true(scram.check_cbind(first.gs2, "biws"))
-        assert.is_false((scram.check_cbind(first.gs2, "eSws")))   -- base64("y,,")
+        assert.is_false((scram.check_cbind(first.gs2, "eSws")))
         assert.is_false((scram.check_cbind(first.gs2, nil)))
     end)
 end)
 
 describe("SCRAM over the wire, through the handlers", function()
 
-    -- The handler half is where the exchange meets connection state: the
-    -- challenge must be answered on the same connection that asked for it, one
-    -- attempt per challenge, and a failure has to leave the connection closed
-    -- rather than half-authenticated.
 
     local ITER = 1000
     local PASSWORD = "orders-pw"
@@ -342,7 +306,6 @@ describe("SCRAM over the wire, through the handlers", function()
         server = { authenticator = auth.authenticator({ store = store }) }
     end)
 
-    -- Runs the client half against the handlers. Returns the connection.
     local function handshake(username, password, tamper)
         local conn = fake_conn()
         local client_nonce = scram.nonce(rng.bytes)
@@ -379,8 +342,6 @@ describe("SCRAM over the wire, through the handlers", function()
     end)
 
     it("returns a server signature the client can verify", function()
-        -- Without this the client has proved itself to the broker but has no
-        -- evidence the broker knew the credential — half of mutual auth.
         local conn = handshake("orders", PASSWORD)
         local op, payload = last(conn)
         assert.are.equal(proto.OP_AUTH_OK, op)
@@ -401,8 +362,6 @@ describe("SCRAM over the wire, through the handlers", function()
     end)
 
     it("closes on an unknown user, with the same error and after a challenge", function()
-        -- The challenge is answered normally for an unknown account (with a
-        -- decoy salt), so the failure looks identical from outside.
         local conn = handshake("ghost", PASSWORD)
         assert.is_truthy(conn.closed)
         assert.are.equal(proto.ERR_AUTH_FAILED, conn.closed.code)
@@ -456,8 +415,6 @@ describe("SCRAM over the wire, through the handlers", function()
     end)
 
     it("counts a failed proof toward the per-IP lockout", function()
-        -- Five is the default max_failures; the ban must trip on the fifth, so
-        -- a SCRAM brute-force is limited exactly like a password one.
         for _ = 1, 4 do handshake("orders", "wrong") end
         assert.is_false(server.authenticator:is_banned("10.0.0.1"))
         handshake("orders", "wrong")
@@ -467,25 +424,15 @@ end)
 
 describe("client and broker halves against each other", function()
 
-    -- The two halves are written from the same RFC but in different files; the
-    -- only way to know they agree is to run one against the other. This drives
-    -- the REAL client code (src/client/init.lua) into the REAL handlers over a
-    -- fake duplex socket, so every layer between them — the frame encoders,
-    -- the field caps, the opcode dispatch — is exercised too.
-    --
-    -- The exchange is strictly request/response, so no scheduler is needed:
-    -- the fake socket dispatches on send and the reply is waiting by the time
-    -- the client reads.
 
     local Client = require("src.client")
 
     local ITER = 1000
 
     local function fake_transport(server, conn)
-        local inbox = ""      -- bytes waiting for the client to read
+        local inbox = ""
         return {
             send = function(_self, data)
-                -- Frame the client's bytes and run them through dispatch.
                 local pos = 1
                 while pos <= #data do
                     local len = string.unpack(">I4", data, pos)

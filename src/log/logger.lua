@@ -1,31 +1,3 @@
--- Tiny leveled logger.
---
---   local Log = require("src.log.logger")
---   Log.configure({                                  -- once at startup
---       level         = "INFO",
---       file_path     = "/var/log/moonmq.log",       -- nil = no file
---       log_to_stderr = true,                        -- default true
---   })
---   local log = Log.get("server")
---   log:info("listening on %s:%d", host, port)
---   log:warn("no authenticator configured, allowing")
---   log:error("conn=%s start failed: %s", id, err)
---
--- Output line: "2026-05-30T12:34:56.789Z [INFO ] [server] message\n"
---
--- One process-global level + (optionally tee'd) sinks. Until Log.configure
--- is called the default (INFO -> stderr) applies, matching the codebase's
--- de-facto behavior before this module existed.
---
--- File output uses line-buffered I/O (setvbuf "line") so a crash loses at
--- most one partial line. No rotation: pair with logrotate(8) using
--- `copytruncate` (we hold the FD open across rotation; logrotate copies
--- and zero-truncates, which we don't need to re-open for).
---
--- If file open fails at configure() time we fall back to stderr-only and
--- emit a one-time WARN — startup never aborts because of a misconfigured
--- log path.
-
 local socket = require("socket")
 
 local M = {}
@@ -37,7 +9,6 @@ local LEVELS = {
     ERROR = 40,
 }
 
--- Padded to 5 chars so columns align.
 local LEVEL_LABEL = {
     [10] = "DEBUG",
     [20] = "INFO",
@@ -47,9 +18,6 @@ local LEVEL_LABEL = {
 
 local state = {
     level = LEVELS.INFO,
-    -- `sinks` is a list of io-like handles. emit() writes to all of them
-    -- in order. The default is a single stderr sink, which preserves the
-    -- pre-existing behavior for anyone who never calls configure().
     sinks = { io.stderr },
 }
 
@@ -65,12 +33,6 @@ local function now_iso()
     return string.format("%s.%03dZ", os.date("!%Y-%m-%dT%H:%M:%S", secs), ms)
 end
 
--- Replace control characters in the final message with visible escapes.
--- Several call sites format attacker-influenced bytes into log lines (client
--- name/version, usernames, HTTP header values); raw \r\n would let a client
--- forge whole log records, and raw ESC can corrupt an operator's terminal or
--- spoof entries in a log pipeline. Neutralizing centrally means no call site
--- has to remember to sanitize.
 local CTRL_ESCAPES = { ["\r"] = "\\r", ["\n"] = "\\n", ["\t"] = "\\t" }
 local function sanitize(msg)
     return (msg:gsub("%c", function(c)
@@ -95,20 +57,10 @@ local function emit(component, level_num, fmt, ...)
         "%s [%s] [%s] %s\n",
         now_iso(), LEVEL_LABEL[level_num], component, sanitize(msg))
     for i = 1, #state.sinks do
-        -- pcall: never let a broken sink (closed file, EBADF, full disk)
-        -- crash an in-flight request. We'd rather lose a log line than
-        -- abort a produce/fetch.
         pcall(state.sinks[i].write, state.sinks[i], line)
     end
 end
 
--- Public: one-time process init from config.
--- opts.level:         "DEBUG"|"INFO"|"WARN"|"ERROR" (case-insensitive).
---                     Unknown falls back to INFO and emits a one-time WARN.
--- opts.sink:          legacy single-sink override. Replaces stderr.
--- opts.file_path:     if set (non-nil, non-empty), append-open and tee.
--- opts.log_to_stderr: bool. When false AND file_path opened, suppress
---                     stderr. Default true.
 function M.configure(opts)
     opts = opts or {}
     if opts.level ~= nil then
@@ -123,9 +75,6 @@ function M.configure(opts)
         end
     end
 
-    -- Reset sinks. opts.sink (legacy) wins; otherwise rebuild from
-    -- log_to_stderr + file_path. Always at least one sink so emit() can
-    -- never silently swallow logs.
     if opts.sink ~= nil then
         state.sinks = { opts.sink }
         return
@@ -138,14 +87,10 @@ function M.configure(opts)
     if opts.file_path and opts.file_path ~= "" then
         local f, ferr = io.open(opts.file_path, "a")
         if f then
-            -- Line-buffered so a crash loses at most one partial line.
-            -- Also lets `tail -f` see new lines without an explicit flush.
             local ok = pcall(f.setvbuf, f, "line")
             if not ok then pcall(f.setvbuf, f, "no") end
             sinks[#sinks + 1] = f
         else
-            -- Forced to stderr even if the user disabled it — we
-            -- absolutely must surface the open failure somewhere.
             log_to_stderr = true
             emit("logger", LEVELS.WARN,
                 "could not open log file %q: %s — falling back to stderr",
@@ -168,7 +113,6 @@ function Logger:info(fmt, ...)  emit(self.component, LEVELS.INFO,  fmt, ...) end
 function Logger:warn(fmt, ...)  emit(self.component, LEVELS.WARN,  fmt, ...) end
 function Logger:error(fmt, ...) emit(self.component, LEVELS.ERROR, fmt, ...) end
 
--- Public: get a component-scoped logger. Cheap; cached per name.
 local cache = {}
 function M.get(component)
     local existing = cache[component]
@@ -178,7 +122,6 @@ function M.get(component)
     return l
 end
 
--- Exposed for tests / introspection.
 M.LEVELS = LEVELS
 
 return M

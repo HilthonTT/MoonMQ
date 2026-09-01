@@ -21,8 +21,6 @@ local function new_broker_with_topic(topic, parts, dlq_opts)
     return broker
 end
 
--- Append a record to (topic, partition) and return its offset — the offset
--- a consumer would see in a delivered ConsumerRecord.
 local function append(broker, topic_name, partition_id, key, value)
     local topic = assert(broker:get_topic(topic_name))
     local part = topic.partitions[partition_id]
@@ -106,7 +104,6 @@ describe("DlqManager", function()
         local r2 = assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom"))
         assert.is_false(r2.dead_lettered)
         assert.are.equal(2, r2.attempts)
-        -- Not dead-lettered yet: no DLQ topic exists.
         assert.is_nil((broker:get_topic("orders.dlq")))
 
         local r3 = assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom"))
@@ -116,7 +113,6 @@ describe("DlqManager", function()
         assert.are.equal(1, r3.dlq_partition)
         assert.is_number(r3.next_offset)
 
-        -- DLQ topic mirrors the source partition count and is user-visible.
         local dlq_topic = assert(broker:get_topic("orders.dlq"))
         assert.are.equal(2, #dlq_topic.partitions)
         local listed = false
@@ -125,7 +121,6 @@ describe("DlqManager", function()
         end
         assert.is_true(listed)
 
-        -- The dead-lettered record: original key, enveloped value.
         local msg = assert(dlq_topic.partitions[1]:read_message(r3.dlq_offset))
         assert.are.equal("k1", msg.key)
         local env = assert(envelope.decode(msg.value))
@@ -148,7 +143,6 @@ describe("DlqManager", function()
         assert.is_true(r.dead_lettered)
         assert.are.equal(0, broker.dlq:attempts_for("g1", "orders", 1, off))
 
-        -- A fresh failure cycle starts from 1 (and appends a SECOND dlq record).
         local again = assert(broker.dlq:record_failure("g1", "orders", 1, off, ""))
         assert.is_false(again.dead_lettered)
         assert.are.equal(1, again.attempts)
@@ -197,7 +191,6 @@ describe("DlqManager", function()
         local broker = new_broker_with_topic("orders", 1)
         assert.is_nil((broker.dlq:record_failure("g1", "nope", 1, 0, "")))
         assert.is_nil((broker.dlq:record_failure("g1", "orders", 9, 0, "")))
-        -- Offset at/past the log end is unreadable — never counted.
         local topic = assert(broker:get_topic("orders"))
         assert.is_nil((broker.dlq:record_failure(
             "g1", "orders", 1, topic.partitions[1].offset + 100, "")))
@@ -219,7 +212,6 @@ describe("DlqManager", function()
         assert(broker.dlq:record_failure("g1", "orders", 1, o3, ""))
 
         assert.are.equal(2, broker.dlq.tracked)
-        -- o1 was stalest and got evicted; its next failure restarts at 1.
         assert.are.equal(0, broker.dlq:attempts_for("g1", "orders", 1, o1))
         assert.are.equal(1, broker.dlq:attempts_for("g1", "orders", 1, o2))
     end)

@@ -1,16 +1,6 @@
--- Regression cover for the crash documented at the top of reactor.lua:
--- socket.select raises "descriptor too large for set size" the moment any
--- watched descriptor reaches FD_SETSIZE, and the raise happens inside run()'s
--- own frame — so it killed the whole broker, not the offending connection.
--- Reproduced end-to-end at exactly the shipped MaxConnections of 1024.
---
--- These specs drive the same paths with a deliberately tiny fd_limit instead
--- of opening a thousand sockets.
-
 local socket  = require("socket")
 local Reactor = require("src.server.reactor")
 
--- A socket stand-in that reports whatever descriptor number we want.
 local function fake_sock(fd)
     return {
         getfd     = function() return fd end,
@@ -40,14 +30,11 @@ describe("Reactor descriptor budget", function()
 
     it("passes sockets with no usable descriptor rather than guessing", function()
         local r = Reactor.new({ fd_limit = 10 })
-        assert.is_true(r:can_watch(fake_sock(-1)))          -- unconnected
-        assert.is_true(r:can_watch({ close = function() end }))  -- no getfd
+        assert.is_true(r:can_watch(fake_sock(-1)))
+        assert.is_true(r:can_watch({ close = function() end }))
     end)
 
     it("does not blow up the loop when select raises", function()
-        -- Park a coroutine on a descriptor that select cannot represent: the
-        -- pre-fix behaviour was an uncaught error out of run(). Now the
-        -- offender is dropped, its coroutine resumed, and the loop keeps going.
         local r = Reactor.new({ fd_limit = 4 })
         local closed, resumed = false, false
 
@@ -61,10 +48,9 @@ describe("Reactor descriptor budget", function()
             r:wait_readable(bad)
             resumed = true
         end)
-        coroutine.resume(co)              -- parks on bad
+        coroutine.resume(co)
         r.read_waiters[bad] = co
 
-        -- Stop after one tick so run() returns.
         r:spawn(function() r:sleep(0.01); r:stop() end)
 
         local ok, err = pcall(function() r:run() end)
@@ -76,8 +62,6 @@ describe("Reactor descriptor budget", function()
     end)
 
     it("refuses an accepted connection whose descriptor is over the limit", function()
-        -- fd_limit of 1 makes every real accepted socket unwatchable, which is
-        -- the same situation as a full fd table, minus a thousand sockets.
         local r = Reactor.new({ fd_limit = 1 })
         local handled = false
 
@@ -89,7 +73,6 @@ describe("Reactor descriptor budget", function()
             local c = socket.tcp()
             c:settimeout(1)
             c:connect("127.0.0.1", tonumber(port))
-            -- Give the reactor a few ticks to accept and refuse.
             r:sleep(0.2)
             c:close()
             r:stop()
@@ -104,7 +87,7 @@ describe("Reactor descriptor budget", function()
     end)
 
     it("serves normally when descriptors fit", function()
-        local r = Reactor.new()   -- real limit
+        local r = Reactor.new()
         local got_peer = nil
 
         local listener, lerr = r:listen("127.0.0.1", 0, function(sock, peer)

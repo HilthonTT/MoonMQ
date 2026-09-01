@@ -1,18 +1,5 @@
--- LuaJIT FFI binding to libsnappy. Used in place of the `snappy` luarocks
--- rock, which is not published for Lua 5.1. API mirrors what the rock
--- would have exposed but uses (value, err) return convention.
---
--- Snappy is OPTIONAL: it needs both the LuaJIT `ffi` module and a loadable
--- libsnappy. On stock Lua 5.4 (no ffi) or a host without libsnappy, requiring
--- this module must NOT raise — the broker still boots and simply rejects
--- snappy-coded produce requests. `M.available` reports whether the codec is
--- usable; compress/uncompress return (nil, err) when it isn't.
-
 local M = {}
 
--- Guard the ffi require + ffi.load so a missing dependency degrades to
--- "unavailable" instead of a load-time crash. `ffi` is absent on stock Lua;
--- ffi.load raises if libsnappy can't be resolved.
 local ok, ffi = pcall(require, "ffi")
 local lib
 if ok and ffi then
@@ -40,25 +27,14 @@ if ok and ffi then
                                         char* uncompressed,
                                         size_t* uncompressed_length);
         ]]
-        -- ffi.load("snappy") resolves to libsnappy.so on Linux/WSL and
-        -- libsnappy.dylib on macOS. The unversioned symlink is provided by the
-        -- -dev package; if that's missing, libsnappy.so.1 is the runtime name.
         lib = ffi.load("snappy")
     end)
 end
 
--- available reports whether the snappy codec can actually be used on this host.
 M.available = (lib ~= nil)
 
 local SNAPPY_OK              = 0
 
--- Upper bound on a single decompressed frame. snappy_uncompressed_length only
--- parses the varint length prefix at the front of the frame — it does NOT
--- validate the body — so a tiny (~5-byte) malformed input can declare a ~4 GiB
--- output and force that allocation before snappy_uncompress ever runs (a
--- memory-amplification bomb). 256 MiB is far above any real message while still
--- refusing an obviously bogus declared length. Callers that legitimately need
--- larger frames can raise this.
 local MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 
 local function status_name(code)
@@ -94,18 +70,11 @@ function M.uncompress(data)
     local in_len  = #data
     local out_len = ffi.new("size_t[1]")
 
-    -- Snappy stores the uncompressed length in the frame header — read it
-    -- first so we can size the output buffer exactly. No iterative grow.
     local status = lib.snappy_uncompressed_length(data, in_len, out_len)
     if status ~= SNAPPY_OK then
         return nil, string.format("snappy_uncompressed_length: %s", status_name(status))
     end
 
-    -- Reject an attacker-declared length before allocating for it. Without this
-    -- a malformed frame declaring a huge length triggers a giant allocation
-    -- (bomb), and ffi.new itself RAISES on allocation failure rather than
-    -- returning nil — so the allocation + uncompress is pcall-wrapped to turn
-    -- any such failure into a clean (nil, err) instead of an uncaught crash.
     local declared = tonumber(out_len[0])
     if declared > MAX_UNCOMPRESSED_BYTES then
         return nil, string.format(
@@ -122,8 +91,6 @@ function M.uncompress(data)
         return ffi.string(out, out_len[0]), nil
     end)
     if not pok then
-        -- pcall caught a raised error (e.g. ffi.new allocation failure); `result`
-        -- holds the error object here.
         return nil, string.format("snappy_uncompress: %s", tostring(result))
     end
     if result == nil then

@@ -1,15 +1,3 @@
--- Base64 (RFC 4648) encode/decode.
---
--- Written for SCRAM (RFC 5802), whose message fields — nonces, salt, proofs —
--- are specified as base64 text. Keeping the wire bytes RFC-shaped means the
--- exchange can be checked against published SCRAM vectors instead of only
--- against ourselves.
---
--- decode is strict: it rejects anything outside the alphabet, misplaced
--- padding, and lengths that cannot be a valid encoding. The inputs here are
--- attacker-supplied (a client-first message arrives pre-authentication), so
--- "lenient" would mean accepting two encodings of the same nonce.
-
 local M = {}
 
 local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -54,9 +42,6 @@ function M.encode(data)
     return table.concat(out)
 end
 
--- Returns (decoded, nil) or (nil, err). No whitespace is tolerated: SCRAM
--- fields are single-token, and silently skipping characters would let two
--- different strings decode to the same nonce.
 function M.decode(text)
     if type(text) ~= "string" then return nil, "base64: not a string" end
     if #text % 4 ~= 0 then return nil, "base64: length not a multiple of 4" end
@@ -65,7 +50,6 @@ function M.decode(text)
     local pad = 0
     if text:sub(-1) == "=" then pad = 1 end
     if text:sub(-2) == "==" then pad = 2 end
-    -- Padding may only appear at the very end.
     local body = text:sub(1, #text - pad)
     if body:find("=", 1, true) then return nil, "base64: misplaced padding" end
 
@@ -84,7 +68,6 @@ function M.decode(text)
         end
     end
 
-    -- Leftover bits must be zero, otherwise the encoding is non-canonical.
     if bits > 0 and (acc & ((1 << bits) - 1)) ~= 0 then
         return nil, "base64: non-canonical trailing bits"
     end

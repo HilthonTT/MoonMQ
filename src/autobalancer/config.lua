@@ -3,13 +3,8 @@ local NetworkOutGoal     = require("src.autobalancer.goals.network_out_distribut
 local DiskGoal           = require("src.autobalancer.goals.disk_distribution_goal")
 local PartitionCountGoal = require("src.autobalancer.goals.partition_count_distribution_goal")
 
--- Central defaults and the goal factory, mirroring AutoMQ's
--- AutoBalancerControllerConfig. `build_goals` turns a config table into the
--- ordered goal list the detector runs (lower priority first).
 local M = {}
 
--- Each entry: which goal module builds it, and whether it's on by default.
--- Per-goal tuning is passed through untouched to the goal's new(opts).
 local GOAL_SPECS = {
     { key = "network_in",      module = NetworkInGoal,      default = true },
     { key = "network_out",     module = NetworkOutGoal,     default = true },
@@ -18,22 +13,16 @@ local GOAL_SPECS = {
 }
 
 M.defaults = {
-    -- ClusterModel sampling
     percentile = 0.9,
     window     = 60,
     min_valid  = 3,
 
-    -- Detector
     max_actions_per_detect = 50,
     emit_metrics           = true,
 
-    -- Per-goal overrides live under goals.<key> = { ... } or goals.<key> = false
     goals = {},
 }
 
--- Build the ordered goal list. `goals_cfg` maps a goal key to either false
--- (disable) or a table of overrides forwarded to that goal's new(). Omitted
--- keys use the default-enabled goal with default tuning.
 function M.build_goals(goals_cfg)
     goals_cfg = goals_cfg or {}
     local goals = {}

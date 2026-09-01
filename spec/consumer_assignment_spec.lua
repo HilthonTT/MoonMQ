@@ -14,8 +14,6 @@ local function rmdir(path)
     end
 end
 
--- Produce one record into every partition of `topic` so a poll of any subset
--- returns exactly that subset's partitions.
 local function seed_all_partitions(broker, topic_name)
     local topic = assert(broker:get_topic(topic_name))
     for pid = 1, #topic.partitions do
@@ -76,7 +74,7 @@ describe("consumer group partition assignment", function()
 
         local c = consumer_m.Consumer.new(broker, "g")
         assert(c:subscribe("orders"))
-        c:set_assignment({})           -- joined but assigned nothing
+        c:set_assignment({})
         local recs = assert(c:poll())
         assert.are.equal(0, #recs)
     end)
@@ -92,8 +90,6 @@ describe("consumer group partition assignment", function()
         c:set_assignment({ orders = { 1 } })
         assert.is_true(partitions_seen(assert(c:poll()))[1])
 
-        -- Rebalance hands this member partition 3 instead; the next poll picks
-        -- it up with no re-subscribe needed.
         c:set_assignment({ orders = { 3 } })
         local s = partitions_seen(assert(c:poll()))
         assert.is_true(s[3], "should read newly-assigned partition 3")

@@ -1,22 +1,7 @@
--- Length-prefixed message framer. Pure I/O concern: takes a byte stream,
--- yields complete frames. (The write side lives in src/wire/protocol.lua,
--- whose encoders emit an already length-prefixed frame.)
---
--- Wire format:  [FrameLen:u32 BE] [FrameBody:FrameLen bytes]
---
--- Knows nothing about opcodes, correlation IDs, or message types. The
--- protocol module is layered on top.
-
 local rct = require("src.server.reactor")
 
 local M = {}
 
--- Reads one full frame off the socket. Returns (frame_body, nil) or
--- (nil, err).
---
--- The caller is responsible for bounding the read with `deadline` — for
--- handshake reads this should be the handshake deadline, for steady-
--- state reads the idle deadline.
 function M.read_frame(reactor, sock, max_frame, deadline)
     assert(deadline == nil or type(deadline) == 'number',
         "deadline must be a number or nil")

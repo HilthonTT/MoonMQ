@@ -37,11 +37,6 @@ describe("crc32 (IEEE 802.3)", function()
         assert.is_true(v >= 0 and v < 0x100000000)
     end)
 
-    -- crc32.lua picks a native zlib (FFI or the lua-zlib rock) when one is
-    -- present and a pure-Lua table otherwise. Which backend is active depends
-    -- on the host, and a mismatch between them would silently corrupt every
-    -- record on disk — so check whatever backend loaded against an
-    -- independent reference implementation of the same polynomial.
     describe("active backend vs. an independent reference", function()
         local ref_table = {}
         for i = 0, 255 do

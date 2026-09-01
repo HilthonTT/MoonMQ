@@ -1,7 +1,3 @@
--- Small string helpers Lua's stdlib lacks. Kept deliberately thin: only what
--- the commitlog's filename parsing (src/commitlog/commitlog.lua) actually
--- needs, so this doesn't drift into an unused grab-bag.
-
 local M = {}
 
 function M.endswith(str, ending)

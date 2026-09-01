@@ -1,7 +1,3 @@
--- Controller epoch fencing (src/cluster/controller_fence.lua): the balance
--- loop is no longer "one controller by convention" — a superseded controller
--- is refused by peers and stops acting.
-
 local json            = require("dkjson")
 local brk_m           = require("src.broker")
 local os_utils        = require("src.core.os")
@@ -38,7 +34,6 @@ local function make_node(id)
     return node
 end
 
--- In-process Peer: only what the fencing paths need.
 local function local_peer(node)
     local cs = node.cluster_server
     return {
@@ -81,11 +76,11 @@ describe("controller fence", function()
         os.execute("mkdir -p '" .. BASE .. "/A'")
         local f = assert(ControllerFence.new(BASE .. "/A"))
         assert.is_true(f:observe(3, "B"))
-        assert.is_true(f:observe(3, "B"))        -- same claimant, same epoch: ok
-        local ok, err = f:observe(3, "C")        -- rival at same epoch: no
+        assert.is_true(f:observe(3, "B"))
+        local ok, err = f:observe(3, "C")
         assert.is_nil(ok)
         assert.matches("stale", err)
-        local ok2, err2 = f:observe(2, "B")      -- older: no
+        local ok2, err2 = f:observe(2, "B")
         assert.is_nil(ok2)
         assert.matches("stale", err2)
         assert.is_true(f:observe(4, "C"))
@@ -100,12 +95,10 @@ describe("controller fence", function()
                 "POST /cluster/append HTTP/1.1\r\nX-Controller-Epoch: %d\r\nX-Controller-Id: %s\r\n\r\n",
                 epoch, id)
         end
-        -- fence is at epoch 2 (claimed above by A)
         local ok, err = n.cluster_server:_check_fence(hdrs(1, "B"))
         assert.is_nil(ok)
         assert.matches("stale", err)
         assert.is_true(n.cluster_server:_check_fence(hdrs(3, "B")))
-        -- No headers at all: legacy request, passes.
         assert.is_true(n.cluster_server:_check_fence("POST /cluster/append HTTP/1.1\r\n\r\n"))
     end)
 
@@ -128,23 +121,19 @@ describe("controller fence", function()
         assert.is_table(actions_a)
         assert.are.equal(1, loop_a.controller_epoch)
 
-        -- B starts its own loop: claims epoch 2 locally and announces to A.
         local loop_b = loop_for(b)
         local _, err_b = loop_b:tick()
         assert.is_nil(err_b)
         assert.are.equal(2, loop_b.controller_epoch)
 
-        -- A's next pass re-announces epoch 1 to B, which knows epoch 2: fenced.
         local actions_a2, err_a2 = loop_a:tick()
         assert.are.equal(0, #actions_a2)
         assert.matches("superseded", err_a2)
         assert.is_true(loop_a.fenced)
 
-        -- And it stays fenced without re-claiming.
         local _, err_a3 = loop_a:tick()
         assert.matches("superseded", err_a3)
 
-        -- B is unaffected.
         local _, err_b2 = loop_b:tick()
         assert.is_nil(err_b2)
     end)

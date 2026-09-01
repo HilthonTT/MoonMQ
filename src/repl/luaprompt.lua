@@ -12,7 +12,6 @@ LuaPrompt = Class {
     init = function(self, options)
         options = options or {}
 
-        -- If false not parsing while typing
         self.parsing = true
         if options.parsing ~= nil then
             self.parsing = options.parsing
@@ -32,19 +31,12 @@ LuaPrompt = Class {
 
         self.env = options.env or _G
 
-        -- Leave function
         self.quit = options.quit
 
-        -- History
         self.history = options.history or {}
         self.historyIndex = 0
 
-        -- Lexing
         self.builtins = options.builtins or {}
-        -- merge(
-        --     require "croissant.builtins",
-        --     options.builtins or {}
-        -- )
         self.tokens = {}
 
         self.tokenColors = options.tokenColors
@@ -59,17 +51,16 @@ function LuaPrompt:registerKeybinding()
     self.keybinding.command_get_next_history = {
         Prompt.escapeCodes.key_down,
         C "n",
-        Esc "[B", -- backup
+        Esc "[B",
     }
 
     self.keybinding.command_get_previous_history = {
         Prompt.escapeCodes.key_up,
         C "p",
-        Esc "[A", -- backup
+        Esc "[A",
     }
 
     self.keybinding.command_exit = {
-        -- Not allowed
     }
 
     self.keybinding.command_abort = {
@@ -119,7 +110,6 @@ function LuaPrompt:command_complete()
         local possibleValues = {}
         local highlightedPossibleValues = {}
         if currentToken.kind == "identifier" then
-            -- Search in _G
             for k, _ in pairs(self.env) do
                 if k:utf8sub(1, #currentToken.text) == currentToken.text then
                     table.insert(possibleValues, k)
@@ -128,7 +118,6 @@ function LuaPrompt:command_complete()
                 end
             end
 
-            -- Search in keywords
             for _, k in ipairs(keywords) do
                 if k:utf8sub(1, #currentToken.text) == currentToken.text then
                     table.insert(possibleValues, k)
@@ -137,7 +126,6 @@ function LuaPrompt:command_complete()
                 end
             end
 
-            -- Search in builtins
             for _, k in ipairs(self.builtins) do
                 if k:utf8sub(1, #currentToken.text) == currentToken.text then
                     table.insert(possibleValues, k)
@@ -148,9 +136,6 @@ function LuaPrompt:command_complete()
         elseif currentToken.kind == "operator"
             and (currentToken.text == "."
                 or currentToken.text == ":") then
-            -- TODO: this requires an AST
-            -- We need to be able to evaluate previous expression to search
-            -- possible values in it
 
             if currentTokenIndex > 1
                 and self.tokens[currentTokenIndex - 1].kind == "identifier" then

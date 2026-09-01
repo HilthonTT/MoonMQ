@@ -84,14 +84,12 @@ local function frameEnv(withGlobals, frameOffset)
     local level = 5 + (frameOffset or 0)
     local func = debug.getinfo(level - 1).func
     local env = {}
-    -- Shallow copy of _G
     local rawenv = {}
     for k, v in pairs(_G) do
         rawenv[k] = v
     end
     local i
 
-    -- Retrieve the upvalues
     i = 1
     while true do
         local ok, name, value = pcall(debug.getupvalue, func, i)
@@ -105,7 +103,6 @@ local function frameEnv(withGlobals, frameOffset)
         i = i + 1
     end
 
-    -- Retrieve the locals (overwriting any upvalues)
     i = 1
     while true do
         local ok, name, value = pcall(debug.getlocal, level, i)
@@ -119,7 +116,6 @@ local function frameEnv(withGlobals, frameOffset)
         i = i + 1
     end
 
-    -- Retrieve the varargs
     local varargs = {}
     i = 1
     while true do
@@ -146,7 +142,6 @@ local function frameEnv(withGlobals, frameOffset)
 end
 
 local function bindInFrame(frame, name, value, env)
-    -- Mutating a local?
     do
         local i = 1
         repeat
@@ -161,7 +156,6 @@ local function bindInFrame(frame, name, value, env)
         until var == nil
     end
 
-    -- Mutating an upvalue?
     local func = debug.getinfo(frame).func
     do
         local i = 1
@@ -176,11 +170,9 @@ local function bindInFrame(frame, name, value, env)
         until var == nil
     end
 
-    -- New global
     rawset(_G, name, value)
 end
 
--- Returns true when more line are needed
 local function runChunk(code, env, name)
     env = env or _G
 
@@ -200,7 +192,6 @@ local function runChunk(code, env, name)
             end
 
             if result.n < 2 then
-                -- Look for assignments
                 local names = { code:match "^([^{=]+)%s?=[^=]" }
                 if names then
                     for _, n in ipairs(names) do
@@ -221,7 +212,6 @@ local function runChunk(code, env, name)
             print(colors.red(result[2]))
         end
     else
-        -- Syntax error near <eof>
         if err and err:match("<eof>") then
             return true
         else
@@ -235,7 +225,6 @@ end
 local function runFile(script, arguments)
     arguments = arguments or {}
 
-    -- Run file
     local fn, err = loadfile(script)
 
     if not fn then

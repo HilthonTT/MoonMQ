@@ -1,29 +1,6 @@
--- Executor for MoonMQ's SQL-like console.
---
--- Owns the session state (the live broker connection and any joined group)
--- and turns a parsed statement into a broker call via src/client. Every
--- statement returns a uniform result table the REPL knows how to render:
---
---   { ok = true,  kind = "message", message = "..." }
---   { ok = true,  kind = "rows", columns = {...}, rows = {{...}, ...}, note = "..." }
---   { ok = true,  kind = "help", topic = "fetch"|nil }
---   { ok = true,  kind = "quit" }
---   { ok = false, error = "..." }
---
--- The executor never prints; keeping I/O in the REPL makes the command layer
--- straightforward to unit-test with a stub client.
-
 local Session = {}
 Session.__index = Session
 
--- opts.client_factory lets tests inject a fake connector. It must have the
--- same shape as src.client.Client.new: (opts) -> (client, err).
---
--- Auth note: the broker requires an AUTH frame to leave the handshake even in
--- OPEN mode (a connection that only says HELLO is dropped by the handshake
--- watchdog after a few seconds). So we always authenticate, defaulting to the
--- project's shipped admin/admin credentials; override per-connection with
--- CONNECT ... USER '...' PASSWORD '...'.
 function Session.new(opts)
     opts = opts or {}
     return setmetatable({
@@ -33,11 +10,7 @@ function Session.new(opts)
         port           = opts.port or 9092,
         user           = opts.user or "admin",
         password       = opts.password or "admin",
-        -- Parameters of the last successful connect, replayed to transparently
-        -- reconnect if the broker drops an idle socket between statements.
         last_connect   = nil,
-        -- Remembered from the last CREATE/JOIN GROUP so SHOW GROUP and
-        -- offset-less commands have context.
         group          = nil,
         assignment     = nil,
     }, Session)
@@ -47,8 +20,6 @@ local function ok_msg(msg)          return { ok = true, kind = "message", messag
 local function fail(msg)            return { ok = false, error = msg } end
 
 local function client_module()
-    -- Required lazily: pulls in luasocket, which the pure lexer/parser layers
-    -- (and their tests) must not depend on.
     return require("src.client")
 end
 
@@ -56,7 +27,6 @@ function Session:is_connected()
     return self.client ~= nil and not self.client.closed
 end
 
--- Guard for statements that need a live connection.
 function Session:require_client()
     if not self:is_connected() then
         return nil, "not connected — run CONNECT first"
@@ -120,8 +90,6 @@ function Session:list_topics()
 
     local rows = {}
     for _, t in ipairs(topics) do
-        -- The wire list may be plain strings or {name, partitions} tables
-        -- depending on protocol version; handle both.
         if type(t) == "table" then
             rows[#rows + 1] = { t.name or t[1] or "?", t.partitions or t[2] or "" }
         else
@@ -161,7 +129,6 @@ function Session:subscribe(node)
 
     local records = {}
     local limit = node.limit
-    -- Read pushed records until the per-record timeout elapses or LIMIT is hit.
     while not (limit and #records >= limit) do
         local rec, rerr = c:next_record(node.timeout)
         if not rec then
@@ -245,7 +212,6 @@ function Session:heartbeat()
     return ok_msg(string.format("heartbeat sent for group '%s'", self.group))
 end
 
--- Dispatch table keyed by AST node type.
 local HANDLERS = {
     connect      = Session.connect,
     disconnect   = function(s) return s:disconnect() end,
@@ -263,11 +229,6 @@ local HANDLERS = {
     quit         = function() return { ok = true, kind = "quit" } end,
 }
 
--- Statements safe to replay verbatim after a transparent reconnect. These
--- either don't reach the broker when the socket is already dead (a failed
--- write never appends) or are naturally idempotent. Group statements are
--- excluded: a reconnect drops the member_id, so retrying would be misleading —
--- the user should re-JOIN instead.
 local RETRYABLE = {
     create_topic = true,
     list_topics  = true,
@@ -276,8 +237,6 @@ local RETRYABLE = {
     commit       = true,
 }
 
--- Does this error look like the connection died (rather than an application
--- error the broker deliberately returned)?
 local function looks_disconnected(err)
     err = tostring(err or ""):lower()
     return err:find("closed") or err:find("broken pipe")
@@ -285,8 +244,6 @@ local function looks_disconnected(err)
         or err:find("reset") or err:find("timeout")
 end
 
--- Execute one AST node; returns a result table (never throws for broker
--- errors, which come back as { ok = false, error }).
 function Session:execute(node)
     local handler = HANDLERS[node.type]
     if not handler then
@@ -295,9 +252,6 @@ function Session:execute(node)
 
     local res = handler(self, node)
 
-    -- The broker drops idle sockets (handshake/idle/heartbeat deadlines). If a
-    -- retryable statement failed because the connection died, silently
-    -- re-establish it with the last-used parameters and try once more.
     if res and res.ok == false and RETRYABLE[node.type]
         and self.last_connect and looks_disconnected(res.error) then
         local rc = self:connect(self.last_connect)

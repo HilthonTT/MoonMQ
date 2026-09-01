@@ -1,12 +1,3 @@
--- DELETE_TOPIC / DESCRIBE_TOPIC / ALTER_TOPIC_CONFIG.
---
--- Before these, topic config was write-once at creation: topic_config.lua
--- persisted retention and friends to a sidecar and the cleaners acted on it,
--- but nothing could read it back, change it, or remove a topic. The
--- interesting cases here are the ones where deletion has to reach past the
--- log: live consumer groups, durable committed offsets, and DLQ counters all
--- reference a topic by name and would otherwise dangle.
-
 local proto      = require("src.wire.protocol")
 local uuid       = require("src.core.uuid")
 local brk_m      = require("src.broker")
@@ -48,8 +39,6 @@ local function only_reply(conn)
     return op, payload
 end
 
--- Fake coordinator standing in for the Server's real one where a test only
--- needs delete_topic's group-eviction call to be observable.
 local function fake_coordinator()
     return {
         forgotten = {},
@@ -103,9 +92,6 @@ describe("topic admin wire formats", function()
         local d = assert(proto.decode_topic_description(payload))
         assert.are.equal("orders", d.name)
         assert.are.equal(4, d.num_partitions)
-        -- Values come back as strings even for the numeric keys: the sidecar
-        -- mixes types and a client that prints or re-submits them should not
-        -- need a per-key type table.
         assert.are.equal("604800", d.config.retention)
         assert.are.equal("commitlog", d.config.backend)
     end)
@@ -169,9 +155,6 @@ describe("topic admin handlers", function()
             local d = assert(proto.decode_topic_description(payload))
 
             assert.are.equal("60", d.config.retention)
-            -- An unset key is absent rather than filled with the current
-            -- default: "unset" and "set to today's default" diverge the day
-            -- the default moves, and the sidecar records that difference.
             assert.is_nil(d.config.max_segment_size)
         end)
 
@@ -193,9 +176,6 @@ describe("topic admin handlers", function()
             assert(broker:create_topic("orders", 1))
             expect_ok(alter_config("orders", { retention = 120 }))
 
-            -- Read the sidecar directly: it is the durable source of truth
-            -- Broker:load_topics restores from, so a change that only touched
-            -- memory would be lost on the next restart.
             local dir = fs_m.join_path(BASE_DIR, "orders")
             local saved = assert(topic_config.load(dir))
             assert.are.equal(120, saved.retention)
@@ -238,8 +218,6 @@ describe("topic admin handlers", function()
 
         it("rejects backend as immutable", function()
             assert(broker:create_topic("orders", 1))
-            -- backend decides the on-disk format; changing it on a topic with
-            -- data would mean reinterpreting existing segments.
             local e = expect_error(alter_config("orders", { backend = "commitlog" }))
             assert.are.equal(proto.ERR_INVALID_CONFIG, e.code)
         end)
@@ -283,8 +261,6 @@ describe("topic admin handlers", function()
             assert(broker:create_topic("orders", 1))
             expect_ok(delete_topic("orders"))
 
-            -- The directory is what load_topics scans, so a delete that only
-            -- forgot the topic in memory would resurrect it here.
             local reopened = assert(brk_m.Broker.new(BASE_DIR))
             assert.are.same({}, reopened:list_topics())
         end)
@@ -297,8 +273,6 @@ describe("topic admin handlers", function()
             expect_ok(delete_topic("orders"))
             assert.is_nil(broker:fetch_offset("billing", "orders", 1))
 
-            -- Durably, not just in memory: a recreated topic of the same name
-            -- must not hand the group a stale offset into an unrelated log.
             local reopened = assert(brk_m.Broker.new(BASE_DIR))
             assert.is_nil(reopened:fetch_offset("billing", "orders", 1))
         end)
@@ -325,9 +299,6 @@ describe("topic admin handlers", function()
         end)
 
         it("drops the topic's DLQ attempt counters", function()
-            -- record_failure reads the record before counting (it validates
-            -- the offset and needs the bytes for the dead-letter path), so
-            -- each topic needs a real record to NACK against.
             local orders = assert(broker:create_topic("orders", 1))
             local events = assert(broker:create_topic("events", 1))
             local o_off = orders.partitions[1]:write_message(
@@ -342,16 +313,12 @@ describe("topic admin handlers", function()
             expect_ok(delete_topic("orders"))
 
             assert.are.equal(0, broker.dlq:attempts_for("g", "orders", 1, o_off))
-            -- The other topic's counter is keyed by the same packed format and
-            -- must survive: forget_topic unpacks the key rather than
-            -- pattern-matching the packed bytes.
             assert.are.equal(1, broker.dlq:attempts_for("g", "events", 1, e_off))
         end)
 
         it("refuses to delete an internal topic", function()
             local e = expect_error(delete_topic("__consumer_offsets"))
             assert.are.equal(proto.ERR_TOPIC_FORBIDDEN, e.code)
-            -- And the broker's own state is untouched.
             assert.is_truthy(broker.topic_manager.topics["__consumer_offsets"])
         end)
 
@@ -369,7 +336,6 @@ describe("topic admin handlers", function()
 
             local fresh = assert(broker:create_topic("orders", 1))
             assert.are.equal(1, #fresh.partitions)
-            -- A brand new log, not the old one reopened.
             assert.are.equal(fresh.partitions[1]:oldest_offset(),
                              fresh.partitions[1].offset)
         end)
@@ -397,9 +363,6 @@ describe("ConsumerGroup:forget_topic", function()
 
         assert.is_nil(group.topics["orders"])
         assert.is_truthy(group.topics["events"])
-        -- The member keeps its events partitions and loses only the orders
-        -- ones: a rebalance after deletion must not hand out partitions of a
-        -- log that no longer exists.
         local m = group.members["m1"]
         assert.is_nil(m.partitions["orders"])
         assert.are.equal(2, #m.partitions["events"])

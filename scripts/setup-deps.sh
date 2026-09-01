@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Platform-specific MoonMQ deps.
-#
-# luaposix provides posix.stdio / posix.unistd for the durable-fsync path
-# in src/io/io_sync.lua. It's POSIX-only and won't build on native Windows,
-# so it lives here instead of the Makefile's cross-platform `deps` list.
 set -euo pipefail
 
 LUAROCKS="${LUAROCKS:-luarocks}"

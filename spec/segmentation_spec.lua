@@ -65,7 +65,6 @@ describe("SegmentedPartition", function()
     end)
 
     it("rolls when the active segment exceeds max_segment_size", function()
-        -- Tiny cap so each message rolls on its own.
         local p = new_partition("t1", 1, { max_segment_size = 64 })
 
         local offsets = {}
@@ -76,11 +75,9 @@ describe("SegmentedPartition", function()
             offsets[i] = off
         end
 
-        -- We expect more than one segment after a few writes.
         assert.is_true(#p.segments >= 2,
             string.format("expected >=2 segments, got %d", #p.segments))
 
-        -- Reading by global offset must follow the segment boundaries.
         for i = 1, 3 do
             local got, _, rerr = p:read_message(offsets[i])
             assert.is_nil(rerr)
@@ -102,8 +99,6 @@ describe("SegmentedPartition", function()
         local cp = tonumber(f:read("*a"))
         f:close()
 
-        -- The checkpoint should be the base offset of the active (newest)
-        -- segment, i.e., the boundary between sealed and live data.
         assert.are.equal(cp, p.active_segment.base_offset)
         p:close()
     end)
@@ -121,10 +116,9 @@ describe("SegmentedPartition", function()
             { part_dir("t1", 1), string.format("%020d.log", 0) }, SEP)
 
         local f = assert(io.open(seg_path, "ab"))
-        f:write(string.char(0,0,0,0,0,0,0xFF,0xFF)) -- bogus length prefix
+        f:write(string.char(0,0,0,0,0,0,0xFF,0xFF))
         f:close()
 
-        -- Delete clean-shutdown so load_segments runs verify_file.
         os.remove(table.concat({ part_dir("t1", 1), ".clean-shutdown" }, SEP))
 
         local p2 = new_partition("t1", 1)
@@ -138,9 +132,6 @@ describe("SegmentedPartition", function()
         local good_offset = p.offset
         p:close()
 
-        -- Reopen: clean_shutdown flag is present, recovery should be a
-        -- no-op on sealed segments. (The active segment is always
-        -- verified, but with no tear there's nothing to truncate.)
         local p2 = new_partition("t1", 1)
         assert.are.equal(p2.offset, good_offset)
         p2:close()

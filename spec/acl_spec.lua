@@ -1,13 +1,3 @@
--- ACL evaluation and rule validation.
---
--- Two properties carry the whole model and both are easy to break by
--- accident: default-deny (a principal with no matching rule is refused, so a
--- forgotten grant fails closed) and deny-wins (an explicit deny beats any
--- allow regardless of order, so "everything under orders.* except
--- orders.audit" needs no ordering rules). Everything else here pins the
--- config-time validation, which is what stops a mistyped rule from silently
--- granting nothing — or, worse, more than intended.
-
 local acl_m = require("src.server.acl")
 
 describe("acl rules", function()
@@ -21,14 +11,10 @@ describe("acl rules", function()
     end)
 
     it("rejects operations that are meaningless on the resource", function()
-        -- group:write is never checked by any handler; a rule granting it
-        -- would look effective and do nothing.
         local rule, err = acl_m.rule({
             Resource = "group", Name = "g", Operations = { "write" } })
         assert.is_nil(rule)
         assert.is_truthy(err:find("not valid on a group"))
-        -- The error names the alternatives, so the fix does not require
-        -- reading the source.
         assert.is_truthy(err:find("describe"))
     end)
 
@@ -86,9 +72,7 @@ describe("acl evaluation", function()
         assert.is_true(a:authorized("topic", "orders", "read"))
         assert.is_false(a:authorized("topic", "orders2", "read"))
         assert.is_false(a:authorized("topic", "order", "read"))
-        -- The grant is per-operation, not per-resource.
         assert.is_false(a:authorized("topic", "orders", "write"))
-        -- ...and per-resource-type: a topic grant is not a group grant.
         assert.is_false(a:authorized("group", "orders", "read"))
     end)
 

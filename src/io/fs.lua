@@ -1,22 +1,6 @@
 local os_utils = require("src.core.os")
+local io_sync  = require("src.io.io_sync")
 
--- Three backends, probed in this order per operation:
---
---   luaposix  — stat/dirent/unistd syscalls. THE path that matters on the
---               broker: everything here runs on the single reactor thread,
---               and the shell fallback below forks a process per call.
---               Measured on ext4: `test -d` 23.6ms vs posix.sys.stat 2.5us,
---               `ls -1a` via popen 18.7ms vs posix.dirent 11.8us. Opening
---               ten partitions cost 42 process spawns before this existed.
---   Win32 FFI — LuaJIT-on-Windows, where luaposix doesn't exist. Also avoids
---               the probe-file trick is_dir used to need (read-only dirs
---               returned false, and a failed os.remove could leave litter).
---   shell     — correct everywhere, slow everywhere. Kept so a host with
---               neither luaposix nor FFI still boots.
---
--- Set MOONMQ_FS_BACKEND=shell to force the fallback (used by the spec to
--- exercise both paths on one host, and useful when a syscall path is
--- suspect). fs.backend reports which one is live.
 local force_backend = os.getenv("MOONMQ_FS_BACKEND")
 
 local px_stat, px_dirent, px_unistd
@@ -24,8 +8,6 @@ if force_backend ~= "shell" and not os_utils.IS_WINDOWS then
     local ok_stat,   stat   = pcall(require, "posix.sys.stat")
     local ok_dirent, dirent = pcall(require, "posix.dirent")
     local ok_unistd, unistd = pcall(require, "posix.unistd")
-    -- All three or none: a half-present luaposix would mean some operations
-    -- fork and some don't, which is the worst of both for latency debugging.
     if ok_stat and ok_dirent and ok_unistd then
         px_stat, px_dirent, px_unistd = stat, dirent, unistd
     end
@@ -48,7 +30,7 @@ local function join_path(...)
     local sep   = os_utils.IS_WINDOWS and "\\" or "/"
     local parts = {}
     for _, p in ipairs({ ... }) do
-        p = p:gsub("[/\\]+$", "") -- strip trailing slashes (both kinds)
+        p = p:gsub("[/\\]+$", "")
         if p ~= "" then
             parts[#parts+1] = p
         end
@@ -56,9 +38,6 @@ local function join_path(...)
     return table.concat(parts, sep)
 end
 
--- Normalize Lua's wildly version-dependent os.execute return shape.
--- LuaJIT (5.1 semantics): single number, 0 = success.
--- Lua 5.2+: (true|nil, "exit"|"signal", code).
 local function exec_ok(...)
     local r1, _, r3 = os.execute(...)
     if type(r1) == "boolean" then
@@ -70,7 +49,7 @@ end
 local function is_dir(path)
     assert(type(path) == "string", "path must be a string")
     if px_stat then
-        local st = px_stat.stat(path)          -- follows symlinks, like `test -d`
+        local st = px_stat.stat(path)
         return st ~= nil and px_stat.S_ISDIR(st.st_mode) ~= 0
     end
     if os_utils.IS_WINDOWS and kernel32 and has_bit then
@@ -79,17 +58,11 @@ local function is_dir(path)
         local FILE_ATTRIBUTE_DIRECTORY = 0x10
         return bit.band(attr, FILE_ATTRIBUTE_DIRECTORY) ~= 0
     end
-    -- Unix fallback (and Windows-without-FFI fallback).
     local quoted = path:gsub("'", "'\\''")
     local ok = exec_ok(string.format("test -d '%s'", quoted))
     return ok
 end
 
---- True if anything (file, dir, symlink) exists at `path`. Equivalent to a
---- successful os.Stat with no IsNotExist. On Windows uses GetFileAttributesA
---- (0xFFFFFFFF == not found); elsewhere shells out to `test -e`. The
---- Windows-without-FFI path falls through to `test -e`, which only works under
---- a POSIX shell (WSL/git-bash), same limitation is_dir already carries.
 local function exists(path)
     assert(type(path) == "string", "path must be a string")
     if px_stat then
@@ -102,10 +75,6 @@ local function exists(path)
     return exec_ok(string.format("test -e '%s'", quoted))
 end
 
--- `mkdir -p` in Lua: walk the components and create each missing one.
--- An existing component is not an error (EEXIST), and neither is losing a
--- race to another process — the authoritative check is is_dir() on the
--- component we just tried to create, same contract as the shell version.
 local function mkdir_posix(path)
     if is_dir(path) then return true, nil end
 
@@ -133,9 +102,6 @@ local function mkdir(path)
 
     local cmd
     if os_utils.IS_WINDOWS then
-        -- Windows mkdir creates intermediate dirs by default and errors
-        -- if the dir already exists; 2>nul swallows the "already exists"
-        -- noise. The authoritative check is is_dir() afterward.
         cmd = string.format('mkdir "%s" 2>nul', path:gsub("/", "\\"))
     else
         cmd = string.format("mkdir -p '%s'", path:gsub("'", "'\\''"))
@@ -156,10 +122,6 @@ local function read_dir(dir)
     end
 
     if px_dirent then
-        -- posix.dirent.dir RAISES on an unreadable directory (it does not
-        -- return nil, err), so it has to be pcall'd — the is_dir check above
-        -- doesn't cover a directory we lack +r on, or one unlinked between
-        -- the two calls.
         local ok, names = pcall(px_dirent.dir, dir)
         if not ok then
             return nil, string.format("read_dir failed: %s", tostring(names))
@@ -183,9 +145,6 @@ local function read_dir(dir)
         return nil, "failed to open pipe for read_dir"
     end
 
-    -- pcall so that an iterator error (child process death mid-read,
-    -- pipe broken, etc.) doesn't leak the pipe handle. We always close
-    -- the pipe, then re-surface any iterator error to the caller.
     local entries = {}
     local ok, iter_err = pcall(function()
         for name in pipe:lines() do
@@ -201,10 +160,6 @@ local function read_dir(dir)
     return entries, nil
 end
 
---- Remove a single EMPTY directory. POSIX os.remove (C remove()) dispatches
---- to rmdir for a directory, but Windows' CRT remove() only handles files,
---- so we need RemoveDirectoryA there (FFI), or a bare `rmdir` (no /s, since
---- the dir is already empty) when FFI is unavailable.
 local function rmdir_empty(path)
     if px_unistd then
         if px_unistd.rmdir(path) == 0 then
@@ -214,7 +169,7 @@ local function rmdir_empty(path)
     end
     if os_utils.IS_WINDOWS then
         if kernel32 then
-            if kernel32.RemoveDirectoryA(path) ~= 0 then -- nonzero == success
+            if kernel32.RemoveDirectoryA(path) ~= 0 then
                 return true, nil
             end
             return false, string.format("RemoveDirectoryA failed: %s", path)
@@ -231,25 +186,14 @@ local function rmdir_empty(path)
     return true, nil
 end
 
---- Recursively remove `path` and everything under it, matching Go's
---- os.RemoveAll: an absent path is success, not an error. Pure Lua, no shell
---- spawn -- depth-first, unlink files then remove the emptied directories.
----
---- CAVEAT vs Go: this follows symlinks-to-directories. is_dir() (test -d /
---- GetFileAttributesA) reports a dir-symlink as a directory, so we'd recurse
---- INTO the target and delete its contents. Go's RemoveAll removes the link
---- itself. Detecting links needs lstat (FFI) or `test -L`, which I left out
---- because a commit-log dir shouldn't contain symlinks -- flagging it in case
---- this ever gets pointed at a tree where it matters.
 local remove_all
 remove_all = function(path)
     assert(type(path) == "string", "path must be a string")
     if not exists(path) then
-        return true, nil -- absent is success
+        return true, nil
     end
 
     if not is_dir(path) then
-        -- plain file; os.remove unlinks files on every platform.
         local ok, err = os.remove(path)
         if not ok then
             return false, string.format("failed to remove %s: %s", path, tostring(err))
@@ -271,9 +215,6 @@ remove_all = function(path)
     return rmdir_empty(path)
 end
 
---- Returns a list of file paths matching a Lua pattern.
---- `dir`     - the directory to search in
---- `pattern` - a Lua pattern (e.g. "^partition%-.*%.log$"). NOT a shell glob.
 local function glob(dir, pattern)
     assert(type(dir) == "string", "dir must be a string")
     assert(type(pattern) == "string", "pattern must be a string")
@@ -292,27 +233,19 @@ local function glob(dir, pattern)
     return matches, nil
 end
 
---- True if `path` is rooted at a volume/filesystem root, matching Go's
---- filepath.IsAbs. Note: on Windows "C:foo" (drive-relative) and "\foo"
---- (rooted but no drive) are both NOT absolute, same as Go.
 local function is_abs(path)
     assert(type(path) == "string", "path must be a string")
     if os_utils.IS_WINDOWS then
-        return path:match("^%a:[/\\]") ~= nil    -- C:\ or C:/
-            or path:match("^[/\\][/\\]") ~= nil   -- UNC \\host or //host
+        return path:match("^%a:[/\\]") ~= nil
+            or path:match("^[/\\][/\\]") ~= nil
     end
     return path:sub(1, 1) == "/"
 end
 
---- Pure lexical cleanup, equivalent to Go's filepath.Clean:
---- collapses redundant separators, drops "." elements, resolves inner
---- ".." against the preceding element, and discards leading ".." on a
---- rooted path. It does NOT touch the filesystem (no symlink resolution).
 local function clean(path)
     local is_windows = os_utils.IS_WINDOWS
     local out_sep    = is_windows and "\\" or "/"
 
-    -- Split off a non-collapsible volume prefix so we never mangle it.
     local vol = ""
     local p   = path
     if is_windows then
@@ -321,14 +254,13 @@ local function clean(path)
             vol = drive
             p   = p:sub(3)
         else
-            -- UNC: \\host\share is treated as one indivisible unit.
             local consumed = p:match("^([/\\][/\\][^/\\]+[/\\][^/\\]+)")
             if consumed then
                 vol = consumed:gsub("/", "\\")
                 p   = p:sub(#consumed + 1)
             end
         end
-        p = p:gsub("\\", "/") -- process with a single separator kind
+        p = p:gsub("\\", "/")
     end
 
     local rooted = p:sub(1, 1) == "/"
@@ -336,15 +268,13 @@ local function clean(path)
     local parts = {}
     for comp in p:gmatch("[^/]+") do
         if comp == "." then
-            -- skip
         elseif comp == ".." then
             local n = #parts
             if n > 0 and parts[n] ~= ".." then
-                parts[n] = nil               -- pop the preceding element
+                parts[n] = nil
             elseif not rooted then
-                parts[#parts + 1] = ".."     -- keep, can't resolve yet
+                parts[#parts + 1] = ".."
             end
-            -- a leading ".." on a rooted path is simply discarded
         else
             parts[#parts + 1] = comp
         end
@@ -359,17 +289,11 @@ local function clean(path)
     end
 
     if result == "" then
-        return "." -- Go returns "." for an empty result
+        return "."
     end
     return result
 end
 
---- Go's filepath.Base: the last element of path. Trailing separators are
---- stripped first. Returns "." for an empty path, and a single separator
---- for a path made entirely of separators. On Windows the volume prefix
---- (drive or UNC) is dropped before the last element is taken, and both
---- "/" and "\" count as separators; on Unix only "/" does (a backslash is
---- a legal filename byte there, so it is left untouched).
 local function base(path)
     assert(type(path) == "string", "path must be a string")
     if path == "" then
@@ -388,18 +312,16 @@ local function base(path)
                 p = p:sub(#unc + 1)
             end
         end
-        p = p:gsub("[/\\]+$", "")     -- strip trailing separators
+        p = p:gsub("[/\\]+$", "")
         if p == "" then return "\\" end
         return p:match("[^/\\]+$")
     end
 
-    p = p:gsub("/+$", "")             -- strip trailing separators
+    p = p:gsub("/+$", "")
     if p == "" then return "/" end
     return p:match("[^/]+$")
 end
 
---- Current working directory. FFI on Windows (no shell spawn), shell
---- fallback elsewhere. Returns (path, nil) or (nil, err_string).
 local function getcwd()
     if px_unistd then
         local cwd = px_unistd.getcwd()
@@ -407,8 +329,6 @@ local function getcwd()
         return nil, "getcwd failed"
     end
     if os_utils.IS_WINDOWS and kernel32 then
-        -- First call with a 0 buffer returns the required size including
-        -- the NUL terminator; the second call actually fills it.
         local needed = tonumber(kernel32.GetCurrentDirectoryA(0, nil))
         if not needed or needed == 0 then
             return nil, "GetCurrentDirectoryA: size query failed"
@@ -421,13 +341,12 @@ local function getcwd()
         return ffi.string(buf, len), nil
     end
 
-    -- Unix (and Windows-without-FFI) fallback: shell out.
     local cmd  = os_utils.IS_WINDOWS and "cd" or "pwd"
     local pipe = io.popen(cmd)
     if not pipe then
         return nil, "failed to open pipe for getcwd"
     end
-    local out = pipe:read("*l") -- first line, newline stripped
+    local out = pipe:read("*l")
     pipe:close()
     if not out or out == "" then
         return nil, "failed to read cwd"
@@ -435,9 +354,6 @@ local function getcwd()
     return out, nil
 end
 
---- Go's filepath.Abs: returns an absolute, cleaned path. Absolute inputs
---- are just cleaned; relative inputs are joined against the cwd first.
---- Returns (path, nil) or (nil, err_string) if the cwd can't be read.
 local function abs_path(path)
     assert(type(path) == "string", "path must be a string")
 
@@ -450,15 +366,9 @@ local function abs_path(path)
         return nil, err
     end
 
-    -- Join with "/" unconditionally; clean() normalizes per-OS. We do NOT
-    -- reuse join_path here: it strips trailing slashes, so join_path("/", x)
-    -- collapses the root "/" to "" and drops it (would yield "x" not "/x").
     return clean(cwd .. "/" .. path), nil
 end
 
--- Which backend answered: "posix" (syscalls, no forks), "win32" (FFI), or
--- "shell" (a process per call). Logged at boot by the server so a slow
--- broker on a host without luaposix is diagnosable from the log alone.
 local backend
 if px_stat then
     backend = "posix"
@@ -466,6 +376,17 @@ elseif os_utils.IS_WINDOWS and kernel32 then
     backend = "win32"
 else
     backend = "shell"
+end
+
+local function atomic_write(path, data)
+    assert(type(path) == "string", "path must be a string")
+    local tmp = path .. ".tmp"
+    local f, ferr = io.open(tmp, "wb")
+    if not f then return nil, ferr end
+    f:write(data)
+    f:flush()
+    f:close()
+    return io_sync.atomic_rename(tmp, path)
 end
 
 return {
@@ -482,4 +403,5 @@ return {
     base       = base,
     getcwd     = getcwd,
     abs_path   = abs_path,
+    atomic_write = atomic_write,
 }

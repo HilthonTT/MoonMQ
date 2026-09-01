@@ -1,13 +1,3 @@
--- LIST_GROUPS / DESCRIBE_GROUP / DELETE_GROUP.
---
--- The coordinator has always held members and assignments, and OffsetManager
--- has always held committed offsets; none of it was reachable over the wire,
--- which is why lag had to be reconstructed out-of-band. The case that drives
--- the design here is the group with committed offsets but NO live members --
--- an abandoned or between-deploys consumer -- because it is invisible to the
--- coordinator registry (reap() drops emptied groups) and is exactly the thing
--- an operator goes looking for.
-
 local proto      = require("src.wire.protocol")
 local uuid       = require("src.core.uuid")
 local brk_m      = require("src.broker")
@@ -103,7 +93,6 @@ describe("group admin wire formats", function()
         assert.are.equal("m1", d.members[1].member_id)
         assert.are.same({ 1, 2 }, d.members[1].assignment.orders)
         assert.are.same({ 1 }, d.members[1].assignment.events)
-        -- A member with no assignment round-trips as an empty table, not nil.
         assert.are.same({}, d.members[2].assignment)
 
         assert.are.equal(2, #d.offsets)
@@ -187,9 +176,6 @@ describe("group admin handlers", function()
         end)
 
         it("reports an offsets-only group as empty with no members", function()
-            -- No JOIN_GROUP ever happened: this group exists only because it
-            -- committed an offset. It is invisible to the coordinator registry
-            -- and is precisely what an abandoned consumer looks like.
             assert(broker:create_topic("orders", 1))
             assert(broker:commit_offset("ghost", "orders", 1, 5))
 
@@ -258,8 +244,6 @@ describe("group admin handlers", function()
             local d = described("ghost")
             assert.are.equal("empty", d.state)
             assert.are.same({}, d.members)
-            -- Offsets without members is the single most useful thing this
-            -- call reports, so it must not be an error.
             assert.are.equal(1, #d.offsets)
             assert.are.equal(9, d.offsets[1].offset)
         end)
@@ -287,9 +271,6 @@ describe("group admin handlers", function()
             assert(broker:commit_offset("ghost", "orders", 1, 9))
             only_reply(delete_group("ghost"))
 
-            -- The tombstone is a zero-length-value record in the offsets log
-            -- (what compact_cleaner already recognises), so replay must erase
-            -- the earlier commit rather than resurrect it.
             local reopened = assert(brk_m.Broker.new(BASE_DIR))
             assert.is_nil(reopened:fetch_offset("ghost", "orders", 1))
         end)
@@ -300,7 +281,6 @@ describe("group admin handlers", function()
 
             local e = expect_error(delete_group("billing"))
             assert.are.equal(proto.ERR_GROUP_NOT_EMPTY, e.code)
-            -- And nothing was torn down.
             assert.is_truthy(coordinator:get("billing"))
         end)
 
@@ -351,8 +331,6 @@ describe("OffsetManager tombstones", function()
 
         assert.are.equal(11, broker:fetch_offset("g", "orders", 1))
 
-        -- Records replay in append order, so the trailing commit must win over
-        -- the tombstone that precedes it.
         local reopened = assert(brk_m.Broker.new(BASE_DIR))
         assert.are.equal(11, reopened:fetch_offset("g", "orders", 1))
     end)

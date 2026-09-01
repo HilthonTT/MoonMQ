@@ -1,8 +1,5 @@
 local Future = require("src.core.future")
 
--- Minimal scheduler stub: resume() just dispatches to coroutine.resume.
--- That is enough for the Future contract since :await() returns whatever
--- the scheduler hands the waiter when it resumes it.
 local function make_scheduler()
     return {
         resume = function(co, value)

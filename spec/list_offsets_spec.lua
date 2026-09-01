@@ -1,7 +1,3 @@
--- LIST_OFFSETS / OFFSETS: the readable offset range of every partition of a
--- topic, which is what makes consumer lag computable client-side and what a
--- client needs to seek to either end of a partition.
-
 local proto      = require("src.wire.protocol")
 local uuid       = require("src.core.uuid")
 local brk_m      = require("src.broker")
@@ -51,8 +47,6 @@ local function only_reply(conn)
     return op, payload
 end
 
--- Drive the handler with a payload built by the real encoder, so the test
--- exercises the shipped wire format rather than a hand-rolled one.
 local function list_offsets(server, topic)
     local conn = fake_conn()
     local _, _, payload = unframe(proto.encode_list_offsets(uuid.bytes(), topic))
@@ -110,7 +104,6 @@ describe("LIST_OFFSETS wire format", function()
         assert.is_true(got[1].lso_known)
         assert.is_true(got[1].leader)
 
-        -- An empty partition: earliest == latest, nothing to read.
         assert.are.equal(17, got[2].earliest)
         assert.are.equal(17, got[2].latest)
     end)
@@ -123,8 +116,6 @@ describe("LIST_OFFSETS wire format", function()
         local _, _, payload = unframe(frame)
         local got = assert(proto.decode_offsets(payload))
 
-        -- The stand-in is a real offset, so a client that ignores the flags
-        -- still reads something sane — just conservative.
         assert.are.equal(99, got[1].high_watermark)
         assert.are.equal(99, got[1].lso)
         assert.is_false(got[1].hwm_exact)
@@ -140,7 +131,6 @@ describe("LIST_OFFSETS wire format", function()
     it("rejects a truncated reply and one that overstates its count", function()
         assert.is_nil(proto.decode_offsets("\0\0"))
 
-        -- Claims one entry, supplies no bytes for it.
         local lying = string.pack(">I4", 1)
         local got, err = proto.decode_offsets(lying)
         assert.is_nil(got)
@@ -185,8 +175,6 @@ describe("LIST_OFFSETS handler", function()
 
         local before = offsets_reply(list_offsets(fake_server(broker), "orders"))
 
-        -- One fixed key lands every record in one partition, so exactly one
-        -- entry should move and the rest must stay put.
         local batch = {}
         for i = 1, 5 do batch[i] = message.Message.new("same-key", "v" .. i, 1) end
         local acks = assert(producer:produce_batch("orders", batch))
@@ -196,7 +184,6 @@ describe("LIST_OFFSETS handler", function()
         for i = 1, #after do
             if after[i].partition == written then
                 assert.is_true(after[i].latest > before[i].latest)
-                -- Nothing has been cleaned, so the log still starts at 0.
                 assert.are.equal(0, after[i].earliest)
             else
                 assert.are.equal(before[i].latest, after[i].latest)
@@ -212,8 +199,6 @@ describe("LIST_OFFSETS handler", function()
         local acks = assert(producer:produce_batch("orders",
             { message.Message.new("k", "v", 1) }))
 
-        -- latest is the offset the NEXT append gets, so it must sit strictly
-        -- past the offset the record just written was given.
         local got = offsets_reply(list_offsets(fake_server(broker), "orders"))
         assert.is_true(got[1].latest > acks[1].offset)
     end)
@@ -222,8 +207,6 @@ describe("LIST_OFFSETS handler", function()
         local broker = assert(brk_m.Broker.new(BASE_DIR))
         assert(broker:create_topic("orders", 1))
 
-        -- No followers configured: nothing can be less replicated than the
-        -- log end, so the watermark is exact and equal to it.
         local got = offsets_reply(list_offsets(fake_server(broker), "orders"))
         assert.is_true(got[1].hwm_exact)
         assert.are.equal(got[1].latest, got[1].high_watermark)
@@ -264,10 +247,6 @@ describe("LIST_OFFSETS handler", function()
         assert.is_true(got[1].latest > got[1].high_watermark)
     end)
 
-    -- Regression: the coordinator returns nil for a partition no unresolved
-    -- transaction touches, which means "the stable point is the log end", not
-    -- "unknown". Treating it as unknown made lso_known false on every ordinary
-    -- topic, which is every topic almost all of the time.
     it("reports a known LSO when no transaction is in flight", function()
         local broker = assert(brk_m.Broker.new(BASE_DIR))
         assert(broker:create_topic("orders", 1))
@@ -297,9 +276,6 @@ describe("LIST_OFFSETS handler", function()
         local producer = producer_m.Producer.new(broker, 0)
         assert(producer:produce_batch("orders", { message.Message.new("k", "v", 1) }))
 
-        -- Stand in for an unresolved transaction that enrolled partition 1 at
-        -- offset 0: the stable point is pinned there even though the log has
-        -- moved on, so a read_committed consumer's ceiling is 0, not `latest`.
         local real_lso = broker.transactions.lso
         broker.transactions.lso = function(_, _, id) return id == 1 and 0 or nil end
 
@@ -315,12 +291,9 @@ describe("LIST_OFFSETS handler", function()
         local broker = assert(brk_m.Broker.new(BASE_DIR))
         assert(broker:create_topic("orders", 2))
 
-        -- Unclustered: serves_partition is unconditionally true.
         local got = offsets_reply(list_offsets(fake_server(broker), "orders"))
         for i = 1, #got do assert.is_true(got[i].leader) end
 
-        -- Clustered with partition 2 owned elsewhere: its bounds still come
-        -- back (from the stale local copy) but the flag says not to trust them.
         broker.cluster_assignments = {
             owned_by_self = function(_self, _topic, id) return id == 1 end,
         }

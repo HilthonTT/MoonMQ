@@ -3,27 +3,18 @@ local BrokerUpdater        = require("src.autobalancer.model.broker_updater")
 local ReplicaUpdater       = require("src.autobalancer.model.replica_updater")
 local ClusterModelSnapshot = require("src.autobalancer.model.cluster_snapshot")
 
--- ClusterModel is the long-lived, live picture of the cluster that the metrics
--- pipeline feeds: which brokers exist, which topic-partition replicas each one
--- holds, and a rolling window of load samples per replica. A detection pass
--- calls snapshot() to freeze it into a ClusterModelSnapshot for the goals.
--- Mirrors AutoMQ's RecordClusterModel.
 local ClusterModel = {}
 ClusterModel.__index = ClusterModel
 
 local DEFAULT_PERCENTILE = 0.9
 
--- opts (optional):
---   percentile  smoothing point read from each sample window (default 0.9)
---   window      per-series ring size, forwarded to WindowedSamples
---   min_valid   samples before a series is trusted, forwarded to WindowedSamples
 function ClusterModel.new(opts)
     opts = opts or {}
     return setmetatable({
         percentile   = opts.percentile or DEFAULT_PERCENTILE,
         sample_opts  = { window = opts.window, min_valid = opts.min_valid },
-        brokers      = {},   -- id -> BrokerUpdater
-        replicas     = {},   -- broker_id -> { key -> ReplicaUpdater }
+        brokers      = {},
+        replicas     = {},
     }, ClusterModel)
 end
 
@@ -47,7 +38,6 @@ local function replica_key(topic_name, partition)
     return topic_name .. "-" .. tostring(partition)
 end
 
--- topic must be a real Topic object (Action.new requires it downstream).
 function ClusterModel:register_replica(broker_id, topic, partition)
     assert(self.brokers[broker_id],
         "register broker before its replicas: " .. tostring(broker_id))
@@ -59,9 +49,6 @@ function ClusterModel:register_replica(broker_id, topic, partition)
     return bucket[key]
 end
 
--- Record one measured-resource sample for a replica. Silently ignores samples
--- for an unknown replica so a lagging metrics feed can't crash detection; the
--- replica will start collecting once registered.
 function ClusterModel:update_replica_load(broker_id, topic_name, partition, resource, value)
     local bucket = self.replicas[broker_id]
     if not bucket then return false end
@@ -71,8 +58,6 @@ function ClusterModel:update_replica_load(broker_id, topic_name, partition, reso
     return true
 end
 
--- Freeze the live model into a ClusterModelSnapshot: snapshot every broker and
--- replica, then aggregate broker loads from their replicas.
 function ClusterModel:snapshot()
     local snap = ClusterModelSnapshot.new()
     for id, updater in pairs(self.brokers) do

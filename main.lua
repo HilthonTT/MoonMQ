@@ -43,16 +43,6 @@ local function run_cli_command(argv)
     return false
 end
 
--- Build the user store, the authenticator over it, and the quota manager that
--- reads per-user limits from the same parsed config.
---
--- A configuration problem here is FATAL rather than a warning that degrades to
--- an open broker: an unparseable ACL or a bad credential means the operator's
--- intent is unknown, and guessing at it is how a broker ends up serving
--- everyone. The one exception is "no credentials at all", which stays the
--- documented OPEN mode.
---
--- Returns (authenticator, quotas). Either may be nil.
 local function build_auth(cfg)
     local ac = cfg.Auth or {}
 
@@ -79,9 +69,6 @@ local function build_auth(cfg)
     })
     log:info("auth: %d user(s): %s", store:count(), store:describe())
 
-    -- Quotas: a default applying to every principal, per-user overrides drawn
-    -- from the user entries themselves, and per-topic ceilings that apply to
-    -- whoever touches that topic.
     local qc = ac.Quotas or {}
     local default_spec, derr = quota_m.spec(qc.Default)
     if derr then
@@ -119,17 +106,6 @@ local function build_auth(cfg)
     return authenticator, quotas
 end
 
--- Resolve one TLS block into (server_config, client_config).
---
--- Fatal on error, like the rest of the security config: an unreadable
--- certificate or a Verify with nothing to verify against means the operator
--- asked for encryption and would not be getting it. Falling back to plaintext
--- there is the one outcome nobody wants.
---
--- `mode` selects which halves to build: a listener needs only the server side,
--- an inter-broker link needs both (its own listener and the client that dials
--- its peers), and both are built from ONE config block so a cluster cannot be
--- encrypted in one direction only.
 local function build_tls(block, where, mode)
     local server_cfg, client_cfg
 
@@ -151,9 +127,6 @@ local function build_tls(block, where, mode)
         client_cfg = cfg
     end
 
-    -- The block validated, but a broker built without luasec cannot honour
-    -- it. Same fatal treatment: the alternative is a port the operator
-    -- believes is encrypted and isn't.
     if server_cfg or client_cfg then
         local ok, err = tls_m.require_available(where)
         if not ok then
@@ -165,8 +138,6 @@ local function build_tls(block, where, mode)
     return server_cfg, client_cfg
 end
 
--- Metrics-endpoint credentials. The token may come from the environment so it
--- does not have to live in a file that ships with the repo.
 local function build_metrics_auth(cfg)
     local mc = Config.get(cfg, "Server.MetricsAuth", nil)
     local token = os.getenv("MOONMQ_METRICS_TOKEN")
@@ -191,8 +162,6 @@ if is_main(arg, ...) then
         os.exit(1)
     end
 
-    -- Empty string from JSON means "no file" (cleaner than nil/missing
-    -- key distinction); Logger.configure interprets that as stderr-only.
     local log_file = Config.get(cfg, "Logging.File", "")
     if log_file == "" then log_file = nil end
     Log.configure({
@@ -206,16 +175,11 @@ if is_main(arg, ...) then
 
     local authenticator, quotas = build_auth(cfg)
 
-    -- Replication config (single-leader, static). Peers are the followers a
-    -- leader ships to; map JSON {Id, Address} to the {id, address} the server
-    -- expects. Absent/Enabled=false leaves replication off.
     local rep = s.Replication or {}
     local peers = {}
     for _, p in ipairs(rep.Peers or {}) do
         peers[#peers + 1] = { id = p.Id, address = p.Address }
     end
-    -- One Replication.Tls block yields both halves: the follower's /replicate
-    -- listener and the leader's client to it.
     local rep_server_tls, rep_client_tls = build_tls(rep.Tls, "Replication.Tls")
     local replication = {
         enabled        = rep.Enabled or false,
@@ -230,8 +194,6 @@ if is_main(arg, ...) then
         tls            = rep_client_tls,
     }
 
-    -- Cluster config (static membership + partition ownership; see
-    -- docs/cluster.md). Absent → single-broker, zero overhead.
     local cluster = nil
     local cl = s.Cluster
     if cl and cl.Enabled ~= false and cl.BrokerId then
@@ -254,7 +216,6 @@ if is_main(arg, ...) then
         }
     end
 
-    -- Autobalancer loop (needs Cluster; run on ONE broker per cluster).
     local autobalance = nil
     local ab = s.Autobalance
     if ab and ab.Enabled ~= false and cluster then
@@ -269,26 +230,20 @@ if is_main(arg, ...) then
     end
 
     local srv = assert(Server.new({
-        acks                   = s.Acks,   -- "none" | "leader" | "all" (default leader)
+        acks                   = s.Acks,
         replication            = replication,
         cluster                = cluster,
         autobalance            = autobalance,
-        -- Dead-letter queue tuning (nil = defaults: ".dlq", 3 deliveries).
         dlq                    = s.Dlq and {
             suffix         = s.Dlq.Suffix,
             max_deliveries = s.Dlq.MaxDeliveries,
         } or nil,
         data_dir               = s.DataDir or "./data_server",
-        -- Storage engine for topics that don't pin one themselves: "segmented"
-        -- (default) or "commitlog". Per-topic config sidecars still win.
         default_backend        = s.StorageBackend,
         host                   = s.Host or "0.0.0.0",
         port                   = s.Port or 9092,
         max_connections        = s.MaxConnections,
         max_connections_per_ip = s.MaxConnectionsPerIP,
-        -- Descriptors reserved for non-connection use (listeners, metrics,
-        -- replication, one open log + timeindex per partition). Raise it on a
-        -- broker with many partitions; see Server.new.
         fd_reserve             = s.FdReserve,
         max_frame              = s.MaxFrameSize,
         max_pending_bytes      = s.MaxPendingBytes,
@@ -300,24 +255,15 @@ if is_main(arg, ...) then
         heartbeat_miss_threshold = s.HeartbeatMissThreshold,
         max_topics             = s.MaxTopics,
         max_list_topics        = s.MaxListTopics,
-        -- Idle durable-producer expiry (seconds; 0 disables). Defaults to
-        -- one day, matching Kafka's producer.id.expiration.ms.
         producer_expiry_s              = s.ProducerExpirySeconds,
         producer_expiry_check_interval = s.ProducerExpiryCheckIntervalSeconds,
         metrics_host           = s.MetricsHost or "127.0.0.1",
         metrics_port           = s.MetricsPort or 9090,
         authenticator          = authenticator,
-        -- Per-user / per-topic quotas, and the credential gate on the metrics
-        -- listener. Both nil unless configured; see docs/security.md.
         quotas                 = quotas,
         metrics_auth           = build_metrics_auth(cfg),
-        -- TLS, per listener. Absent blocks leave that port in plaintext, which
-        -- is what every existing deployment gets on upgrade.
         tls                    = (build_tls(s.Tls, "Server.Tls", "server")),
         metrics_tls            = (build_tls(s.MetricsTls, "Server.MetricsTls", "server")),
-        -- LingerMs is the JSON unit (Kafka-conventional); convert to seconds
-        -- at the boundary. Server.new accepts seconds so all internal math
-        -- stays in one unit (socket.gettime() is seconds).
         group_commit_linger_s    = gc.LingerMs and gc.LingerMs / 1000 or nil,
         group_commit_max_waiters = gc.MaxWaiters,
     }))

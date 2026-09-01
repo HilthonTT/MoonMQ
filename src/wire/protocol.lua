@@ -1,18 +1,3 @@
--- Binary wire protocol between MoonMQ clients and the broker daemon.
--- All numbers big-endian. Strings are length-prefixed (u32) UTF-8.
---
--- ┌──────────────┬────────┬────────────────┬──────────────┐
--- │ FrameLen(4B) │ Op(1B) │ CorrelID(16B)  │ Payload(var) │
--- └──────────────┴────────┴────────────────┴──────────────┘
---
--- CorrelID is a 16-byte UUID (see src/core/uuid.lua), matching the
--- connection identifiers used throughout the server.
---
--- FrameLen covers everything after itself (op + correl_id + payload).
--- No application CRC: TCP handles integrity at the transport layer, and
--- adding our own checksum just costs CPU on the hot path. On-disk records
--- still CRC themselves because the disk layer can corrupt independently.
-
 local M = {}
 M.__index = M
 
@@ -20,9 +5,6 @@ M.PROTOCOL_VERSION = 1
 M.SERVER_NAME = "MoonMQ"
 M.SERVER_VERSION = "v0.01"
 
--- Opcodes. Client requests 0x01-0x7F, server replies 0x80-0xFE.
--- 0xFF reserved for future framing extensions.
--- Client to server
 M.OP_HELLO        = 0x01
 M.OP_AUTH         = 0x02
 M.OP_PRODUCE      = 0x03
@@ -31,114 +13,45 @@ M.OP_SUBSCRIBE    = 0x05
 M.OP_COMMIT       = 0x06
 M.OP_CREATE_TOPIC = 0x07
 M.OP_LIST_TOPICS  = 0x08
--- 0x09 is retired (was PING; connection liveness is HEARTBEAT_REQ/RESP below).
--- Do not reuse — old clients may still emit it and must fail as UNKNOWN_OP.
 M.OP_GOODBYE      = 0x0A
 
 M.OP_IDENTIFY_CLIENT  = 0x0D
--- Idempotent producer (Kafka-style). INIT_PRODUCER_ID requests a u64
--- producer ID from the broker; subsequent PRODUCE_IDEMPOTENT frames
--- carry that PID plus a per-(PID, topic, partition) monotonic sequence
--- number, letting the broker dedup retries. PIDs are session-scoped
--- (live in broker memory only, expire when the connection closes).
 M.OP_INIT_PRODUCER_ID = 0x0E
 M.OP_PRODUCE_IDEMPOTENT = 0x0F
 
--- Consumer-group coordination (Kafka-style). JOIN_GROUP registers this
--- connection as a member subscribing to one or more topics and gets back
--- the partition assignment the broker's ConsumerGroup computed for it.
--- GROUP_HEARTBEAT renews the member's lease (distinct from the connection
--- liveness HEARTBEAT_REQ/RESP); LEAVE_GROUP departs voluntarily. A member
--- is also dropped automatically when its connection closes.
 M.OP_JOIN_GROUP       = 0x10
 M.OP_LEAVE_GROUP      = 0x11
 M.OP_GROUP_HEARTBEAT  = 0x12
 
--- Transactions (Kafka-style, atomic multi-partition — see docs/transactions.md).
--- BEGIN_TXN starts a transaction on a connection that opened a durable producer
--- (a producer_name / transactional_id); transactional PRODUCE_IDEMPOTENT frames
--- then implicitly enrol their partitions, TXN_OFFSET_COMMIT buffers offsets into
--- the txn, and END_TXN commits or aborts atomically. All three are acked with
--- OP_OK.
 M.OP_BEGIN_TXN        = 0x13
 M.OP_END_TXN          = 0x14
 M.OP_TXN_OFFSET_COMMIT = 0x15
 
--- Dead-letter queue (see docs/dlq.md). NACK reports that the consumer failed
--- to process a delivered record. The broker counts attempts per
--- (group, topic, partition, offset): below the configured maximum it rewinds
--- the group's committed offset so the record is redelivered; at the maximum
--- it moves the record to the topic's dead-letter topic (<topic>.dlq) and
--- advances the group past it. Acked with NACK_ACK either way.
 M.OP_NACK             = 0x16
 
--- Batching. One PRODUCE_BATCH frame carries N records for a topic and is
--- answered by one PRODUCE_BATCH_ACK carrying N (partition, offset) pairs —
--- amortising framing, dispatch, and (crucially) the acks=1 fsync across the
--- whole batch instead of paying all three per record. FETCH asks for a batched
--- reply via its flags byte and gets one RECORD_BATCH instead of N RECORD
--- frames. See docs/batching.md.
 M.OP_PRODUCE_BATCH    = 0x17
 
--- Offset introspection. LIST_OFFSETS asks for the readable offset range of
--- every partition of one topic and is answered by a single OFFSETS frame.
--- Nothing before it could express "where does this log start and end", which
--- made two ordinary things impossible: seeking to the head or tail of a
--- partition, and computing consumer lag (latest - committed) client-side.
--- Both bounds are already tracked in memory by every storage backend, so the
--- broker answers without touching disk.
 M.OP_LIST_OFFSETS     = 0x18
 
--- Topic administration beyond CREATE/LIST. Until these, a topic's config was
--- write-once at creation: topic_config.lua persisted retention, cleanup policy
--- and segment sizing to a sidecar, and the cleaners acted on it, but no client
--- could read it back, change it, or remove a topic at all — you edited the
--- sidecar by hand and restarted the broker.
---
--- DELETE_TOPIC is refused for internal topics (the `__` prefix) because
--- __consumer_offsets and __producer_state are broker state, not user data.
 M.OP_DELETE_TOPIC       = 0x19
 M.OP_DESCRIBE_TOPIC     = 0x1A
 M.OP_ALTER_TOPIC_CONFIG = 0x1B
 
--- Consumer-group introspection. The coordinator already holds members,
--- assignments and (via OffsetManager) committed offsets; none of it was
--- reachable, which is why lag had to be reconstructed out-of-band by
--- scripts/lag_monitor.py. DESCRIBE_GROUP answers all three from the
--- coordinator's own state, so lag becomes a broker-side fact.
---
--- DELETE_GROUP only succeeds on a group with no live members — the same rule
--- Kafka applies, and for the same reason: deleting under an active member
--- leaves it holding an assignment nothing will ever rebalance.
 M.OP_LIST_GROUPS      = 0x1C
 M.OP_DESCRIBE_GROUP   = 0x1D
 M.OP_DELETE_GROUP     = 0x1E
 
--- SCRAM-SHA-256 authentication (RFC 5802/7677; see src/server/scram.lua).
--- A three-frame alternative to OP_AUTH that never puts the password on the
--- wire and costs the broker no PBKDF2:
---
---   AUTH_SCRAM       -> str mechanism | str client-first-message
---   AUTH_CHALLENGE   <- str server-first-message           (0x91)
---   AUTH_SCRAM_FINAL -> str client-final-message
---   AUTH_OK          <- str server-final-message           (0x81, payload)
---
--- Either mechanism may be used on a connection; both end in AUTH_OK and
--- both are one-shot. Old clients that only speak OP_AUTH are unaffected.
 M.OP_AUTH_SCRAM       = 0x1F
 M.OP_AUTH_SCRAM_FINAL = 0x20
 
--- Bidirectional
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
 
--- Server to clients
 M.OP_WELCOME       = 0x80
 M.OP_AUTH_OK       = 0x81
 M.OP_PRODUCE_ACK   = 0x82
 M.OP_RECORD        = 0x83
 M.OP_TOPIC_LIST    = 0x84
--- 0x85 is retired (was PONG). See the note on 0x09.
 M.OP_OK            = 0x86
 M.OP_IDENTIFY_ACK  = 0x87
 M.OP_PRODUCER_ID   = 0x88
@@ -153,70 +66,25 @@ M.OP_GROUP_DESCRIPTION = 0x90
 M.OP_AUTH_CHALLENGE    = 0x91
 M.OP_ERROR         = 0xFE
 
--- Correlation IDs are 16-byte UUIDs.
 local CORREL_ID_LEN = 16
 M.CORREL_ID_LEN = CORREL_ID_LEN
 
--- Consumer isolation levels, carried as an optional trailing byte on
--- FETCH/SUBSCRIBE (absent = READ_UNCOMMITTED, so old clients are unaffected).
--- READ_COMMITTED consumers stop at the Last Stable Offset and never see
--- records of aborted transactions — see docs/transactions.md.
 M.ISOLATION_READ_UNCOMMITTED = 0
 M.ISOLATION_READ_COMMITTED   = 1
 
--- Optional trailing flags byte on FETCH, after the isolation byte. A broker
--- that predates batching stops decoding at isolation and answers with the
--- legacy one-RECORD-frame-per-record stream, so setting the bit is safe
--- against any broker version.
 M.FETCH_FLAG_BATCHED = 0x01
 
--- PRODUCE_BATCH flags byte. IDEMPOTENT means the frame carries the
--- (pid, base_seq, epoch) triple and the batch participates in producer-state
--- dedup; without it the batch is a plain multi-record append.
 M.BATCH_FLAG_IDEMPOTENT = 0x01
 
--- Per-partition flags on an OFFSETS entry. `earliest` and `latest` are always
--- exact; the other two bounds are not always knowable, so each carries a bit
--- saying whether the number next to it means anything. When a bit is clear the
--- encoder has substituted `latest`, which keeps a flags-ignoring client honest
--- (it reads a real offset, just a conservative one) without a sentinel value.
---
---   HWM_EXACT — the high watermark is a real min-LEO-across-in-sync-followers
---               reading. Clear when replication is configured but no follower
---               is currently in sync, so there is no meaningful minimum.
---   LSO_KNOWN — the Last Stable Offset is a real read ceiling. Set whenever a
---               transaction coordinator answered, INCLUDING the ordinary case
---               of no transaction in flight, where the stable point simply is
---               the log end. Clear only on a broker built without one.
---   LOCAL     — this broker serves the partition. Clear means the cluster has
---               moved it elsewhere and the bounds are from a stale local copy;
---               ask the owning broker for authoritative numbers.
 M.OFFSETS_FLAG_HWM_EXACT = 0x01
 M.OFFSETS_FLAG_LSO_KNOWN = 0x02
 M.OFFSETS_FLAG_LOCAL     = 0x04
 
--- LIST_OFFSETS query modes, carried as an optional trailing byte exactly the
--- way FETCH grew isolation and flags. Absent = BOUNDS, so a client that
--- predates this sends the old one-string body and a broker that predates it
--- stops decoding after the topic and answers with bounds only.
---
---   BOUNDS    — the earliest/latest/hwm/lso reply that LIST_OFFSETS has always
---               given. No extra fields follow the mode byte.
---   TIMESTAMP — a u64 millisecond timestamp follows. The reply carries the
---               ordinary bounds AND a trailing per-partition section giving
---               the earliest offset whose record timestamp is >= the query,
---               which is Kafka's offsetForTimes semantics.
 M.LIST_OFFSETS_MODE_BOUNDS    = 0
 M.LIST_OFFSETS_MODE_TIMESTAMP = 1
 
--- Set on a FOR_TIMES entry when the partition actually had a record at or
--- after the requested timestamp. Clear means "no such record" — the partition
--- is empty, or every record predates the query — and the offset field is then
--- the partition's `latest`, i.e. where such a record would eventually land.
--- Same substitute-don't-sentinel rule as the OFFSETS_FLAG_* fields above.
 M.FOR_TIMES_FLAG_FOUND = 0x01
 
--- Error codes. Keep numeric so non-Lua clients can switch on them.
 M.ERR_BAD_FRAME            = 1
 M.ERR_UNKNOWN_OP           = 2
 M.ERR_NOT_AUTHED           = 3
@@ -226,46 +94,16 @@ M.ERR_RATE_LIMITED         = 6
 M.ERR_INTERNAL             = 7
 M.ERR_BAD_PROTOCOL         = 8
 M.ERR_FRAME_TOO_LARGE      = 9
--- Idempotent producer error codes.
--- DUPLICATE_SEQUENCE: seq <= last_seq seen for (PID, topic, partition).
---   This is the normal retry-after-success case; the broker returns the
---   *original* offset alongside a successful ack (not this error). The
---   error fires only when sequences appear truly out of order (gap).
 M.ERR_NO_PRODUCER_ID       = 10
 M.ERR_OUT_OF_ORDER_SEQUENCE = 11
--- Consumer-group error codes.
--- GROUP_MEMBER_UNKNOWN: heartbeat/leave naming a member the coordinator
---   has no record of — either it was reaped for inactivity (client should
---   re-JOIN_GROUP) or it never joined on this connection.
--- GROUP_CONFLICT: a connection tried to join a second, different group;
---   one connection maps to at most one group membership.
 M.ERR_GROUP_MEMBER_UNKNOWN = 12
 M.ERR_GROUP_CONFLICT       = 13
--- BATCH_TOO_LARGE: more records in one PRODUCE_BATCH than the broker will
--- accept. Split and resend — the batch was NOT partially applied.
 M.ERR_BATCH_TOO_LARGE      = 14
--- Topic/group administration error codes.
--- GROUP_MISSING: DESCRIBE_GROUP / DELETE_GROUP naming a group this
---   coordinator has no record of.
--- GROUP_NOT_EMPTY: DELETE_GROUP on a group that still has live members.
--- INVALID_CONFIG: ALTER_TOPIC_CONFIG with an unknown key, an unparseable
---   value, or a key that cannot be changed after creation (`backend`).
--- TOPIC_FORBIDDEN: an admin op aimed at an internal topic (`__` prefix).
 M.ERR_GROUP_MISSING        = 15
 M.ERR_GROUP_NOT_EMPTY      = 16
 M.ERR_INVALID_CONFIG       = 17
 M.ERR_TOPIC_FORBIDDEN      = 18
--- NOT_AUTHORIZED: the connection is authenticated, but the principal's ACL
--- (src/server/acl.lua) does not grant this operation on this resource.
--- Distinct from NOT_AUTHED (no valid session at all) and AUTH_FAILED (bad
--- credential): retrying with the same credential will never help, and the
--- message names the resource and operation so the operator knows which ACL
--- rule is missing.
 M.ERR_NOT_AUTHORIZED       = 19
--- Transactional / durable-producer error codes (see docs/transactions.md).
--- PRODUCER_FENCED: a produce/transaction op arrived with an epoch older than
---   the current one for this producer id — a newer session (same
---   transactional_id / producer_name) has taken over and fenced this one.
 M.ERR_PRODUCER_FENCED      = 50
 M.ERR_INVALID_TXN_STATE    = 51
 M.ERR_TRANSACTION_TIMED_OUT = 52
@@ -285,9 +123,6 @@ local function encode_frame(op, correl_id, payload)
 end
 M.encode_frame = encode_frame
 
--- Splits a frame body (everything after the u32 length prefix) into its
--- opcode, correlation ID, and payload. Returns (op, correl, payload, nil)
--- or (nil, nil, nil, err).
 local function parse_frame(body)
     if type(body) ~= "string" or #body < 1 + CORREL_ID_LEN then
         return nil, nil, nil, "frame shorter than header"
@@ -332,11 +167,6 @@ function M.encode_auth(correl_id, username, password)
     return encode_frame(M.OP_AUTH, correl_id, payload)
 end
 
--- `extra` carries the SCRAM server-final message ("v=<signature>") when the
--- session authenticated over SCRAM. It is a plain trailing string, so a client
--- that only knows the old empty-payload AUTH_OK reads the frame unchanged —
--- but a SCRAM client MUST verify it, or it has authenticated itself to a
--- server it never authenticated in return.
 function M.encode_auth_ok(correl_id, extra)
     return encode_frame(M.OP_AUTH_OK, correl_id,
         extra and extra ~= "" and encode_string(extra) or "")
@@ -355,10 +185,6 @@ function M.encode_auth_scram_final(correl_id, client_final)
     return encode_frame(M.OP_AUTH_SCRAM_FINAL, correl_id, encode_string(client_final))
 end
 
--- PRODUCE payload: u8 codec | str topic | str key | str value.
--- `codec` is the compression codec the broker should store the value under
--- (0 none, 1 gzip, 2 snappy — see src/record/message.lua). Defaults to 0 so
--- callers that don't compress are unaffected.
 function M.encode_produce(correl_id, topic, key, value, codec)
     local payload = string.pack(">B", codec or 0)
         .. encode_string(topic) .. encode_string(key) .. encode_string(value)
@@ -370,17 +196,6 @@ function M.encode_produce_ack(correl_id, partition, offset)
     return encode_frame(M.OP_PRODUCE_ACK, correl_id, payload)
 end
 
--- PRODUCE_BATCH payload:
---   u8 flags | u8 codec | str topic
---     | [u64 pid | u32 base_seq | u16 epoch]   (only when flags has IDEMPOTENT)
---     | u32 count | (str key | str value)*
---
--- All records go to one topic; the broker still partitions each record
--- individually (same key-hash / sticky partitioner as PRODUCE), so a batch may
--- span partitions. Under IDEMPOTENT the i-th record carries sequence
--- base_seq + i, which keeps the existing per-(pid, topic) monotonic contract.
---
--- `records` is a list of { key = , value = } (key defaults to "").
 function M.encode_produce_batch(correl_id, topic, records, opts)
     assert(type(records) == "table", "records must be a list")
     opts = opts or {}
@@ -405,14 +220,6 @@ function M.encode_produce_batch(correl_id, topic, records, opts)
     return encode_frame(M.OP_PRODUCE_BATCH, correl_id, table.concat(parts))
 end
 
--- PRODUCE_BATCH_ACK payload:
---   u32 count | (u32 partition | u64 offset)* | u16 err_code | str err_message
---
--- `count` is how many records were actually appended, always a PREFIX of the
--- request: records past it were not written. err_code 0 means the whole batch
--- landed. A non-zero code with count > 0 is a partial append — the client may
--- resend the tail (under IDEMPOTENT the sequence space lines up so the resend
--- is treated as fresh, not as a duplicate).
 function M.encode_produce_batch_ack(correl_id, acks, err_code, err_message)
     local parts = { string.pack(">I4", #acks) }
     for i = 1, #acks do
@@ -423,10 +230,6 @@ function M.encode_produce_batch_ack(correl_id, acks, err_code, err_message)
     return encode_frame(M.OP_PRODUCE_BATCH_ACK, correl_id, table.concat(parts))
 end
 
--- RECORD_BATCH payload:
---   u32 count | (str topic | u32 partition | u64 offset | u64 timestamp
---                | str key | str value)*
--- Same per-record fields as OP_RECORD, minus the per-record frame header.
 function M.encode_record_batch(correl_id, records)
     local parts = { string.pack(">I4", #records) }
     for i = 1, #records do
@@ -440,34 +243,18 @@ function M.encode_record_batch(correl_id, records)
     return encode_frame(M.OP_RECORD_BATCH, correl_id, table.concat(parts))
 end
 
--- Idempotent producer wire format.
--- INIT_PRODUCER_ID request: empty payload (reserved for future
--- transaction timeout / transactional_id fields).
--- Response (OP_PRODUCER_ID): u64 PID.
--- PRODUCE_IDEMPOTENT request: u64 pid | u32 seq | string topic | string key | string value
--- Response: identical to OP_PRODUCE_ACK (partition + offset). Duplicate
--- retries return the ORIGINAL ack — see _handle_produce_idempotent.
--- INIT_PRODUCER_ID request now carries an optional producer_name (a stable
--- identity — Kafka's transactional_id). Empty name = today's ephemeral
--- session-scoped PID; a non-empty name gets a durable PID + monotonic epoch
--- back so idempotence survives reconnects/restarts and old sessions are fenced.
 function M.encode_init_producer_id(correl_id, producer_name)
     return encode_frame(M.OP_INIT_PRODUCER_ID, correl_id,
         encode_string(producer_name or ""))
 end
 
 function M.decode_init_producer_id(payload)
-    -- Back-compat: an empty payload (old clients) means no producer name.
-    -- Uses M.decode_string (exported) because the local `decode_string` isn't in
-    -- scope this high in the file — same forward-reference reason
-    -- decode_produce_idempotent is defined near the bottom.
     if #payload == 0 then return { producer_name = "" }, nil end
     local name, _, err = M.decode_string(payload, 1, M.MAX_PRODUCER_NAME)
     if not name then return nil, err end
     return { producer_name = name }, nil
 end
 
--- PRODUCER_ID reply: u64 pid | u16 epoch.
 function M.encode_producer_id(correl_id, pid, epoch)
     local payload = string.pack(">I8I2", pid, epoch or 0)
     return encode_frame(M.OP_PRODUCER_ID, correl_id, payload)
@@ -479,11 +266,6 @@ function M.decode_producer_id(payload)
     return { pid = pid, epoch = epoch }, nil
 end
 
--- PRODUCE_IDEMPOTENT payload:
---   u64 pid | u32 seq | u16 epoch | u8 codec | str topic | str key | str value
--- epoch fences zombie producers (durable/transactional producers, see
--- src/storage/producer_state.lua); 0 for a plain session-scoped idempotent
--- producer. codec is the compression codec (as in PRODUCE).
 function M.encode_produce_idempotent(correl_id, pid, seq, topic, key, value, epoch, codec)
     local payload = string.pack(">I8I4I2B", pid, seq, epoch or 0, codec or 0)
         .. encode_string(topic)
@@ -492,13 +274,7 @@ function M.encode_produce_idempotent(correl_id, pid, seq, topic, key, value, epo
     return encode_frame(M.OP_PRODUCE_IDEMPOTENT, correl_id, payload)
 end
 
--- decode_produce_idempotent lives lower in the file, after decode_string
--- and the per-field max-length constants are declared. Lua forward
--- references to `local` bindings don't work, hence the placement.
 
--- isolation (optional) is an ISOLATION_* byte; omitted/0 = read_uncommitted.
--- flags (optional) trails isolation; set FETCH_FLAG_BATCHED to ask for one
--- RECORD_BATCH reply instead of a RECORD frame per record.
 function M.encode_fetch(correl_id, topic, group_id, max_records, isolation, flags)
     local payload = encode_string(topic) .. encode_string(group_id)
         .. string.pack(">I4", max_records)
@@ -516,7 +292,6 @@ function M.encode_record(correl_id, topic, partition, offset, timestamp, key, va
     return encode_frame(M.OP_RECORD, correl_id, payload)
 end
 
--- isolation (optional) is an ISOLATION_* byte; omitted/0 = read_uncommitted.
 function M.encode_subscribe(correl_id, topic, group_id, isolation)
     local payload = encode_string(topic) .. encode_string(group_id)
         .. string.pack(">B", isolation or M.ISOLATION_READ_UNCOMMITTED)
@@ -541,8 +316,6 @@ function M.encode_commit(correl_id, topic, partition, offset)
     return encode_frame(M.OP_COMMIT, correl_id, payload)
 end
 
--- NACK: str topic | u32 partition | u64 offset | str reason. `offset` is the
--- record's own offset as delivered in OP_RECORD (not the post-read cursor).
 function M.encode_nack(correl_id, topic, partition, offset, reason)
     local payload = encode_string(topic)
         .. string.pack(">I4I8", partition, offset)
@@ -550,21 +323,16 @@ function M.encode_nack(correl_id, topic, partition, offset, reason)
     return encode_frame(M.OP_NACK, correl_id, payload)
 end
 
--- NACK_ACK reply: u8 dead_lettered | u16 attempts | str dlq_topic (empty
--- unless dead_lettered).
 function M.encode_nack_ack(correl_id, dead_lettered, attempts, dlq_topic)
     local payload = string.pack(">BI2", dead_lettered and 1 or 0, attempts)
         .. encode_string(dlq_topic or "")
     return encode_frame(M.OP_NACK_ACK, correl_id, payload)
 end
 
--- BEGIN_TXN carries no payload: the connection already holds the durable
--- producer identity (pid/epoch/name) it transacts under.
 function M.encode_begin_txn(correl_id)
     return encode_frame(M.OP_BEGIN_TXN, correl_id, "")
 end
 
--- END_TXN: u8 commit (1 = commit, 0 = abort).
 function M.encode_end_txn(correl_id, commit)
     return encode_frame(M.OP_END_TXN, correl_id,
         string.pack(">B", commit and 1 or 0))
@@ -575,7 +343,6 @@ function M.decode_end_txn(payload)
     return { commit = string.unpack(">B", payload, 1) ~= 0 }, nil
 end
 
--- TXN_OFFSET_COMMIT: str group | u32 count | (str topic | u32 partition | u64 offset)*
 function M.encode_txn_offset_commit(correl_id, group, offsets)
     local parts = { encode_string(group), string.pack(">I4", #offsets) }
     for i = 1, #offsets do
@@ -595,19 +362,6 @@ function M.encode_list_topics(correl_id)
     return encode_frame(M.OP_LIST_TOPICS, correl_id, "")
 end
 
--- LIST_OFFSETS request:
---   str topic [| u8 mode | u64 timestamp_ms]
---
--- `timestamp_ms` nil asks for bounds only and emits the bare one-string body
--- older brokers expect. Passing one appends the TIMESTAMP mode byte and the
--- query, and the reply gains its FOR_TIMES section — the extension shape this
--- function's comment reserved when LIST_OFFSETS first shipped.
---
--- Unlike the bounds (in-memory counters), a timestamp query walks the log: the
--- segmented backend binary-searches the sparse .timeindex to a nearby file
--- position and linear-scans one index interval from there, and the commitlog
--- backend, which keeps no time index, scans from its oldest retained offset.
--- Cheap enough for a seek, not something to put in a poll loop.
 function M.encode_list_offsets(correl_id, topic, timestamp_ms)
     local payload = encode_string(topic)
     if timestamp_ms ~= nil then
@@ -619,27 +373,6 @@ function M.encode_list_offsets(correl_id, topic, timestamp_ms)
     return encode_frame(M.OP_LIST_OFFSETS, correl_id, payload)
 end
 
--- OFFSETS reply:
---   u32 count
---     | (u32 partition | u64 earliest | u64 latest
---        | u64 high_watermark | u64 lso | u8 flags)*
---
--- Entries are emitted in partition order. `earliest` is the oldest offset
--- still readable after retention, `latest` the offset the next append will
--- get, so an empty partition reports earliest == latest.
---
--- Callers pass nil for high_watermark / lso when the value isn't available and
--- this substitutes `latest` with the corresponding flag cleared — see the
--- OFFSETS_FLAG_* comments for why a substituted value beats a sentinel.
--- `for_times` (optional) appends a trailing section answering a TIMESTAMP
--- query:
---
---   u32 count | (u32 partition | u64 offset | u8 flags)*
---
--- It is appended only when the request asked for it. That placement is what
--- makes the extension safe: decode_offsets reads exactly `count` fixed-width
--- entries and returns, so a client built before this existed stops at the end
--- of the bounds section and never sees the extra bytes.
 function M.encode_offsets(correl_id, entries, for_times)
     assert(type(entries) == "table", "entries must be a list")
 
@@ -667,9 +400,6 @@ function M.encode_offsets(correl_id, entries, for_times)
     return encode_frame(M.OP_OFFSETS, correl_id, table.concat(parts))
 end
 
--- Topic administration.
---
--- DELETE_TOPIC / DESCRIBE_TOPIC request: str name. DELETE is acked with OP_OK.
 function M.encode_delete_topic(correl_id, name)
     return encode_frame(M.OP_DELETE_TOPIC, correl_id, encode_string(name))
 end
@@ -678,16 +408,6 @@ function M.encode_describe_topic(correl_id, name)
     return encode_frame(M.OP_DESCRIBE_TOPIC, correl_id, encode_string(name))
 end
 
--- TOPIC_DESCRIPTION reply:
---   str name | u32 partition_count | u32 config_count | (str key | str value)*
---
--- Config values are strings even for the numeric keys. The sidecar mixes
--- numbers (retention, max_segment_size) with strings (backend,
--- cleanup_policy), and a client that just prints them or round-trips them into
--- ALTER_TOPIC_CONFIG should not have to carry a per-key type table to do it.
--- Only keys actually set on the topic are emitted — an absent key means the
--- partition default is in force, which is not the same as a set value that
--- happens to equal the default.
 function M.encode_topic_description(correl_id, name, num_partitions, config)
     local keys = {}
     for k in pairs(config) do keys[#keys + 1] = k end
@@ -705,11 +425,6 @@ function M.encode_topic_description(correl_id, name, num_partitions, config)
     return encode_frame(M.OP_TOPIC_DESCRIPTION, correl_id, table.concat(parts))
 end
 
--- ALTER_TOPIC_CONFIG request:
---   str name | u32 count | (str key | str value)*
--- Acked with OP_OK. Values travel as strings and the broker parses them
--- against the key's declared type, so the wire format does not need to change
--- when a new config key is added.
 function M.encode_alter_topic_config(correl_id, name, config)
     local keys = {}
     for k in pairs(config) do keys[#keys + 1] = k end
@@ -723,16 +438,10 @@ function M.encode_alter_topic_config(correl_id, name, config)
     return encode_frame(M.OP_ALTER_TOPIC_CONFIG, correl_id, table.concat(parts))
 end
 
--- Consumer-group administration.
---
--- LIST_GROUPS request: empty body.
 function M.encode_list_groups(correl_id)
     return encode_frame(M.OP_LIST_GROUPS, correl_id, "")
 end
 
--- GROUP_LIST reply:
---   u32 count | (str group_id | str state | u32 member_count)*
--- Groups are emitted in sorted id order so the bytes are deterministic.
 function M.encode_group_list(correl_id, groups)
     local parts = { string.pack(">I4", #groups) }
     for i = 1, #groups do
@@ -748,19 +457,6 @@ function M.encode_describe_group(correl_id, group_id)
     return encode_frame(M.OP_DESCRIBE_GROUP, correl_id, encode_string(group_id))
 end
 
--- GROUP_DESCRIPTION reply:
---   str group_id | str state
---   | u32 member_count
---       | (str member_id | u32 topic_count
---            | (str topic | u32 part_count | (u32 partition_id)*)*)*
---   | u32 offset_count | (str topic | u32 partition | u64 committed)*
---
--- The offsets section is the group's DURABLE committed positions from
--- __consumer_offsets, not the members' in-flight cursors, and it is
--- independent of membership: a group with no live members still has offsets,
--- which is exactly the state you want to inspect before deleting it. Pairing
--- these with LIST_OFFSETS `latest` (or `lso` under read_committed) is what
--- makes lag computable without the broker having to define it.
 function M.encode_group_description(correl_id, desc)
     local parts = { encode_string(desc.group_id), encode_string(desc.state) }
 
@@ -800,12 +496,6 @@ function M.encode_delete_group(correl_id, group_id)
     return encode_frame(M.OP_DELETE_GROUP, correl_id, encode_string(group_id))
 end
 
--- Consumer-group wire formats.
---
--- JOIN_GROUP request:
---   string group_id | string member_id | u32 topic_count | (string topic)*
--- An empty member_id asks the broker to assign one (first join); the
--- assigned id comes back in the GROUP_ASSIGNMENT reply.
 function M.encode_join_group(correl_id, group_id, member_id, topics)
     local parts = {
         encode_string(group_id),
@@ -818,11 +508,6 @@ function M.encode_join_group(correl_id, group_id, member_id, topics)
     return encode_frame(M.OP_JOIN_GROUP, correl_id, table.concat(parts))
 end
 
--- GROUP_ASSIGNMENT reply:
---   string member_id | u32 topic_count
---     | (string topic | u32 part_count | (u32 partition_id)*)*
--- `assignment` is { [topic] = { partition_id, ... }, ... }. Topics are
--- emitted in sorted order so the wire bytes are deterministic.
 function M.encode_group_assignment(correl_id, member_id, assignment)
     local topics = {}
     for topic in pairs(assignment) do topics[#topics + 1] = topic end
@@ -840,7 +525,6 @@ function M.encode_group_assignment(correl_id, member_id, assignment)
     return encode_frame(M.OP_GROUP_ASSIGNMENT, correl_id, table.concat(parts))
 end
 
--- LEAVE_GROUP / GROUP_HEARTBEAT share a body: string group_id | string member_id.
 function M.encode_leave_group(correl_id, group_id, member_id)
     return encode_frame(M.OP_LEAVE_GROUP, correl_id,
         encode_string(group_id) .. encode_string(member_id))
@@ -857,20 +541,12 @@ end
 
 function M.encode_ok(correl_id) return encode_frame(M.OP_OK, correl_id, "") end
 
--- Default cap on any single length-prefixed string. Individual decoders
--- can pass a tighter `max_len` when they know the field's domain (e.g.
--- topic names cap at 249 from util.validate_topic_name). The default is
--- still applied at the boundary so a malformed wire frame can't
--- allocate an attacker-chosen number of bytes per field.
 local MAX_STRING_LEN = 64 * 1024
 
 local function decode_string(buf, pos, max_len)
     if #buf - pos + 1 < 4 then
         return nil, nil, "truncated string length"
     end
-    -- string.unpack returns the next position; use it directly rather
-    -- than adding sizeof by hand. Keeps this in sync if the prefix
-    -- format ever changes.
     local len, next_pos = string.unpack(">I4", buf, pos)
 
     local cap = max_len or MAX_STRING_LEN
@@ -886,41 +562,17 @@ end
 M.decode_string = decode_string
 M.MAX_STRING_LEN = MAX_STRING_LEN
 
--- Per-field caps. Topic name (249) matches util.validate_topic_name.
--- Group id (256) is generous for human-readable group names. Identify
--- name/version are already capped at the dispatch layer; we add caps
--- here too so any future caller gets the same defense without having
--- to remember to add a second check.
 local MAX_TOPIC_NAME    = 249
 local MAX_GROUP_ID      = 256
 local MAX_MEMBER_ID     = 256
 local MAX_CLIENT_NAME   = 128
 local MAX_CLIENT_VERSION = 64
--- Credential caps. The password is the PBKDF2/HMAC *key*, and HMAC re-derives
--- its block key from the full key on every one of the (600k) iterations, so
--- verify cost is O(iterations * password_length). Left at the 64 KiB default
--- string cap, a single AUTH frame with a 64 KiB password stalls the entire
--- single-threaded reactor for seconds. Cap both fields tightly — no legitimate
--- username/password approaches 1 KiB.
 local MAX_USERNAME      = 256
 local MAX_PASSWORD      = 1024
--- Upper bound on partitions in one OFFSETS reply, mirroring the num_partitions
--- ceiling CREATE_TOPIC enforces. Caps how much a single count field can make a
--- client allocate. Declared up here with the other field caps because the
--- group-description decoder needs it too, and that one sits above the OFFSETS
--- decoders -- a `local` referenced before its declaration would silently read
--- a nil global instead.
 local MAX_PARTITIONS = 1024
 M.MAX_PARTITIONS = MAX_PARTITIONS
--- Cap topics-per-join so a single JOIN_GROUP frame can't ask us to
--- decode an attacker-chosen number of length-prefixed strings. 256 is
--- far above any realistic subscription set.
 local MAX_GROUP_TOPICS  = 256
--- Producer name (a.k.a. transactional_id): a stable, human-assigned identity.
--- 256 is generous; it's the key into __producer_state.
 local MAX_PRODUCER_NAME = 256
--- NACK failure reason: free-form client text that ends up stored inside the
--- dead-letter envelope, so cap it well below the generic string bound.
 local MAX_NACK_REASON   = 1024
 M.MAX_TOPIC_NAME = MAX_TOPIC_NAME
 M.MAX_GROUP_ID   = MAX_GROUP_ID
@@ -942,9 +594,6 @@ function M.decode_auth(payload)
     return { username = user, password = pass }, nil
 end
 
--- SCRAM messages are short printable ASCII (the longest field is a base64
--- 32-byte proof). 4 KiB is far above any legal message and keeps a
--- pre-authentication frame from being an allocation lever.
 local MAX_SASL_MESSAGE = 4096
 local MAX_MECHANISM    = 64
 M.MAX_SASL_MESSAGE = MAX_SASL_MESSAGE
@@ -969,7 +618,6 @@ function M.decode_auth_scram_final(payload)
     return { message = message }, nil
 end
 
--- An empty payload is the pre-SCRAM shape and stays valid: message = "".
 function M.decode_auth_ok(payload)
     if not payload or #payload == 0 then return { message = "" }, nil end
     local message, _, err = decode_string(payload, 1, MAX_SASL_MESSAGE)
@@ -994,7 +642,6 @@ function M.decode_subscribe(payload)
     if not topic then return nil, err end
     local group, p2, gerr = decode_string(payload, p, MAX_GROUP_ID)
     if not group then return nil, gerr end
-    -- Optional trailing isolation byte (older clients don't send it).
     local isolation = M.ISOLATION_READ_UNCOMMITTED
     if p2 and #payload - p2 + 1 >= 1 then
         isolation = string.unpack(">B", payload, p2)
@@ -1009,8 +656,6 @@ function M.decode_fetch(payload)
     if not group then return nil, gerr end
     if #payload - p2 + 1 < 4 then return nil, "short fetch" end
     local max_records, p3 = string.unpack(">I4", payload, p2)
-    -- Optional trailing isolation byte (older clients don't send it), then an
-    -- optional flags byte after it (clients older than batching send neither).
     local isolation = M.ISOLATION_READ_UNCOMMITTED
     local flags     = 0
     if #payload - p3 + 1 >= 1 then
@@ -1052,8 +697,6 @@ function M.decode_join_group(payload)
     return { group_id = group, member_id = member, topics = topics }, nil
 end
 
--- Inverse of encode_group_assignment. Returns
--- { member_id, assignment = { [topic] = { partition_id, ... } } }.
 function M.decode_group_assignment(payload)
     local member, p, merr = decode_string(payload, 1, MAX_MEMBER_ID)
     if not member then return nil, merr end
@@ -1082,7 +725,6 @@ function M.decode_group_assignment(payload)
     return { member_id = member, assignment = assignment }, nil
 end
 
--- LEAVE_GROUP and GROUP_HEARTBEAT carry the same body.
 local function decode_group_member_ref(payload)
     local group, p, gerr = decode_string(payload, 1, MAX_GROUP_ID)
     if not group then return nil, gerr end
@@ -1108,9 +750,6 @@ function M.decode_create_topic(payload)
     return { name = name, num_partitions = string.unpack(">I4", payload, p) }, nil
 end
 
--- DELETE_TOPIC / DESCRIBE_TOPIC / DELETE_GROUP / DESCRIBE_GROUP all carry a
--- single length-prefixed name, so they share a decoder factory rather than
--- four near-identical functions.
 local function single_name_decoder(field, max_len)
     return function(payload)
         local name, _, err = decode_string(payload, 1, max_len)
@@ -1124,15 +763,8 @@ M.decode_describe_topic = single_name_decoder("name", MAX_TOPIC_NAME)
 M.decode_describe_group = single_name_decoder("group_id", MAX_GROUP_ID)
 M.decode_delete_group   = single_name_decoder("group_id", MAX_GROUP_ID)
 
--- Cap on config entries in one ALTER_TOPIC_CONFIG frame. The recognised key
--- set is six entries (topic_config.lua NUMBER_KEYS + STRING_KEYS); 64 leaves
--- room to grow while still bounding how many length-prefixed pairs a single
--- frame can make us decode.
 local MAX_CONFIG_ENTRIES = 64
 M.MAX_CONFIG_ENTRIES = MAX_CONFIG_ENTRIES
--- Config keys and values are short identifiers and numbers. Capping them well
--- under the 64 KiB default keeps a malformed frame from allocating on our
--- behalf, the same reason the credential fields are capped.
 local MAX_CONFIG_KEY   = 64
 local MAX_CONFIG_VALUE = 256
 
@@ -1160,7 +792,6 @@ function M.decode_alter_topic_config(payload)
     return { name = name, config = config }, nil
 end
 
--- Inverse of encode_topic_description.
 function M.decode_topic_description(payload)
     local name, p, nerr = decode_string(payload, 1, MAX_TOPIC_NAME)
     if not name then return nil, nerr end
@@ -1186,8 +817,6 @@ function M.decode_topic_description(payload)
     return { name = name, num_partitions = num_partitions, config = config }, nil
 end
 
--- Cap on groups in one GROUP_LIST reply, mirroring the max_groups ceiling the
--- coordinator enforces on live groups.
 local MAX_GROUPS_LISTED = 4096
 M.MAX_GROUPS_LISTED = MAX_GROUPS_LISTED
 
@@ -1213,7 +842,6 @@ function M.decode_group_list(payload)
     return groups, nil
 end
 
--- Inverse of encode_group_description.
 function M.decode_group_description(payload)
     local gid, p, gerr = decode_string(payload, 1, MAX_GROUP_ID)
     if not gid then return nil, gerr end
@@ -1327,15 +955,6 @@ function M.decode_nack_ack(payload)
     }, nil
 end
 
--- Cap records-per-produce-batch so one frame can't ask us to decode an
--- attacker-chosen number of key/value pairs. The real bound on a batch is
--- MaxFrameSize (the framer rejects the frame before we ever get here); this
--- is the belt-and-braces count bound, checked before any allocation.
---
--- MAX_IDEMPOTENT_BATCH is tighter because an idempotent batch's per-record
--- acks are persisted in the producer-state memo so an exact retry can replay
--- them (see src/storage/producer_state.lua) — 1024 records is a ~12 KB memo
--- record, which is the most we're willing to write per batch.
 local MAX_BATCH_RECORDS     = 10000
 local MAX_IDEMPOTENT_BATCH  = 1024
 M.MAX_BATCH_RECORDS    = MAX_BATCH_RECORDS
@@ -1360,9 +979,6 @@ function M.decode_produce_batch(payload)
     if count > MAX_BATCH_RECORDS then
         return nil, string.format("too many records (%d > %d)", count, MAX_BATCH_RECORDS)
     end
-    -- Cheapest possible record is two empty length prefixes; reject a count
-    -- that the remaining bytes cannot possibly satisfy before we start
-    -- allocating a table sized for it.
     if count * 8 > #payload - pos + 1 then
         return nil, string.format("produce_batch count %d exceeds payload", count)
     end
@@ -1440,8 +1056,6 @@ function M.decode_record_batch(payload)
     return records, nil
 end
 
--- Cap offsets-per-txn-commit so one frame can't ask us to decode an
--- attacker-chosen number of triples. 1024 is far above any realistic batch.
 local MAX_TXN_OFFSETS = 1024
 
 function M.decode_txn_offset_commit(payload)
@@ -1469,18 +1083,12 @@ function M.decode_list_offsets(payload)
     local topic, p, terr = decode_string(payload, 1, MAX_TOPIC_NAME)
     if not topic then return nil, terr end
 
-    -- Optional trailing mode byte; clients older than offset-for-timestamp
-    -- send nothing after the topic.
     local mode = M.LIST_OFFSETS_MODE_BOUNDS
     local timestamp
     if #payload - p + 1 >= 1 then
         local m, p2 = string.unpack(">B", payload, p)
         mode = m
         if mode == M.LIST_OFFSETS_MODE_TIMESTAMP then
-            -- A TIMESTAMP mode byte with no timestamp behind it is a malformed
-            -- frame, not an old client: an old client never sends the byte at
-            -- all. Reject rather than silently degrading to a bounds query,
-            -- which would answer a question nobody asked.
             if #payload - p2 + 1 < 8 then
                 return nil, "list_offsets: timestamp mode without a timestamp"
             end
@@ -1493,10 +1101,6 @@ function M.decode_list_offsets(payload)
     return { topic = topic, mode = mode, timestamp = timestamp }, nil
 end
 
--- Returns the entry list described on encode_offsets, partition order
--- preserved. The flag bits come back as booleans: `hwm_exact` and `lso_known`
--- say whether those two fields are real readings or the `latest` stand-in,
--- and `leader` says the answering broker serves the partition.
 function M.decode_offsets(payload)
     if #payload < 4 then return nil, "short offsets" end
     local count, pos = string.unpack(">I4", payload, 1)
@@ -1505,7 +1109,6 @@ function M.decode_offsets(payload)
             "too many partitions (%d > %d)", count, MAX_PARTITIONS)
     end
 
-    -- partition(4) + earliest(8) + latest(8) + hwm(8) + lso(8) + flags(1)
     local ENTRY_SIZE = 37
     local entries = {}
     for i = 1, count do
@@ -1525,18 +1128,12 @@ function M.decode_offsets(payload)
         pos = np
     end
 
-    -- Optional FOR_TIMES section (see encode_offsets). Absent on a bounds
-    -- reply and on any broker built before offset-for-timestamp, so its
-    -- absence is normal, not an error. Attached as a named field on the
-    -- entries list: `#entries` and ipairs() still see only the bounds
-    -- entries, so every existing caller is unaffected.
     if #payload - pos + 1 >= 4 then
         local tcount, tpos = string.unpack(">I4", payload, pos)
         if tcount > MAX_PARTITIONS then
             return nil, string.format(
                 "too many for_times entries (%d > %d)", tcount, MAX_PARTITIONS)
         end
-        -- partition(4) + offset(8) + flags(1)
         local TIME_ENTRY_SIZE = 13
         local times = {}
         for i = 1, tcount do
@@ -1579,10 +1176,7 @@ function M.decode_error(payload)
     return { code = code, message = msg }, nil
 end
 
--- Idempotent produce decode. Lives here because it depends on the
--- decode_string helper and the MAX_TOPIC_NAME constant declared above.
 function M.decode_produce_idempotent(payload)
-    -- header = pid(8) + seq(4) + epoch(2) + codec(1) = 15 bytes.
     if #payload < 15 then return nil, "short produce_idempotent header" end
     local pid, seq, epoch, codec, p = string.unpack(">I8I4I2B", payload, 1)
     local topic, p2, terr = decode_string(payload, p, MAX_TOPIC_NAME)

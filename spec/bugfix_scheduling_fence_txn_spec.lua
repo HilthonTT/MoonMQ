@@ -1,18 +1,3 @@
--- Regression tests for three defects fixed together:
---
---   1. Reactor:run computed the next-timer deadline BEFORE firing due timers,
---      so a timer armed by a coroutine it had just resumed was invisible and
---      the loop blocked on select for the full 1s cap. Every cooperative
---      reactor:sleep(0) cost a second — which made a default 600k-iteration
---      AUTH take ~73s and blow through the 5s handshake watchdog.
---   2. ClusterServer:_handle consulted the controller fence BEFORE checking
---      X-Cluster-Token. ControllerFence:observe durably adopts a higher epoch,
---      so an unauthenticated request could pin the epoch and permanently fence
---      the real controller out of the broker despite getting a 401 back.
---   3. Coordinator:begin overwrote a transaction sitting in PREPARE_COMMIT /
---      PREPARE_ABORT, destroying the only record of a decision that end_txn
---      and crash recovery both roll forward.
-
 local json           = require("dkjson")
 local socket         = require("socket")
 local Reactor        = require("src.server.reactor")
@@ -34,9 +19,6 @@ local function rmdir(path)
     end
 end
 
--- An in-memory socket that hands `request` to the reader and collects
--- everything written back. Nothing ever blocks, so ClusterServer:_handle runs
--- to completion on the calling coroutine and the reactor never has to spin.
 local function mock_sock(request)
     local pos, out = 1, {}
     return {
@@ -74,8 +56,6 @@ describe("reactor timer scheduling", function()
         r:run()
 
         assert.is_number(elapsed)
-        -- Pre-fix this was ~1s per yield (n seconds total). Anything under a
-        -- fraction of one tick proves the deadline is recomputed after firing.
         assert.is_true(elapsed < 0.5,
             string.format("%d x sleep(0) took %.3fs; expected well under 0.5s", n, elapsed))
     end)
@@ -99,7 +79,6 @@ end)
 describe("handshake watchdog vs. in-flight credential verification", function()
     local Connection = require("src.server.connection")
 
-    -- Minimum stub the watchdog + close path touch.
     local function fake_conn(reactor, deadline)
         local server = {
             reactor            = reactor,
@@ -117,12 +96,8 @@ describe("handshake watchdog vs. in-flight credential verification", function()
 
     it("does not evict a connection whose AUTH the broker is still computing", function()
         local r = Reactor.new()
-        -- Integer deadline: this test must exercise the wait-it-out logic, not
-        -- be masked by the %d-on-a-float crash the next test covers.
         local conn = fake_conn(r, 1)
 
-        -- The AUTH handler flags the derivation; it outlasts the deadline
-        -- (pure-Lua PBKDF2 at any real iteration count does).
         conn.auth_in_progress = true
         r:spawn(function()
             r:sleep(1.6)
@@ -139,9 +114,6 @@ describe("handshake watchdog vs. in-flight credential verification", function()
 
     it("still evicts a peer that never completes the handshake", function()
         local r = Reactor.new()
-        -- Fractional deadline on purpose: the close message formatted it with
-        -- %d, which raises on a non-integer and killed the watchdog coroutine
-        -- before it could close anything.
         local conn = fake_conn(r, 0.1)
 
         r:spawn(function() conn:run_handshake_watchdog() end)
@@ -188,7 +160,6 @@ describe("cluster endpoint auth ordering", function()
         cs:_handle(sock)
 
         assert.is_truthy(response_of(sock):find("401", 1, true))
-        -- The whole point: the fence must be untouched, in memory AND on disk.
         local epoch, claimant = fence:highest()
         assert.are.equal(0, epoch)
         assert.is_nil(claimant)
@@ -196,7 +167,6 @@ describe("cluster endpoint auth ordering", function()
         local reloaded = assert(ControllerFence.new(BASE_DIR))
         assert.are.equal(0, (reloaded:highest()))
 
-        -- And a legitimate controller can still claim epoch 1 afterwards.
         assert.are.equal(1, (fence:claim("b1")))
     end)
 
@@ -253,7 +223,6 @@ describe("transaction coordinator prepared-state protection", function()
         assert(broker.transactions:add_offsets("txn-p", pid, epoch, "grp",
             { { topic = "in", partition = 1, offset = 42 } }))
 
-        -- Fail the offset commit so end_txn leaves the txn in PREPARE_COMMIT.
         local real_commit = broker.offsets.commit
         broker.offsets.commit = function() return nil, "injected failure" end
         local ok = broker.transactions:end_txn("txn-p", pid, epoch, true)
@@ -262,8 +231,6 @@ describe("transaction coordinator prepared-state protection", function()
         assert.are.equal(txn_m.STATES.PREPARE_COMMIT,
             broker.transactions:current("txn-p").state)
 
-        -- The client must NOT be able to wipe the durable decision by starting
-        -- a fresh transaction on the same id.
         local bok, berr, bcode = broker.transactions:begin("txn-p", pid, epoch)
         assert.is_nil(bok)
         assert.are.equal("state", bcode)
@@ -271,14 +238,11 @@ describe("transaction coordinator prepared-state protection", function()
         assert.are.equal(txn_m.STATES.PREPARE_COMMIT,
             broker.transactions:current("txn-p").state)
 
-        -- Retrying END_TXN with the same decision still completes it, and the
-        -- buffered offset lands.
         assert(broker.transactions:end_txn("txn-p", pid, epoch, true))
         assert.are.equal(txn_m.STATES.COMPLETE_COMMIT,
             broker.transactions:current("txn-p").state)
         assert.are.equal(42, broker:fetch_offset("grp", "in", 1))
 
-        -- Once COMPLETE, the id is reusable for the next transaction.
         assert(broker.transactions:begin("txn-p", pid, epoch))
         assert.are.equal(txn_m.STATES.ONGOING,
             broker.transactions:current("txn-p").state)

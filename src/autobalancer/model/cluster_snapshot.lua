@@ -3,18 +3,13 @@ local Action   = require("src.autobalancer.common.action")
 
 local ActionType = Action.ActionType
 
--- ClusterModelSnapshot is the working set a detection pass operates on: the
--- brokers, the replicas grouped by broker, and each broker's aggregated load.
--- Goals mutate it in place by applying Actions; because it's a copy of the live
--- ClusterModel, that mutation is a cheap simulation that never touches real
--- broker state. Mirrors AutoMQ's ClusterModelSnapshot.
 local ClusterModelSnapshot = {}
 ClusterModelSnapshot.__index = ClusterModelSnapshot
 
 function ClusterModelSnapshot.new()
     return setmetatable({
-        brokers            = {},   -- id -> Broker
-        replicas_by_broker = {},   -- id -> { key -> Replica }
+        brokers            = {},
+        replicas_by_broker = {},
     }, ClusterModelSnapshot)
 end
 
@@ -29,9 +24,6 @@ function ClusterModelSnapshot:add_replica(replica)
     bucket[replica:key()] = replica
 end
 
--- Recompute every broker's load as the sum of its replicas' loads. Called once
--- after all replicas are added; apply_action keeps the totals correct after
--- that, so goals never re-aggregate mid-pass.
 function ClusterModelSnapshot:aggregate()
     for id, broker in pairs(self.brokers) do
         for _, r in ipairs(Resource.VALUES) do broker.loads[r] = 0 end
@@ -53,8 +45,6 @@ function ClusterModelSnapshot:broker_load(id, resource)
     return b and b:get_load(resource) or 0
 end
 
--- Active brokers only — the set eligible to hold replicas and therefore the set
--- goals balance across. Returned sorted by id for deterministic iteration.
 function ClusterModelSnapshot:active_broker_ids()
     local ids = {}
     for id, b in pairs(self.brokers) do
@@ -64,8 +54,6 @@ function ClusterModelSnapshot:active_broker_ids()
     return ids
 end
 
--- Replicas currently placed on a broker, as an array (order unspecified; goals
--- sort as needed).
 function ClusterModelSnapshot:replicas_of(id)
     local out = {}
     local bucket = self.replicas_by_broker[id]
@@ -93,9 +81,6 @@ local function move_one(self, replica, from_id, to_id)
     end
 end
 
--- Apply an Action, mutating placement and keeping broker load totals in sync.
--- Returns true, or nil + err if the action doesn't match the snapshot (unknown
--- replica / broker) so a goal never silently balances against a stale plan.
 function ClusterModelSnapshot:apply_action(action)
     if action.action_type == ActionType.MOVE then
         local replica = self:replica_at(action.src_broker_id,
@@ -108,7 +93,6 @@ function ClusterModelSnapshot:apply_action(action)
         return true
     end
 
-    -- SWAP: src replica and dest replica trade brokers.
     local src_replica = self:replica_at(action.src_broker_id,
         action.src_topic.name, action.src_partition)
     local dest_replica = self:replica_at(action.dest_broker_id,

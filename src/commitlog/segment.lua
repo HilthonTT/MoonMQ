@@ -1,14 +1,3 @@
--- A single log segment: one ".log" file holding a contiguous run of records
--- plus a ".index" sidecar mapping offsets to byte positions. Faithful port of
--- jocko's commitlog/segment.go, adapted to MoonMQ's self-framing record format
--- (see src/record/message.lua) instead of jocko's MessageSet.
---
--- Offsets are message counts (jocko semantics): base_offset is the first
--- offset in the segment, next_offset the offset the next appended record will
--- receive, and position the number of bytes written so far. A record on disk
--- is length-prefixed and CRC-protected, so the log is self-describing — the
--- index is an acceleration structure, rebuildable from the log at any time.
-
 local fs_m      = require("src.io.fs")
 local io_sync   = require("src.io.io_sync")
 local message_m = require("src.record.message")
@@ -21,9 +10,6 @@ local IndexFileSuffix = ".index"
 local Segment = {}
 Segment.__index = Segment
 
--- Path helpers. `suffix` is "" for live segments and ".cleaned" for the
--- temporary segment a compaction writes before atomically replacing the
--- original (jocko's cleanedSuffix scheme).
 local function log_path(dir, base_offset, suffix)
     return fs_m.join_path(dir,
         string.format("%020d%s", base_offset, LogFileSuffix .. (suffix or "")))
@@ -34,10 +20,6 @@ local function index_path(dir, base_offset, suffix)
         string.format("%020d%s", base_offset, IndexFileSuffix .. (suffix or "")))
 end
 
--- new opens (creating if absent) the segment at base_offset in `dir`, then
--- rebuilds its index from the log — which also recovers next_offset/position
--- and trims any torn tail left by a crash mid-append. Returns (segment, nil)
--- or (nil, err).
 function Segment.new(dir, base_offset, max_bytes, suffix)
     assert(type(dir) == "string", "dir must be a string")
     assert(type(base_offset) == "number", "base_offset must be a number")
@@ -45,8 +27,6 @@ function Segment.new(dir, base_offset, max_bytes, suffix)
     suffix = suffix or ""
 
     local lp = log_path(dir, base_offset, suffix)
-    -- "a+b": append-only writes (records always land at EOF, so a torn write
-    -- can't corrupt earlier data) while still allowing seek+read for lookups.
     local file, err = io.open(lp, "a+b")
     if not file then
         return nil, string.format("failed to open segment log %s: %s",
@@ -80,18 +60,10 @@ function Segment.new(dir, base_offset, max_bytes, suffix)
     return s, nil
 end
 
--- build_index discards the on-disk index and rebuilds it by scanning the log,
--- one record at a time. It (re)derives next_offset and position from the log
--- itself — the log is authoritative — and physically truncates any trailing
--- partial record so subsequent appends stay contiguous. Returns nil on
--- success, err string otherwise.
 function Segment:build_index()
     local terr = self.index:truncate_entries(0)
     if terr then return terr end
 
-    -- File size up front so a corrupt length prefix can't drive a huge
-    -- allocation via file:read(total_size) — we bound each record against the
-    -- bytes actually remaining before trusting its length.
     local file_end = self.file:seek("end") or 0
     self.file:seek("set", 0)
 
@@ -99,35 +71,20 @@ function Segment:build_index()
     local position    = 0
 
     while true do
-        -- Peek the 8-byte length prefix, bound it against the file, then rewind
-        -- and decode the whole record through deserialize_record so the CRCs
-        -- are validated here — the same way segment_verify does for the
-        -- segmented backend. A short read, an out-of-range length, or a CRC
-        -- mismatch is treated as a torn tail: stop and truncate below. (The
-        -- old fast-path framed by length alone and skipped CRC entirely, so a
-        -- mid-log bit-flip was silently indexed and only faulted at read_at.)
         local size_bytes = self.file:read(8)
         if not size_bytes or #size_bytes < 8 then
             break
         end
         local total_size = string.unpack(">I8", size_bytes)
-        -- Bound against the bytes REMAINING, never `position + 8 + total_size
-        -- > file_end`: the prefix is covered by neither CRC, so corruption can
-        -- set it to any u64, and a value near 2^63 wraps that sum to a
-        -- negative Lua integer and slips past the comparison. The subtraction
-        -- can't overflow (both operands are file positions). MIN_BODY also
-        -- subsumes the old `< 0` test, since a high-bit-set length decodes to
-        -- a negative integer. Same form as read_message / verify_file /
-        -- deserialize_record, which is the authority this rewinds into below.
         if total_size < message_m.MIN_BODY
            or total_size > file_end - (position + 8) then
-            break  -- length runs past EOF: torn/corrupt tail
+            break
         end
 
-        self.file:seek("set", position)  -- rewind to the record start
+        self.file:seek("set", position)
         local msg, framed = message_m.deserialize_record(self.file)
         if not msg then
-            break  -- short read or CRC mismatch: torn/corrupt tail
+            break
         end
 
         local werr = self.index:write_entry(next_offset, position)
@@ -137,10 +94,6 @@ function Segment:build_index()
         next_offset = next_offset + 1
     end
 
-    -- Drop any bytes past the last whole record (a half-written tail from a
-    -- crash, or everything after an interior corruption). Without this, the
-    -- next append would sit after the garbage. file_end was computed up front
-    -- and the scan is read-only, so it still reflects the on-disk size.
     if position < file_end then
         log:warn("segment %020d: trimming %d byte(s) past last valid record at %d",
             self.base_offset, file_end - position, position)
@@ -155,9 +108,6 @@ function Segment:build_index()
     return nil
 end
 
--- is_full reports whether the segment has reached its byte cap. A max_bytes of
--- 0 means "no cap" (never full) — the CommitLog applies its own default before
--- creating segments, so this is just a safety valve.
 function Segment:is_full()
     if self.max_bytes <= 0 then
         return false
@@ -165,32 +115,14 @@ function Segment:is_full()
     return self.position >= self.max_bytes
 end
 
--- write appends a pre-serialized record's bytes, bumping next_offset and
--- position. It does NOT touch the index — the CommitLog writes the index entry
--- after a successful write (jocko splits the responsibility the same way).
--- Returns (true, nil) or (false, err).
 function Segment:write(record)
     assert(type(record) == "string", "record must be a string")
 
-    -- Reposition to EOF before writing. The log handle is opened "a+b" (an
-    -- update stream) and read_at/each seek+read from it; C stdio forbids a write
-    -- directly after a read on an update stream without an intervening
-    -- positioning call, and Windows UCRT enforces it — the write returns nil and
-    -- the append fails. A lagging consumer reading a non-tail record would
-    -- otherwise poison this handle so the next produce fails. seek("end") is the
-    -- required reposition (append mode already targets EOF, so it's a no-op to
-    -- the byte position).
     local pos, serr = self.file:seek("end")
     if not pos then
         return false, string.format("log seek failed: %s", tostring(serr))
     end
 
-    -- Physical EOF must match the tracked position. They diverge when a
-    -- previous write failed after partially flushing (ENOSPC/EIO): garbage
-    -- sits at EOF while `position` still points before it, and appending on
-    -- top would misalign every later record's indexed position (misframed
-    -- reads now, torn-tail truncation of acked records on the next open).
-    -- Truncate the garbage away and continue from the tracked position.
     if pos ~= self.position then
         local tok, terr = io_sync.truncate(self.file, self.position)
         if not tok then
@@ -210,10 +142,6 @@ function Segment:write(record)
     return true, nil
 end
 
--- rewind undoes the most recent write(s): it truncates the log back to byte
--- `position` and restores the offset/position counters. The CommitLog uses
--- this when an index write fails right after a log write, so the segment never
--- reports a record the index doesn't cover. Returns (true, nil) or (false, err).
 function Segment:rewind(position, next_offset)
     assert(type(position) == "number", "position must be a number")
     assert(type(next_offset) == "number", "next_offset must be a number")
@@ -224,8 +152,6 @@ function Segment:rewind(position, next_offset)
     return true, nil
 end
 
--- read_at reads the record stored at byte `position`, returning
--- (Message, framed_size, nil) or (nil, nil, err).
 function Segment:read_at(position)
     assert(type(position) == "number", "position must be a number")
     local pos, serr = self.file:seek("set", position)
@@ -235,9 +161,6 @@ function Segment:read_at(position)
     return message_m.deserialize_record(self.file)
 end
 
--- each iterates every record in offset order, invoking
--- callback(offset, msg, position). Stops at the first short/corrupt record
--- (EOF or torn tail). Used by the compaction cleaner.
 function Segment:each(callback)
     self.file:seek("set", 0)
     local offset   = self.base_offset
@@ -259,10 +182,6 @@ end
 
 function Segment:close()
     if self.file then
-        -- fsync, not just flush: flush only pushes the CRT buffer down to the
-        -- OS page cache, so a "clean shutdown" of a commitlog-backed partition
-        -- would still lose acks=0 writes on a power/OS crash. This matches
-        -- SegmentedPartition:close(), which already fsyncs on close.
         io_sync.sync(self.file)
         self.file:close()
         self.file = nil
@@ -273,8 +192,6 @@ function Segment:close()
     end
 end
 
--- delete closes the segment and removes both its files from disk. Returns nil
--- on success, err string otherwise.
 function Segment:delete()
     self:close()
     local lp = log_path(self.dir, self.base_offset, self.suffix)
@@ -283,20 +200,11 @@ function Segment:delete()
     if not ok then
         return string.format("failed to remove %s: %s", lp, tostring(err))
     end
-    -- The index may legitimately be absent; ignore its removal error.
     os.remove(ip)
     return nil
 end
 
--- replace makes this (".cleaned") segment take the place of `old`: both are
--- closed, this segment's files are renamed over old's canonical names, then it
--- is reopened suffix-less and its index rebuilt. Returns nil on success, err
--- otherwise. Mirrors jocko's Segment.Replace, used by compaction.
 function Segment:replace(old)
-    -- Make the cleaned replacement durable BEFORE the rename. On Windows
-    -- atomic_rename is remove-then-rename (non-atomic), so a crash can leave
-    -- only the ".cleaned" file as the surviving copy — CommitLog:open adopts
-    -- it on recovery, but only if its bytes actually reached disk.
     local sok, serr = self:sync()
     if not sok then
         return string.format("sync cleaned segment failed: %s", tostring(serr))
@@ -310,8 +218,6 @@ function Segment:replace(old)
     local clean_log = log_path(self.dir, self.base_offset, self.suffix)
     local clean_idx = index_path(self.dir, self.base_offset, self.suffix)
 
-    -- atomic_rename removes an existing target first on Windows (POSIX rename
-    -- replaces atomically), so the canonical files are overwritten cleanly.
     local ok, err = io_sync.atomic_rename(clean_log, canon_log)
     if not ok then
         return string.format("rename %s -> %s failed: %s",
@@ -323,10 +229,6 @@ function Segment:replace(old)
                              clean_idx, canon_idx, tostring(err))
     end
 
-    -- Persist the directory entries: on POSIX the two renames above aren't
-    -- crash-durable until the containing directory is fsynced, or a power loss
-    -- could leave the canonical name pointing at a partially-linked file.
-    -- Non-fatal: the rename already succeeded in the page cache.
     local dok, derr = io_sync.sync_dir(self.dir)
     if not dok then
         log:warn("segment %020d: dir fsync after compaction replace failed: %s",

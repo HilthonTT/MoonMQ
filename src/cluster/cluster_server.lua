@@ -1,43 +1,3 @@
--- Inter-broker cluster endpoint. Serves the peer-side of the reassignment
--- layer on its own port, sharing the main reactor (like replica_server):
---
---   POST /cluster/ensure   json {topic, partitions}      → 200 {"ok":true}
---       Create the topic if missing (idempotent).
---   POST /cluster/append   X-Topic / X-Partition headers → 200 {"offset":LEO}
---       body: 1..N serialized records (len(8)|body each), applied in order.
---       Used for both migration batches and forwarded produces.
---   GET  /cluster/leo?topic=T&partition=N                → 200 {"offset":LEO}
---   POST /cluster/owner    json {topic, partition, owner}→ 200 {"ok":true}
---       Record an ownership change in the local assignments table.
---   POST /cluster/offsets  json {topic, partition, offsets:{group:offset}}
---       Apply committed consumer offsets migrated with a partition
---       (higher-wins per group)                       → 200 {"ok":true,"applied":N}
---   GET  /cluster/loads                                  → 200 {"broker_id":..,"loads":[..]}
---       Per-partition disk bytes, feeding peers' autobalancer models.
---   POST /cluster/controller/claim  json {epoch, broker_id}
---       Record a controller claim                        → 200 {"accepted":bool,"highest":N}
---   POST /cluster/txn/enroll  json {txn, topic, partition, first_offset}
---       A peer-coordinated transaction produces to a partition we own:
---       floor its LSO until resolved                     → 200 {"ok":true}
---   POST /cluster/txn/resolve json {txn, topic, partition, aborted, pid, epoch, first, upto}
---       Release the floor; on abort record the aborted
---       range in our abort index                         → 200 {"ok":true}
---   POST /cluster/group/join      json {group, member, topics, origin}
---       Coordinator side of a forwarded JOIN_GROUP       → 200 {"ok":true,"assignment":{..}}
---   POST /cluster/group/heartbeat json {group, member}
---       Renew lease; reply carries current assignment    → 200 {"ok":true,"assignment":{..}}
---   POST /cluster/group/leave     json {group, member}
---       Forwarded LEAVE_GROUP (idempotent)               → 200 {"ok":true}
---
--- Mutating routes (append/ensure/owner/offsets) honour optional
--- X-Controller-Epoch / X-Controller-Id headers: a request from a controller
--- this broker knows to be superseded is refused with 409 (see
--- src/cluster/controller_fence.lua). Requests without the headers pass.
---
--- HTTP/1.1, Connection: close. Binds 127.0.0.1 by default. When opts.token is
--- set, every request must carry a matching X-Cluster-Token — set it whenever
--- the port is reachable beyond loopback.
-
 local socket = require("socket")
 local json   = require("dkjson")
 local msg_m  = require("src.record.message")
@@ -45,6 +5,7 @@ local httpk  = require("src.server.http_kit")
 local tls_m  = require("src.io.tls")
 local util_m = require("src.core.util")
 local ControllerFence = require("src.cluster.controller_fence")
+local local_loads = require("src.cluster.local_loads")
 local log    = require("src.log.logger").get("cluster_server")
 
 local M = {}
@@ -53,13 +14,10 @@ M.__index = M
 local READ_DEADLINE  = 10
 local WRITE_DEADLINE = 5
 local MAX_BODY       = 8 * 1024 * 1024
-local MAX_PARTITIONS = 1024   -- same bound CREATE_TOPIC enforces on the wire
+local MAX_PARTITIONS = 1024
 
 function M.new(opts)
     local broker = assert(opts.broker, "broker required")
-    -- Controller fencing (see src/cluster/controller_fence.lua). Share the
-    -- instance with the balance loop when the caller passes one; otherwise
-    -- build our own over the broker's data dir.
     local fence = opts.fence
     if not fence then
         local f, ferr = ControllerFence.new(broker.topic_manager.baseDir)
@@ -75,17 +33,11 @@ function M.new(opts)
         port        = assert(opts.port, "port required"),
         token       = opts.token,
         fence       = fence,
-        -- TLS for the inter-broker listener (src/io/tls.lua). X-Cluster-Token
-        -- authenticates a peer; TLS is what keeps that token — and the records
-        -- migrated through these routes — off the wire in the clear.
         tls         = opts.tls,
-        -- The server's GroupCoordinator (optional): serves the coordinator
-        -- side of forwarded consumer-group requests (/cluster/group/*).
         group_coordinator = opts.group_coordinator,
     }, M)
 end
 
--- Constant-time token compare — don't leak the match length through timing.
 local function token_ok(expect, got)
     if not expect then return true end
     if type(got) ~= "string" then return false end
@@ -96,15 +48,23 @@ local function token_ok(expect, got)
     return diff == 0
 end
 
--- ---------------------------------------------------------------------------
--- Route implementations. Each returns (status, body_table_or_text).
+
+local function decode_body(body, label, spec)
+    local req = json.decode(body or "")
+    local names, ok = {}, type(req) == "table"
+    for i = 1, #spec, 2 do
+        names[#names + 1] = spec[i]
+        if ok and type(req[spec[i]]) ~= spec[i + 1] then ok = false end
+    end
+    if not ok then
+        return nil, string.format("%s: need {%s}", label, table.concat(names, ", "))
+    end
+    return req
+end
 
 function M:_ensure(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.topic) ~= "string"
-        or type(req.partitions) ~= "number" then
-        return 400, "ensure: need {topic, partitions}"
-    end
+    local req, derr = decode_body(body, "ensure", { "topic", "string", "partitions", "number" })
+    if not req then return 400, derr end
     local valid, verr = util_m.validate_topic_name(req.topic)
     if not valid then return 400, "ensure: " .. tostring(verr) end
     if req.partitions < 1 or req.partitions > MAX_PARTITIONS then
@@ -128,10 +88,6 @@ function M:_ensure(body)
     return 200, { ok = true }
 end
 
--- Apply 1..N concatenated serialized records to (topic, partition), in order.
--- One request_sync at the end so a migration batch costs one fsync, not N.
--- `forwarded` marks the batch as forwarded produce traffic (X-Forwarded-Produce)
--- — counted into this broker's NW_IN feed; migration copies are not.
 function M:_append(topic_name, partition_id, payload, forwarded)
     local topic, terr = self.broker:get_topic(topic_name)
     if not topic then return 404, "append: " .. tostring(terr) end
@@ -178,26 +134,19 @@ function M:_leo(query)
 end
 
 function M:_owner(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.topic) ~= "string"
-        or type(req.partition) ~= "number" or type(req.owner) ~= "string" then
-        return 400, "owner: need {topic, partition, owner}"
-    end
+    local req, derr = decode_body(body, "owner", {
+        "topic", "string", "partition", "number", "owner", "string",
+    })
+    if not req then return 400, derr end
     local ok, err = self.assignments:set_owner(req.topic, req.partition, req.owner)
     if not ok then return 500, "owner: " .. tostring(err) end
     log:info("ownership: %s/partition-%d -> %s", req.topic, req.partition, req.owner)
     return 200, { ok = true }
 end
 
--- Record (and answer) a controller claim. Always 200; `accepted` tells the
--- claimant whether it holds the crown here, `highest` what this broker has
--- seen — a rejected claimant reads it to know what it was superseded by.
 function M:_claim(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.epoch) ~= "number"
-        or type(req.broker_id) ~= "string" then
-        return 400, "claim: need {epoch, broker_id}"
-    end
+    local req, derr = decode_body(body, "claim", { "epoch", "number", "broker_id", "string" })
+    if not req then return 400, derr end
     local ok, err = self.fence:observe(req.epoch, req.broker_id)
     local highest = self.fence:highest()
     if ok then
@@ -209,10 +158,6 @@ function M:_claim(body)
     return 200, { accepted = false, highest = highest, reason = err }
 end
 
--- Fence a mutating request that carries controller headers. Requests without
--- the headers (older peers, hand-driven reassignment) pass — the fence only
--- arbitrates between brokers that participate in claiming. Returns (true) or
--- (nil, err).
 function M:_check_fence(headers)
     local epoch = httpk.header(headers, "X%-Controller%-Epoch")
     if not epoch then return true end
@@ -220,15 +165,11 @@ function M:_check_fence(headers)
     return self.fence:observe(tonumber(epoch), id)
 end
 
--- Apply committed consumer offsets pushed by the source broker of a partition
--- migration. Higher-wins: an offset this broker already advanced past (a group
--- consuming here since the cutover) is never rolled back.
 function M:_offsets(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.topic) ~= "string"
-        or type(req.partition) ~= "number" or type(req.offsets) ~= "table" then
-        return 400, "offsets: need {topic, partition, offsets}"
-    end
+    local req, derr = decode_body(body, "offsets", {
+        "topic", "string", "partition", "number", "offsets", "table",
+    })
+    if not req then return 400, derr end
     local applied, failed = 0, 0
     for group, offset in pairs(req.offsets) do
         if type(group) == "string" and type(offset) == "number" then
@@ -254,29 +195,22 @@ function M:_offsets(body)
     return 200, { ok = true, applied = applied }
 end
 
--- A peer broker coordinates a transaction producing to a partition WE own:
--- floor the partition's LSO until the peer resolves it.
 function M:_txn_enroll(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.txn) ~= "string"
-        or type(req.topic) ~= "string" or type(req.partition) ~= "number"
-        or type(req.first_offset) ~= "number" then
-        return 400, "txn/enroll: need {txn, topic, partition, first_offset}"
-    end
+    local req, derr = decode_body(body, "txn/enroll", {
+        "txn", "string", "topic", "string", "partition", "number", "first_offset", "number",
+    })
+    if not req then return 400, derr end
     local txns = self.broker.transactions
     if not txns then return 500, "txn/enroll: no transaction coordinator" end
     txns:remote_enroll(req.txn, req.topic, req.partition, req.first_offset)
     return 200, { ok = true }
 end
 
--- The peer resolved its transaction: release the LSO floor; on abort, record
--- the aborted range in OUR abort index (our consumers filter with it).
 function M:_txn_resolve(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.txn) ~= "string"
-        or type(req.topic) ~= "string" or type(req.partition) ~= "number" then
-        return 400, "txn/resolve: need {txn, topic, partition}"
-    end
+    local req, derr = decode_body(body, "txn/resolve", {
+        "txn", "string", "topic", "string", "partition", "number",
+    })
+    if not req then return 400, derr end
     local txns = self.broker.transactions
     if not txns then return 500, "txn/resolve: no transaction coordinator" end
     local ok, err = txns:remote_resolve(req.txn, req.topic, req.partition, {
@@ -290,18 +224,11 @@ function M:_txn_resolve(body)
     return 200, { ok = true }
 end
 
--- Coordinator side of a forwarded JOIN_GROUP: this broker was chosen by
--- hash(group_id) over the cluster member ids, and `origin` tells the
--- ownership-aware assignment which broker the member's connection lives on.
--- Logical failures come back as 200 {ok=false, code, reason} so the origin
--- can distinguish them from transport errors.
 function M:_group_join(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.group) ~= "string"
-        or type(req.member) ~= "string" or type(req.topics) ~= "table"
-        or type(req.origin) ~= "string" then
-        return 400, "group/join: need {group, member, topics, origin}"
-    end
+    local req, derr = decode_body(body, "group/join", {
+        "group", "string", "member", "string", "topics", "table", "origin", "string",
+    })
+    if not req then return 400, derr end
     for _, t in ipairs(req.topics) do
         if type(t) ~= "string" then return 400, "group/join: topics must be strings" end
     end
@@ -322,15 +249,11 @@ function M:_group_join(body)
     return 200, { ok = true, assignment = assignment }
 end
 
--- Coordinator side of a forwarded GROUP_HEARTBEAT. Success responses carry
--- the member's CURRENT assignment — that's how rebalances propagate to
--- members connected via other brokers.
 function M:_group_heartbeat(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.group) ~= "string"
-        or type(req.member) ~= "string" then
-        return 400, "group/heartbeat: need {group, member}"
-    end
+    local req, derr = decode_body(body, "group/heartbeat", {
+        "group", "string", "member", "string",
+    })
+    if not req then return 400, derr end
     local gc = self.group_coordinator
     if not gc then return 500, "group/heartbeat: no group coordinator" end
 
@@ -342,13 +265,9 @@ function M:_group_heartbeat(body)
     return 200, { ok = true, assignment = (member and member.partitions) or {} }
 end
 
--- Coordinator side of a forwarded LEAVE_GROUP. Idempotent.
 function M:_group_leave(body)
-    local req = json.decode(body or "")
-    if type(req) ~= "table" or type(req.group) ~= "string"
-        or type(req.member) ~= "string" then
-        return 400, "group/leave: need {group, member}"
-    end
+    local req, derr = decode_body(body, "group/leave", { "group", "string", "member", "string" })
+    if not req then return 400, derr end
     local gc = self.group_coordinator
     if not gc then return 500, "group/leave: no group coordinator" end
 
@@ -358,33 +277,10 @@ function M:_group_leave(body)
 end
 
 function M:_loads()
-    local loads = {}
-    local traffic = self.broker.traffic
-    for name, topic in pairs(self.broker.topic_manager.topics) do
-        if name:sub(1, 2) ~= "__" then   -- internal topics never rebalance
-            for _, p in ipairs(topic.partitions) do
-                -- Only partitions this broker owns: a moved-away partition's
-                -- leftover local data must not count as our load.
-                if self.assignments:owned_by_self(name, p.id) then
-                    local bin, bout = 0, 0
-                    if traffic then bin, bout = traffic:totals(name, p.id) end
-                    loads[#loads + 1] = {
-                        topic          = name,
-                        partition      = p.id,
-                        disk_bytes     = p.offset or 0,
-                        -- Cumulative counters; the balance loop differences
-                        -- successive reports into NW_IN/NW_OUT byte rates.
-                        bytes_in_total  = bin,
-                        bytes_out_total = bout,
-                    }
-                end
-            end
-        end
-    end
-    return 200, { broker_id = self.broker_id, loads = loads }
+    return 200, { broker_id = self.broker_id,
+                  loads = local_loads.collect(self.broker, self.assignments) }
 end
 
--- ---------------------------------------------------------------------------
 
 function M:_handle(sock)
     local deadline = socket.gettime() + READ_DEADLINE
@@ -394,7 +290,6 @@ function M:_handle(sock)
     local method, path, query = httpk.request_line(headers)
     local clen = tonumber(httpk.header(headers, "Content%-Length")) or 0
 
-    -- Mutating routes are controller-fenced when the request carries an epoch.
     local MUTATING = {
         ["/cluster/append"]      = true,
         ["/cluster/ensure"]      = true,
@@ -408,13 +303,6 @@ function M:_handle(sock)
     }
 
     local status, out
-    -- Authenticate BEFORE consulting the fence. ControllerFence:observe is not
-    -- a read: a higher epoch is adopted and durably persisted to
-    -- controller-epoch.json. Running it ahead of the token check let an
-    -- unauthenticated caller that merely reaches this port pin the epoch at an
-    -- arbitrary value (X-Controller-Epoch: 2147483647) and permanently fence
-    -- the real controller out of this broker — the 401 it got back was too
-    -- late, the damage was already on disk.
     local authed = token_ok(self.token, httpk.header(headers, "X%-Cluster%-Token"))
     local fence_ok, fence_err = true, nil
     if authed and method == "POST" and MUTATING[path] then

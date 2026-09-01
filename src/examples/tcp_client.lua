@@ -13,10 +13,6 @@ end
 
 local host       = getenv("MOONMQ_HOST", "127.0.0.1")
 local port       = tonumber(getenv("MOONMQ_PORT", "9092"))
--- Defaults match appsettings.json's dev credential (Username "admin",
--- PasswordHash for plaintext "admin"). Override either via env in real
--- deployments. Leaving MOONMQ_USER blank skips AUTH entirely — only
--- useful if the broker is in OPEN mode.
 local username   = getenv("MOONMQ_USER", "admin")
 local password   = getenv("MOONMQ_PASS", "admin")
 local topic      = getenv("MOONMQ_TOPIC", "demo")
@@ -35,8 +31,6 @@ local client, cerr = Client.new{
 if not client then die("%s", cerr) end
 print("connected.")
 
--- 1. Create the topic. Re-running the example is fine: we surface
---    the error but keep going if it already exists.
 print(string.format("create_topic(%q, %d) ...", topic, partitions))
 local ok, err = client:create_topic(topic, partitions)
 if not ok then
@@ -46,7 +40,6 @@ else
     print("  ok.")
 end
 
--- 2. Produce a single record.
 local key   = "k1"
 local value = string.format("hello at %d", os.time())
 print(string.format("produce(%q, %q, %q) ...", topic, key, value))
@@ -54,14 +47,12 @@ local ack, perr = client:produce(topic, key, value)
 if not ack then die("produce: %s", perr) end
 print(string.format("  ack partition=%d offset=%d", ack.partition, ack.offset))
 
--- 3. List topics — the freshly-created one must appear.
 print("list_topics() ...")
 local names, lerr = client:list_topics()
 if not names then die("list_topics: %s", lerr) end
 table.sort(names)
 print(string.format("  %d topic(s): %s", #names, table.concat(names, ", ")))
 
--- 4. Fetch records from the group's current position.
 print(string.format("fetch(%q, %q, 10) ...", topic, group))
 local records, ferr = client:fetch(topic, group, 10)
 if not records then die("fetch: %s", ferr) end
@@ -71,18 +62,11 @@ for i, r in ipairs(records) do
         i, r.partition, r.offset, r.key, r.value))
 end
 
--- 5. Commit the offset just past the produced record so the group
---    won't re-deliver it on the next fetch.
 print(string.format("commit(%q, %d, %d) ...", topic, ack.partition, ack.offset + 1))
 local cok, cerr2 = client:commit(topic, ack.partition, ack.offset + 1)
 if not cok then die("commit: %s", cerr2) end
 print("  ok.")
 
--- 6. Idempotent producer demo. Opens a SECOND connection with
---    idempotent=true; the broker assigns a PID and tracks per-(PID,
---    topic) sequences. We then deliberately resend the same (seq) and
---    expect the broker to return the ORIGINAL (partition, offset)
---    rather than re-appending — proving session-scoped dedup.
 print("opening idempotent producer ...")
 local iclient, ierr = Client.new{
     host           = host,
@@ -106,7 +90,6 @@ if not iack1 then die("idempotent produce 1: %s", ie1) end
 print(string.format("  ack partition=%d offset=%d seq=%d",
     iack1.partition, iack1.offset, iack1.seq))
 
--- Resend the SAME seq. Server should reply with the same (partition, offset).
 print(string.format("retry at seq=0 (expect same offset back) ..."))
 local iack2, ie2 = iclient:produce_at_seq(itopic, ikey, ivalue, 0)
 if not iack2 then die("idempotent retry: %s", ie2) end
@@ -118,7 +101,6 @@ else
         iack2.partition, iack2.offset, iack1.partition, iack1.offset)
 end
 
--- Try an out-of-order seq (skipping seq=1). Expect an error.
 print(string.format("send seq=42 (gap; expect error) ..."))
 local _, ie3 = iclient:produce_at_seq(itopic, ikey, ivalue, 42)
 if ie3 then
@@ -130,10 +112,6 @@ end
 iclient:close()
 print("idempotent demo done.")
 
--- 7. Consumer-group demo over the wire. Join the group (no member_id →
---    the broker assigns one), inspect the partition assignment, renew the
---    lease once, then leave. A lone member owns every partition of the
---    topic.
 print(string.format("join_group(%q, {%q}) ...", group, topic))
 local jres, jerr = client:join_group(group, { topic })
 if not jres then die("join_group: %s", jerr) end
@@ -151,6 +129,5 @@ local lgok, lgerr = client:leave_group()
 if not lgok then die("leave_group: %s", lgerr) end
 print("  left group.")
 
--- 8. Clean shutdown — sends GOODBYE and closes the socket.
 client:close()
 print("done.")

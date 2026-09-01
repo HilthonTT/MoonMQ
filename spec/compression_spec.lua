@@ -20,8 +20,6 @@ local function unframe(frame)
     return proto.parse_frame(frame:sub(5))
 end
 
--- Mirror the broker's produce-side compression (handlers.build_stored_message):
--- compress the value, record the codec in attrs, key stays plaintext.
 local function stored_message(codec, key, value)
     local bytes = assert(compression.compress(codec, value))
     return message.Message.new(key, bytes, 1, codec & message.ATTR_CODEC_MASK)

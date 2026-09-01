@@ -3,8 +3,6 @@ local proto = require("src.wire.protocol")
 local uuid = require("src.core.uuid")
 local msg_m = require("src.record.message")
 local dlq_env = require("src.record.dlq_envelope")
--- SCRAM: the message grammar and the KDF, both shared with the broker so the
--- two halves cannot drift. Neither pulls in server state.
 local scram = require("src.server.scram")
 local pbkdf2 = require("src.core.pbkdf2")
 local rng = require("src.core.rng")
@@ -12,9 +10,6 @@ local tls_m = require("src.io.tls")
 
 local DEFAULT_TIMEOUT = 30
 
--- Compression codec name → id. Kept local (rather than via
--- src.record.compression) so the client doesn't pull in the native codec
--- probes; the broker validates availability and errors if it can't honour it.
 local CODEC_BY_NAME = {
     none   = msg_m.CODEC_NONE,
     gzip   = msg_m.CODEC_GZIP,
@@ -34,15 +29,6 @@ function Client.new(opts)
         return nil, string.format("connect %s:%d: %s", host, port, tostring(cerr))
     end
 
-    -- TLS, if asked for. opts.tls takes the same block shape as the broker's
-    -- Server.Tls (lowercase keys accepted too):
-    --
-    --   tls = { cafile = "/etc/moonmq/ca.crt" }          -- verify the broker
-    --   tls = { cafile = "…", certfile = "…", keyfile = "…" }  -- plus mTLS
-    --   tls = { insecure = true }                        -- dev only, no checks
-    --
-    -- The wrap has to happen before HELLO: everything below this line, the
-    -- handshake included, is application data inside the tunnel.
     if opts.tls then
         local cfg, terr = tls_m.client_config(opts.tls, "client tls")
         if not cfg then
@@ -71,30 +57,14 @@ function Client.new(opts)
         port = port,
         closed = false,
         push_handler = nil,
-        -- Idempotent producer state. pid is assigned by the broker via
-        -- INIT_PRODUCER_ID if opts.idempotent is true; once set, every
-        -- subsequent :produce() routes through OP_PRODUCE_IDEMPOTENT
-        -- and carries the next per-topic sequence number. Retries of
-        -- the same (topic, seq) get the original (partition, offset)
-        -- back from the broker — at-most-once delivery without
-        -- application-level dedup.
         pid = nil,
-        -- Compression codec applied to produced values (name resolved to an id
-        -- here; the broker stores the value under it and consumers decompress
-        -- transparently). Defaults to none.
         compression = CODEC_BY_NAME[tostring(opts.compression or "none"):lower()]
                       or msg_m.CODEC_NONE,
-        -- Consumer isolation level, applied to every fetch/subscribe from this
-        -- client. "read_committed" hides records of aborted/unresolved
-        -- transactions (the broker stops at the Last Stable Offset).
         isolation = (tostring(opts.isolation or "read_uncommitted"):lower()
                      == "read_committed")
                     and proto.ISOLATION_READ_COMMITTED
                     or proto.ISOLATION_READ_UNCOMMITTED,
-        next_seq = {},  -- topic -> next u32 seq to send
-        -- Consumer-group membership, populated by join_group(). The
-        -- broker-assigned member_id is reused by group_heartbeat/leave_group
-        -- so callers don't have to thread it through every call.
+        next_seq = {},
         group_id = nil,
         member_id = nil,
     }, Client)
@@ -106,7 +76,7 @@ function Client.new(opts)
     local hcorrel = uuid.bytes()
     local ok, err = c:_write(proto.encode_hello(hcorrel))
     if not ok then c:close(); return nil, "send hello: " .. err end
- 
+
     local op, _, payload, rerr = c:_read_until(hcorrel)
     if not op then c:close(); return nil, "read welcome: " .. rerr end
     if op == proto.OP_ERROR then
@@ -119,20 +89,14 @@ function Client.new(opts)
         return nil, string.format("expected WELCOME, got 0x%02x", op)
     end
 
-    -- IDENTIFY_CLIENT (optional)
     if opts.client_name then
         local idc = uuid.bytes()
         c:_write(proto.encode_identify_client(idc,
             opts.client_name, opts.client_version or "0.0.0"))
-        c:_read_until(idc)  -- ack is informational, ignore content
+        c:_read_until(idc)
     end
- 
-    --  AUTH (skip if no username — server may be in OPEN mode)
+
     if opts.username then
-        -- Two mechanisms. SCRAM (opts.mechanism = "scram-sha-256") never puts
-        -- the password on the wire and does the PBKDF2 here rather than on the
-        -- broker's single reactor thread — prefer it, especially until TLS
-        -- lands. The default stays "plain" so existing callers are unchanged.
         local mechanism = tostring(opts.mechanism or "plain"):lower()
         if mechanism == "scram" or mechanism == "scram-sha-256" then
             local aerr = c:_auth_scram(opts.username, opts.password or "")
@@ -157,12 +121,6 @@ function Client.new(opts)
         end
     end
 
-    -- Producer-id init (optional). Two modes:
-    --   * opts.producer_name set → DURABLE producer: the broker returns the same
-    --     pid across reconnects/restarts and a bumped epoch each session, so
-    --     idempotence survives a restart and old sessions are fenced.
-    --   * opts.idempotent (no name) → ephemeral session-scoped pid (pids are not
-    --     durable across the socket/process; re-init on reconnect).
     if opts.producer_name or opts.idempotent then
         local icorrel = uuid.bytes()
         ok, err = c:_write(proto.encode_init_producer_id(icorrel,
@@ -193,10 +151,6 @@ function Client.new(opts)
     return c
 end
 
--- Mark the client dead when the peer closed the socket, so pool users
--- (bin/gateway.lua's Pool checks `closed` on acquire/release) cull it
--- instead of handing out a connection that can never recover. Without
--- this, a broker restart left pooled clients dead-but-reusable forever.
 function Client:_mark_closed_on(err)
     if err == "closed" then self.closed = true end
 end
@@ -217,14 +171,6 @@ function Client:_write(data)
     return sent == #data, nil
 end
 
--- Read exactly n bytes. A short read must NOT lose the bytes it did get:
--- sock:receive returns them as the third value alongside a "timeout" error,
--- and next_record deliberately polls with a sub-second socket timeout, so a
--- frame that straddles the poll window is the normal case, not an edge one.
--- Dropping the partial desynced the stream permanently — every later read
--- then parsed record payload bytes as a frame header. Stash the partial in
--- self.rx_partial and resume from it on the next call. (The reactor path
--- already accumulates inside read_exact.)
 function Client:_read_bytes(n)
     if self.closed then return nil, "closed" end
 
@@ -252,10 +198,6 @@ function Client:_read_bytes(n)
     return buf, nil
 end
 
--- Frame reads are resumable for the same reason: a timeout between the length
--- prefix and the body would otherwise make the next call re-read 4 bytes from
--- the middle of the body. rx_frame_len remembers which half we're waiting on,
--- so _read_bytes's partial buffer always belongs to the read in progress.
 function Client:_read_frame()
     if not self.rx_frame_len then
         local len_bytes, err = self:_read_bytes(4)
@@ -271,42 +213,40 @@ function Client:_read_frame()
     self.rx_frame_len = nil
     return proto.parse_frame(body)
 end
- 
--- Reads frames until one matches `target_correl`. Heartbeat requests
--- get replied inline (so a long fetch keeps the connection alive).
--- Push RECORD frames (correl == uuid.ZERO) are passed to push_handler
--- if registered, dropped otherwise.
+
 function Client:_read_until(target_correl)
     while true do
         local op, c, payload, err = self:_read_frame()
         if not op then return nil, nil, nil, err end
- 
+
         if op == proto.OP_HEARTBEAT_REQ then
             self:_write(proto.encode_heartbeat_resp(c))
         elseif op == proto.OP_HEARTBEAT_RESP then
-            -- Server responding to a probe we didn't send; ignore.
         elseif c == target_correl then
             return op, c, payload, nil
         elseif c == uuid.ZERO and op == proto.OP_RECORD and self.push_handler then
             local rec = self:_decode_record(payload)
             if rec then self.push_handler(rec) end
         end
-        -- Anything else (stray correl IDs, unexpected ops) — drop and continue.
     end
 end
 
--- SCRAM-SHA-256 handshake, client half (RFC 5802; see src/server/scram.lua).
--- Returns nil on success, or an error string.
---
--- The password never leaves this function: what goes on the wire is a proof
--- computed from it. The PBKDF2 derivation happens HERE, which is the other
--- half of the point — the broker runs one event loop for every connection, and
--- a password login makes it do the expensive part on that thread.
---
--- The server-final signature is verified before returning. Skipping that check
--- would authenticate this client to the server without authenticating the
--- server to this client, which on a plaintext connection is most of what an
--- attacker in the middle would want.
+function Client:_call(encode, expect_op, expect_name)
+    local correl = uuid.bytes()
+    local ok, err = self:_write(encode(correl))
+    if not ok then return nil, err end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return nil, rerr end
+    if op == proto.OP_ERROR then
+        return nil, (proto.decode_error(payload) or { message = "?" }).message
+    end
+    if expect_op and op ~= expect_op then
+        return nil, string.format("expected %s, got 0x%02x", expect_name, op)
+    end
+    return payload or "", op
+end
+
 function Client:_auth_scram(username, password)
     local client_nonce = scram.nonce(rng.bytes)
     local client_first, client_first_bare = scram.client_first(username, client_nonce)
@@ -387,12 +327,6 @@ function Client:produce(topic, key, value)
     local seq_used
 
     if self.pid then
-        -- Idempotent path: include PID + per-topic monotonic sequence.
-        -- The broker memoizes (PID, topic, seq) → (partition, offset),
-        -- so a retry with the same seq returns the original ack
-        -- without re-appending. On error we DON'T bump next_seq —
-        -- the caller can retry with the same seq for at-most-once
-        -- delivery. On success we commit the bump.
         seq_used = self.next_seq[topic] or 0
         frame = proto.encode_produce_idempotent(
             correl, self.pid, seq_used, topic, key, value,
@@ -412,26 +346,11 @@ function Client:produce(topic, key, value)
     end
     local partition, offset = string.unpack(">I4I8", payload)
     if seq_used ~= nil then
-        -- Only advance after a confirmed success; failures leave the
-        -- seq slot unused so a retry replays the same sequence number.
         self.next_seq[topic] = seq_used + 1
     end
     return { partition = partition, offset = offset, seq = seq_used }
 end
 
--- produce_batch sends many records to one topic in a single frame and gets
--- back one ack frame. Records is a list of { key = , value = } (key optional,
--- defaults to ""); a plain list of strings is also accepted and treated as
--- values with empty keys.
---
--- Returns (acks, err). `acks` is a list of { partition, offset, seq } aligned
--- with the FIRST #acks entries of `records` — a batch that fails part-way
--- through still durably appended that prefix, so the caller resends only the
--- tail. On an idempotent client the sequence counter advances by #acks, which
--- is what makes that resend land as fresh records rather than a duplicate.
---
--- A batch is NOT atomic: it is N appends that share a frame, a dispatch, and
--- one fsync per partition. Wrap it in a transaction if you need all-or-nothing.
 function Client:produce_batch(topic, records)
     assert(type(topic) == "string", "topic must be a string")
     assert(type(records) == "table" and #records > 0,
@@ -475,8 +394,6 @@ function Client:produce_batch(topic, records)
 
     if base_seq ~= nil then
         for i = 1, #res.acks do res.acks[i].seq = base_seq + i - 1 end
-        -- Advance by what actually landed. A failed tail leaves its sequence
-        -- numbers unused, so resending it is a fresh append, not a retry.
         self.next_seq[topic] = base_seq + #res.acks
     end
 
@@ -487,9 +404,6 @@ function Client:produce_batch(topic, records)
     return res.acks, nil
 end
 
--- Inject a duplicate (PID, topic, seq) into the next produce — testing
--- helper that bypasses the next_seq counter, used by the example below
--- to demonstrate broker-side dedup.
 function Client:produce_at_seq(topic, key, value, seq)
     assert(self.pid, "produce_at_seq requires an idempotent client")
     assert(type(seq) == "number" and seq >= 0, "seq must be a non-negative number")
@@ -509,11 +423,6 @@ function Client:produce_at_seq(topic, key, value, seq)
     return { partition = partition, offset = offset, seq = seq }
 end
 
--- fetch pulls up to max_records records, spread across the partitions this
--- client reads. By default it asks the broker for a batched reply (all records
--- in one RECORD_BATCH frame instead of one frame each); a broker that predates
--- batching ignores the request and answers with the per-record stream, which
--- the loop below still handles. Pass batched = false to force the legacy shape.
 function Client:fetch(topic, group, max_records, batched)
     max_records = max_records or 100
     if batched == nil then batched = true end
@@ -551,7 +460,7 @@ function Client:subscribe(topic, group)
     local ok, err = self:_write(
         proto.encode_subscribe(correl, topic, group, self.isolation))
     if not ok then return nil, err end
- 
+
     local op, _, payload, rerr = self:_read_until(correl)
     if not op then return nil, rerr end
     if op == proto.OP_ERROR then
@@ -563,13 +472,9 @@ function Client:subscribe(topic, group)
     return true
 end
 
--- After subscribing, returns the next pushed record. Blocks until one
--- arrives or `timeout` (seconds) elapses. Pass nil for no timeout.
 function Client:next_record(timeout)
     local deadline = timeout and (socket.gettime() + timeout) or nil
 
-    -- Without the reactor, we poll the socket with short timeouts so we
-    -- can check the deadline. With the reactor, read_exact yields.
     local original_timeout = self.timeout
     if not self.reactor then
         self.sock:settimeout(timeout and math.min(0.1, timeout) or 0.1)
@@ -588,7 +493,6 @@ function Client:next_record(timeout)
         local op, c, payload, err = self:_read_frame()
         if not op then
             if err == "timeout" then
-                -- Loop and re-check deadline
             else
                 restore()
                 return nil, err
@@ -599,313 +503,137 @@ function Client:next_record(timeout)
             restore()
             return self:_decode_record(payload)
         end
-        -- Other frames ignored (heartbeat resps, etc.)
     end
 end
 
 function Client:commit(topic, partition, offset)
-    local correl = uuid.bytes()
-    local data = proto.encode_commit(correl, topic, partition, offset)
-    local ok, err = self:_write(data)
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_commit(correl, topic, partition, offset)
+    end)
+    if not payload then return nil, err end
     return true
 end
 
--- nack reports a processing failure for a record this connection consumed.
--- `offset` is the record's own offset as returned by fetch/next_record.
--- Returns ({ dead_lettered, attempts, dlq_topic? }, nil) or (nil, err):
--- dead_lettered=false means the broker rewound the group's offset and the
--- record will be redelivered; true means it was moved to dlq_topic and the
--- group has advanced past it (decode its value with Client.decode_dlq_value).
 function Client:nack(topic, partition, offset, reason)
     assert(type(topic) == "string", "topic must be a string")
-    local correl = uuid.bytes()
-    local ok, err = self:_write(
-        proto.encode_nack(correl, topic, partition, offset, reason))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_NACK_ACK then
-        return nil, string.format("expected NACK_ACK, got 0x%02x", op)
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_nack(correl, topic, partition, offset, reason)
+    end, proto.OP_NACK_ACK, "NACK_ACK")
+    if not payload then return nil, err end
     return proto.decode_nack_ack(payload)
 end
 
--- decode_dlq_value unwraps the value of a record consumed from a dead-letter
--- topic into { topic, partition, offset, timestamp, group, attempts, reason,
--- value } — the original value plus the provenance of the failure. Call with
--- a dot (Client.decode_dlq_value(rec.value)), it takes no self.
 Client.decode_dlq_value = dlq_env.decode
 
 function Client:create_topic(name, num_partitions)
-    local correl = uuid.bytes()
-    local ok, err = self:_write(
-        proto.encode_create_topic(correl, name, num_partitions))
-    if not ok then return nil, err end
- 
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_create_topic(correl, name, num_partitions)
+    end)
+    if not payload then return nil, err end
     return true
 end
 
 function Client:list_topics()
-    local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_list_topics(correl))
-    if not ok then return nil, err end
- 
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(proto.encode_list_topics)
+    if not payload then return nil, err end
     return proto.decode_topic_list(payload)
 end
 
--- list_offsets returns the readable offset range of every partition of
--- `topic`, in partition order:
---
---   { { partition = 1, earliest = 0, latest = 42,
---       high_watermark = 42, lso = 42,
---       hwm_exact = true, lso_known = true, leader = true }, ... }
---
--- `latest` is the offset the next append gets, so a consumer sitting at
--- `committed` is (latest - committed) records behind and an empty partition
--- reports earliest == latest. Under read_committed measure against `lso`
--- instead: that is the ceiling the broker will actually deliver up to, so
--- `latest` would count records no consumer can reach yet as lag.
---
--- `earliest` is not always 0 — retention and compaction move it forward, and
--- a consumer whose committed offset has fallen below it has been lapped.
 function Client:list_offsets(topic)
     assert(type(topic) == "string", "topic must be a string")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_list_offsets(correl, topic))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_OFFSETS then
-        return nil, string.format("expected OFFSETS, got 0x%02x", op)
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_list_offsets(correl, topic)
+    end, proto.OP_OFFSETS, "OFFSETS")
+    if not payload then return nil, err end
     return proto.decode_offsets(payload)
 end
 
--- offsets_for_times resolves, for every partition of `topic`, the earliest
--- offset whose record timestamp is >= `timestamp_ms` (Kafka's offsetForTimes).
--- Returns, in partition order:
---
---   { { partition = 1, offset = 17, found = true }, ... }
---
--- `found = false` means no record qualifies -- the partition is empty, or the
--- timestamp is past everything written so far -- and `offset` is then the
--- partition's `latest`, i.e. where the first qualifying record will land. That
--- makes "seek to 09:00 and follow" work on a quiet partition without a
--- special case: you seek to the end and wait.
---
--- This is a log walk, not a counter read (see encode_list_offsets), so treat
--- it as a seek primitive rather than something to call per poll.
 function Client:offsets_for_times(topic, timestamp_ms)
     assert(type(topic) == "string", "topic must be a string")
     assert(math.type(timestamp_ms) == "integer" and timestamp_ms >= 0,
         "timestamp_ms must be a non-negative integer (milliseconds)")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(
-        proto.encode_list_offsets(correl, topic, timestamp_ms))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_OFFSETS then
-        return nil, string.format("expected OFFSETS, got 0x%02x", op)
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_list_offsets(correl, topic, timestamp_ms)
+    end, proto.OP_OFFSETS, "OFFSETS")
+    if not payload then return nil, err end
 
     local entries, derr = proto.decode_offsets(payload)
     if not entries then return nil, derr end
     if not entries.for_times then
-        -- The broker answered with bounds only, which means it predates
-        -- offset-for-timestamp. Say so plainly rather than returning an empty
-        -- list that reads like "no partition has data after that time".
         return nil, "broker does not support offset-for-timestamp"
     end
     return entries.for_times
 end
 
--- delete_topic removes `name` and its log from the broker, along with the
--- committed offsets and live group subscriptions that referenced it. There is
--- no undo and no confirmation step -- the data is gone when this returns.
 function Client:delete_topic(name)
     assert(type(name) == "string", "name must be a string")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_delete_topic(correl, name))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_delete_topic(correl, name)
+    end)
+    if not payload then return nil, err end
     return true
 end
 
--- describe_topic returns { name, num_partitions, config } where `config` maps
--- the keys actually set on the topic to their values AS STRINGS (the sidecar
--- mixes numbers and strings; see encode_topic_description). A key absent from
--- `config` is at the partition default, which is not the same as being set to
--- whatever that default currently happens to be.
 function Client:describe_topic(name)
     assert(type(name) == "string", "name must be a string")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_describe_topic(correl, name))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_TOPIC_DESCRIPTION then
-        return nil, string.format("expected TOPIC_DESCRIPTION, got 0x%02x", op)
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_describe_topic(correl, name)
+    end, proto.OP_TOPIC_DESCRIPTION, "TOPIC_DESCRIPTION")
+    if not payload then return nil, err end
     return proto.decode_topic_description(payload)
 end
 
--- alter_topic_config merges `config` (a { key = value } table) into the
--- topic's persisted settings. Recognised keys: max_segment_size, retention,
--- cleaner_interval, max_log_bytes, cleanup_policy. `backend` is immutable --
--- it decides the on-disk format, so changing it on a topic with data would
--- mean reinterpreting existing segments.
---
--- retention and cleaner_interval are in SECONDS, sizes in BYTES. Changes to
--- max_segment_size / retention / cleaner_interval take effect immediately on
--- open partitions; the rest apply the next time the topic is opened.
 function Client:alter_topic_config(name, config)
     assert(type(name) == "string", "name must be a string")
     assert(type(config) == "table", "config must be a table")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(
-        proto.encode_alter_topic_config(correl, name, config))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_alter_topic_config(correl, name, config)
+    end)
+    if not payload then return nil, err end
     return true
 end
 
--- list_groups returns { { group_id, state, member_count }, ... } sorted by id.
--- A group with committed offsets but no live members is reported with state
--- "empty" and zero members -- that is what an abandoned consumer group looks
--- like, and it is usually why you are calling this.
 function Client:list_groups()
-    local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_list_groups(correl))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_GROUP_LIST then
-        return nil, string.format("expected GROUP_LIST, got 0x%02x", op)
-    end
+    local payload, err = self:_call(proto.encode_list_groups,
+        proto.OP_GROUP_LIST, "GROUP_LIST")
+    if not payload then return nil, err end
     return proto.decode_group_list(payload)
 end
 
--- describe_group returns
---   { group_id, state,
---     members = { { member_id, assignment = { [topic] = {ids} } }, ... },
---     offsets = { { topic, partition, offset }, ... } }
---
--- `offsets` is the group's DURABLE committed position, independent of
--- membership. Pair it with :list_offsets to compute lag:
---   lag = latest - committed   (or lso - committed under read_committed).
 function Client:describe_group(group_id)
     assert(type(group_id) == "string", "group_id must be a string")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_describe_group(correl, group_id))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_GROUP_DESCRIPTION then
-        return nil, string.format("expected GROUP_DESCRIPTION, got 0x%02x", op)
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_describe_group(correl, group_id)
+    end, proto.OP_GROUP_DESCRIPTION, "GROUP_DESCRIPTION")
+    if not payload then return nil, err end
     return proto.decode_group_description(payload)
 end
 
--- delete_group removes a group and tombstones its committed offsets. Fails
--- with ERR_GROUP_NOT_EMPTY while the group still has live members: make the
--- consumers leave first, or the next commit from a surviving member would
--- immediately recreate what this deleted.
 function Client:delete_group(group_id)
     assert(type(group_id) == "string", "group_id must be a string")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(proto.encode_delete_group(correl, group_id))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_delete_group(correl, group_id)
+    end)
+    if not payload then return nil, err end
     return true
 end
 
--- join_group registers this client as a member of `group_id` subscribing to
--- `topics` (a topic name or array of names) and returns the broker's
--- assignment: { member_id = "...", assignment = { [topic] = { part_id, ... } } }.
--- Pass member_id to rejoin under a known identity; omit it on first join and
--- the broker assigns one (remembered on the client for heartbeat/leave).
 function Client:join_group(group_id, topics, member_id)
     assert(type(group_id) == "string", "group_id must be a string")
     if type(topics) == "string" then topics = { topics } end
     assert(type(topics) == "table" and #topics > 0, "topics must be a non-empty list")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(
-        proto.encode_join_group(correl, group_id, member_id or "", topics))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_GROUP_ASSIGNMENT then
-        return nil, string.format("expected GROUP_ASSIGNMENT, got 0x%02x", op)
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_join_group(correl, group_id, member_id or "", topics)
+    end, proto.OP_GROUP_ASSIGNMENT, "GROUP_ASSIGNMENT")
+    if not payload then return nil, err end
 
     local res, derr = proto.decode_group_assignment(payload)
     if not res then return nil, "decode assignment: " .. tostring(derr) end
@@ -914,89 +642,62 @@ function Client:join_group(group_id, topics, member_id)
     return res
 end
 
--- group_heartbeat renews this member's lease. Returns (true, nil), or
--- (nil, err) — notably when the broker has reaped the member, in which case
--- the caller should join_group again. Defaults to the joined group/member.
 function Client:group_heartbeat(group_id, member_id)
     group_id  = group_id  or self.group_id
     member_id = member_id or self.member_id
     assert(group_id and member_id, "not a member of any group (call join_group first)")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(
-        proto.encode_group_heartbeat(correl, group_id, member_id))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_group_heartbeat(correl, group_id, member_id)
+    end)
+    if not payload then return nil, err end
     return true
 end
 
--- leave_group departs the group. Returns (true, nil) or (nil, err).
 function Client:leave_group(group_id, member_id)
     group_id  = group_id  or self.group_id
     member_id = member_id or self.member_id
     assert(group_id and member_id, "not a member of any group (call join_group first)")
 
-    local correl = uuid.bytes()
-    local ok, err = self:_write(
-        proto.encode_leave_group(correl, group_id, member_id))
-    if not ok then return nil, err end
-
-    local op, _, payload, rerr = self:_read_until(correl)
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
+    local payload, err = self:_call(function(correl)
+        return proto.encode_leave_group(correl, group_id, member_id)
+    end)
+    if not payload then return nil, err end
     self.group_id  = nil
     self.member_id = nil
     return true
 end
 
--- ---- Transactions ---------------------------------------------------------
--- These require a client opened with a producer_name (durable producer); the
--- broker fences on its pid+epoch. A typical flow:
---   c:begin_transaction()
---   c:produce("out", k, v)                       -- transactional produce
---   c:send_offsets_to_transaction("g", { {topic="in", partition=1, offset=42} })
---   c:commit_transaction()                       -- or c:abort_transaction()
 
-local function _txn_expect_ok(c, frame)
-    local ok, err = c:_write(frame)
-    if not ok then return nil, err end
-    local op, _, payload, rerr = c:_read_until(select(2, proto.parse_frame(frame:sub(5))))
-    if not op then return nil, rerr end
-    if op == proto.OP_ERROR then
-        return nil, (proto.decode_error(payload) or { message = "?" }).message
-    end
-    if op ~= proto.OP_OK then
-        return nil, string.format("expected OK, got 0x%02x", op)
-    end
+local function _txn_expect_ok(c, encode)
+    local payload, err = c:_call(encode, proto.OP_OK, "OK")
+    if not payload then return nil, err end
     return true
 end
 
 function Client:begin_transaction()
     assert(self.producer_name, "transactions require a producer_name client")
-    return _txn_expect_ok(self, proto.encode_begin_txn(uuid.bytes()))
+    return _txn_expect_ok(self, proto.encode_begin_txn)
 end
 
 function Client:commit_transaction()
-    return _txn_expect_ok(self, proto.encode_end_txn(uuid.bytes(), true))
+    return _txn_expect_ok(self, function(correl)
+        return proto.encode_end_txn(correl, true)
+    end)
 end
 
 function Client:abort_transaction()
-    return _txn_expect_ok(self, proto.encode_end_txn(uuid.bytes(), false))
+    return _txn_expect_ok(self, function(correl)
+        return proto.encode_end_txn(correl, false)
+    end)
 end
 
--- offsets is a list of { topic=, partition=, offset= }.
 function Client:send_offsets_to_transaction(group, offsets)
     assert(type(group) == "string", "group must be a string")
     assert(type(offsets) == "table", "offsets must be a list")
-    return _txn_expect_ok(self,
-        proto.encode_txn_offset_commit(uuid.bytes(), group, offsets))
+    return _txn_expect_ok(self, function(correl)
+        return proto.encode_txn_offset_commit(correl, group, offsets)
+    end)
 end
 
 function Client:close()
@@ -1007,6 +708,6 @@ function Client:close()
         self.sock:close()
     end)
 end
- 
+
 
 return Client

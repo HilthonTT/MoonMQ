@@ -1,35 +1,3 @@
--- The user store: every principal the broker will accept, with its
--- credential, its ACL, and its quota.
---
--- Before this, `Auth` held exactly one username and one hash, and the answer
--- to "which tenants share this broker" was "one, or everybody pretending to
--- be it". A store turns the broker multi-tenant: N users, each with its own
--- credential and its own authority.
---
--- Config shape (appsettings.json):
---
---     "Auth": {
---       "Users": [
---         { "Username": "orders-svc",
---           "PasswordHash": "scram-sha-256$600000$...",
---           "Acls": [ { "Resource": "topic", "Name": "orders.*",
---                       "Operations": ["read","write","describe"] },
---                     { "Resource": "group", "Name": "orders-*",
---                       "Operations": ["read","describe"] } ],
---           "Quota": { "ProduceRecordsPerSec": 5000 } },
---         { "Username": "admin", "PasswordHash": "...", "Superuser": true }
---       ]
---     }
---
--- The single-user form (`Auth.Username` + `Auth.PasswordHash`) still works and
--- still means what it always meant — one superuser — so an existing config
--- keeps behaving identically after upgrading.
---
--- Everything is validated at load: a bad ACL rule, an unparseable credential,
--- a duplicate username, or an unknown quota key stops the broker at boot with
--- the offending entry named. Security config that fails open because of a
--- typo is the failure mode this is written to prevent.
-
 local acl_m   = require("src.server.acl")
 local quota_m = require("src.server.quota")
 local auth_m  = require("src.server.auth")
@@ -41,9 +9,6 @@ local Store = {}
 Store.__index = Store
 
 local function build_user(spec, index)
-    -- Type-check BEFORE indexing: a Users list holding a bare number would
-    -- otherwise raise "attempt to index a number value" out of a config
-    -- validator, which is a stack trace where an error message belongs.
     if type(spec) ~= "table" then
         return nil, string.format("user #%d: entry must be an object", index)
     end
@@ -55,9 +20,6 @@ local function build_user(spec, index)
     if type(username) ~= "string" or username == "" then
         return nil, string.format("%s: Username is required", where)
     end
-    -- The SCRAM grammar gives "," and "=" a meaning inside the username field
-    -- (they are escaped on the wire); a NUL would truncate comparisons. Reject
-    -- control characters outright rather than discovering them mid-handshake.
     if username:find("[%c]") then
         return nil, string.format("%s: Username contains control characters", where)
     end
@@ -71,9 +33,6 @@ local function build_user(spec, index)
             return nil, string.format(
                 "%s: PasswordHash (or Password) is required", where)
         end
-        -- Hashing at boot costs one derivation per plaintext user. It is the
-        -- documented convenience path; the warning is what nudges operators to
-        -- the hashed form before the user list gets long.
         log:warn("hashing plaintext password for %q on startup. Generate a "
             .. "stored credential instead: lua bin/moonmq-hash.lua <password> --scram",
             username)
@@ -113,16 +72,11 @@ local function build_user(spec, index)
     }, nil
 end
 
--- Build a store from the `Auth` config block. Returns (store, nil) or
--- (nil, err). A config with neither Users nor Username yields (nil, nil):
--- no store, which the caller reads as "broker is OPEN" exactly as before.
 function M.load(auth_cfg)
     if type(auth_cfg) ~= "table" then return nil, nil end
 
     local specs = {}
 
-    -- Legacy single-user form first, so an explicit Users entry for the same
-    -- name is a duplicate-name error rather than a silent shadowing.
     if type(auth_cfg.Username) == "string" and auth_cfg.Username ~= "" then
         local has_credential = (auth_cfg.PasswordHash and auth_cfg.PasswordHash ~= "")
                             or (auth_cfg.Password and auth_cfg.Password ~= "")
@@ -131,10 +85,6 @@ function M.load(auth_cfg)
                 Username     = auth_cfg.Username,
                 PasswordHash = auth_cfg.PasswordHash,
                 Password     = auth_cfg.Password,
-                -- The historical contract: the configured account may do
-                -- anything. Narrowing it on upgrade would break deployments
-                -- silently, which is worse than a permissive default that the
-                -- operator can now tighten explicitly.
                 Superuser    = auth_cfg.Superuser ~= false,
                 Acls         = auth_cfg.Acls,
                 Quota        = auth_cfg.Quota,
@@ -164,9 +114,6 @@ function M.load(auth_cfg)
     end
     table.sort(names)
 
-    -- A user that can authenticate but is authorized for nothing is almost
-    -- always a forgotten Acls block. Default-deny means it fails on its first
-    -- request with a puzzling error; say so at boot, where it is fixable.
     for _, name in ipairs(names) do
         local user = by_name[name]
         if not user.superuser and user.acl:is_empty() then
@@ -202,9 +149,6 @@ function Store:names_sorted()
     return self.names
 end
 
--- Per-user quota specs, in the shape src/server/quota.lua wants. Kept here so
--- the quota manager is built from the same parsed config as the ACLs and
--- cannot drift from it.
 function Store:quota_specs()
     local out = {}
     for _, name in ipairs(self.names) do
@@ -214,9 +158,6 @@ function Store:quota_specs()
     return out
 end
 
--- One line per user for the boot log: who exists, what they may do, and
--- whether the credential is the SCRAM-capable kind. Never includes the
--- credential itself.
 function Store:describe()
     local out = {}
     for _, name in ipairs(self.names) do

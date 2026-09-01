@@ -1,11 +1,3 @@
--- Self-contained pure-Lua SHA-256 + HMAC for Lua 5.4.
--- Provides exactly the surface src/server/auth.lua expects:
---   sha2.sha256(msg)            -> lowercase hex digest
---   sha2.hmac(hashfn, key, msg) -> lowercase hex digest
---   sha2.hex_to_bin(hex)        -> binary string
---   sha2.bin_to_hex(bin)        -> lowercase hex string
--- No LuaRocks / C dependency; uses native 5.4 bitwise ops and string.pack.
-
 local M = {}
 
 local MASK = 0xFFFFFFFF
@@ -101,8 +93,6 @@ function M.sha256(msg)
     return M.bin_to_hex(sha256_bin(msg))
 end
 
--- hashfn must return a hex digest (M.sha256 does). HMAC block size is 64
--- bytes for SHA-256.
 function M.hmac(hashfn, key, msg)
     local blocksize = 64
     if #key > blocksize then

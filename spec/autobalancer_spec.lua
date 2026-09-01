@@ -8,8 +8,6 @@ local Topic         = require("src.storage.topic")
 
 local MB = 1024 * 1024
 
--- Build a topic-per-replica helper: each replica is partition 1 of its own
--- topic, which keeps keys unique and lets us hand real Topic objects to Action.
 local function topic(name) return Topic.new(name) end
 
 describe("autobalancer sample layer", function()
@@ -29,10 +27,9 @@ describe("autobalancer sample layer", function()
         assert.is_false(w:is_trusted())
         w:append(1); w:append(2)
         assert.is_true(w:is_trusted())
-        w:append(3); w:append(4)  -- evicts the 1
+        w:append(3); w:append(4)
         assert.are.equal(3, w:size())
         assert.are.equal(4, w:latest())
-        -- window is {2,3,4}; p0 == min == 2
         assert.are.equal(2, w:snapshot():percentile(0))
     end)
 end)
@@ -143,16 +140,15 @@ describe("network-in goal", function()
 
     it("ignores untrusted (too few samples) replicas", function()
         local ab = Autobalancer.new({
-            emit_metrics = false, min_valid = 5,   -- need 5 samples to trust
+            emit_metrics = false, min_valid = 5,
             goals = { network_out = false, disk = false, partition_count = false },
         })
         ab.model:register_broker("b1"); ab.model:register_broker("b2")
         for i = 1, 4 do
             local t = topic("new" .. i)
             ab.model:register_replica("b1", t, 1)
-            ab.model:update_replica_load("b1", t.name, 1, Resource.NW_IN, 2 * MB) -- 1 sample
+            ab.model:update_replica_load("b1", t.name, 1, Resource.NW_IN, 2 * MB)
         end
-        -- Loads still aggregate, but no replica is trusted, so no moves.
         assert.are.equal(0, #ab:detect())
     end)
 end)

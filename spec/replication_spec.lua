@@ -1,7 +1,5 @@
 local Replicator = require("src.server.replicator")
 
--- A mock follower client. `leo` is the log-end offset it reports back per send
--- (a number, or nil to simulate an error with `err`).
 local function mock(leo, err)
     return {
         sent = 0,
@@ -27,7 +25,7 @@ describe("Replicator", function()
 
     it("ships records and advances a follower's LEO (sync drain)", function()
         local c = mock(100)
-        local r = Replicator.new(nil, 1, followers(c))   -- nil reactor → sync drain
+        local r = Replicator.new(nil, 1, followers(c))
         r:replicate("t", 1, 100, "record-bytes")
         assert.are.equal(1, c.sent)
         assert.is_true(r:all_reached("t", 1, 100))
@@ -46,7 +44,7 @@ describe("Replicator", function()
 
     it("drops a lagging follower out of the in-sync set", function()
         local r = Replicator.new(nil, 1, followers(mock(50)), { lag_max = 0 })
-        r:replicate("t", 1, 100, "x")   -- leader LEO 100, follower only reached 50
+        r:replicate("t", 1, 100, "x")
         assert.are.equal(0, r:in_sync_count("t", 1))
         assert.is_nil(r:high_watermark("t", 1), "no in-sync followers → no HWM")
     end)
@@ -66,19 +64,17 @@ describe("Replicator", function()
 
     it("wait_for returns true once every follower has the record", function()
         local r = Replicator.new(nil, 1, followers(mock(100)))
-        r:replicate("t", 1, 100, "x")          -- sync drain sets last_leo = 100
-        r.reactor = { sleep = function() end }  -- wait_for only needs :sleep
+        r:replicate("t", 1, 100, "x")
+        r.reactor = { sleep = function() end }
         assert.is_true(r:wait_for("t", 1, 100))
     end)
 
     it("wait_for times out when a follower never acks", function()
         local r = Replicator.new({ sleep = function() end }, 1,
             followers(mock(0)), { ack_timeout = 1 })
-        -- Deterministic clock: each read advances 0.6s, so the 1s deadline
-        -- passes after two iterations without a real wall-clock wait.
         local t = 0
         r._now_override = function() t = t + 0.6; return t end
-        local ok, err = r:wait_for("t", 1, 100)  -- no follower ever reaches 100
+        local ok, err = r:wait_for("t", 1, 100)
         assert.is_nil(ok)
         assert.matches("timed out", err)
     end)

@@ -1,6 +1,5 @@
 local Lexer = require("src.repl.sql.lexer")
 
--- Collect (kind, value) pairs, dropping the trailing eof for brevity.
 local function kinds(src)
     local toks = assert(Lexer.tokenize(src))
     local out = {}
@@ -15,7 +14,6 @@ describe("sql lexer", function()
         local toks = kinds("CREATE Topic OrDeRs")
         assert.same({ "keyword", "create" }, toks[1])
         assert.same({ "keyword", "topic" }, toks[2])
-        -- Identifiers are topic/group names — case is significant, kept as typed.
         assert.same({ "ident", "OrDeRs" }, toks[3])
     end)
 

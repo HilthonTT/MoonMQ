@@ -1,12 +1,3 @@
--- Standalone Lua 5.4 smoke test for the persisted-config + timestamp-index
--- storage slice. Bypasses busted (the launcher on this box only ships for
--- 5.1; our code uses 5.3+ features) so we can verify against the real
--- runtime the broker uses.
---
--- Run with:  lua5.4 spec/storage_smoke.lua
---
--- Exit code 0 on all-pass, 1 on first failure (with a short trace).
-
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local fs_m              = require("src.io.fs")
@@ -30,7 +21,6 @@ local function rmtree(p)
     end
 end
 
--- Tiny test harness so output reads sensibly.
 local failures = 0
 local function check(cond, msg)
     if not cond then
@@ -45,7 +35,6 @@ local function section(name)
     io.stdout:write("\n== " .. name .. " ==\n")
 end
 
--- ---------------------------------------------------------------------------
 section("topic_config round-trip")
 
 rmtree(BASE)
@@ -68,14 +57,12 @@ if loaded then
     check(loaded.cleaner_interval == 5, "cleaner_interval round-trips")
 end
 
--- Missing sidecar → empty opts, no error.
 local dir2 = fs_m.join_path(BASE, "t2")
 fs_m.mkdir(dir2)
 local empty, eerr = topic_config.load(dir2)
 check(empty ~= nil and next(empty) == nil and eerr == nil,
     "missing sidecar yields empty opts, no err")
 
--- Malformed sidecar → error.
 local dir3 = fs_m.join_path(BASE, "t3")
 fs_m.mkdir(dir3)
 local mf = io.open(fs_m.join_path(dir3, "topic.config"), "wb")
@@ -84,7 +71,6 @@ mf:close()
 local bad, berr = topic_config.load(dir3)
 check(bad == nil and berr ~= nil, "malformed sidecar surfaces err")
 
--- Unknown keys ignored.
 local dir4 = fs_m.join_path(BASE, "t4")
 fs_m.mkdir(dir4)
 local uf = io.open(fs_m.join_path(dir4, "topic.config"), "wb")
@@ -94,7 +80,6 @@ local fwd, fwd_err = topic_config.load(dir4)
 check(fwd ~= nil and fwd.max_segment_size == 4096 and fwd.future_key == nil,
     "unknown key ignored; err=" .. tostring(fwd_err))
 
--- ---------------------------------------------------------------------------
 section("Broker restart preserves per-topic config")
 
 rmtree(BASE)
@@ -102,18 +87,16 @@ local b1, b1err = broker_m.Broker.new(BASE)
 check(b1 ~= nil, "broker created; err=" .. tostring(b1err))
 
 local _, cerr = b1:create_topic("orders", 2, {
-    max_segment_size = 256,   -- tiny — forces roll on a few messages
+    max_segment_size = 256,
     retention        = 3600,
     cleaner_interval = 600,
 })
 check(cerr == nil, "create_topic with opts; err=" .. tostring(cerr))
 
--- Sidecar landed on disk.
 local sidecar = io.open(fs_m.join_path(BASE, "orders/topic.config"), "rb")
 check(sidecar ~= nil, "topic.config exists on disk")
 if sidecar then sidecar:close() end
 
--- Write enough to roll segment 0.
 local topic_obj = b1.topic_manager.topics["orders"]
 local p1 = topic_obj.partitions[1]
 for i = 1, 10 do
@@ -123,12 +106,10 @@ end
 check(#p1.segments >= 2,
     "tiny max_segment_size rolled active segment (segments=" .. #p1.segments .. ")")
 
--- Close the broker properly so .clean-shutdown gets written.
 for _, t in pairs(b1.topic_manager.topics) do
     for _, p in ipairs(t.partitions) do p:close() end
 end
 
--- Reopen and verify the config came back.
 local b2, b2err = broker_m.Broker.new(BASE)
 check(b2 ~= nil, "broker reopened; err=" .. tostring(b2err))
 local p_reloaded = b2.topic_manager.topics["orders"].partitions[1]
@@ -141,16 +122,14 @@ for _, t in pairs(b2.topic_manager.topics) do
     for _, p in ipairs(t.partitions) do p:close() end
 end
 
--- ---------------------------------------------------------------------------
 section("Broker handles a topic with NO sidecar (upgrade path)")
 
 rmtree(BASE)
 local b3 = broker_m.Broker.new(BASE)
-b3:create_topic("legacy", 1)  -- no opts → no sidecar written
+b3:create_topic("legacy", 1)
 local no_sidecar = io.open(fs_m.join_path(BASE, "legacy/topic.config"), "rb")
 check(no_sidecar == nil, "no sidecar written when opts omitted")
 
--- Write a message so the partition has on-disk state.
 local lp = b3.topic_manager.topics["legacy"].partitions[1]
 lp:write_message(message.Message.new("k", "v", 42))
 for _, t in pairs(b3.topic_manager.topics) do
@@ -167,7 +146,6 @@ for _, t in pairs(b4.topic_manager.topics) do
     for _, p in ipairs(t.partitions) do p:close() end
 end
 
--- ---------------------------------------------------------------------------
 section("Timestamp index writes entries")
 
 rmtree(BASE)
@@ -176,7 +154,6 @@ local td = fs_m.join_path(BASE, "tsidx")
 fs_m.mkdir(td)
 local topic = Topic.new("tsidx")
 local p, perr = SegmentedPartition.new(topic, 1, td, {
-    -- Force an index entry on every message: interval = 1 byte.
     index_interval_bytes = 1,
 })
 check(p ~= nil, "partition opened; err=" .. tostring(perr))
@@ -199,37 +176,30 @@ if f then
         "5 entries x 12 bytes = " .. (5*12) .. ", got " .. #body)
 end
 
--- ---------------------------------------------------------------------------
 section("offset_for_timestamp edge cases")
 
--- Use the same partition. Timestamps are 1010, 1020, 1030, 1040, 1050.
 
--- Exact match.
 local hit_exact = p:offset_for_timestamp(1030)
 check(hit_exact == offsets[3],
     "exact match: expected offsets[3]=" .. offsets[3] ..
     " got " .. tostring(hit_exact))
 
--- Between entries — should return the earliest message with ts >= target.
 local hit_between = p:offset_for_timestamp(1025)
 check(hit_between == offsets[3],
     "between 1020 and 1030: expected offsets[3]=" .. offsets[3] ..
     " got " .. tostring(hit_between))
 
--- Before first → first offset.
 local hit_before = p:offset_for_timestamp(0)
 check(hit_before == offsets[1],
     "before-first: expected offsets[1]=" .. offsets[1] ..
     " got " .. tostring(hit_before))
 
--- After last → nil.
 local hit_after = p:offset_for_timestamp(9999)
 check(hit_after == nil,
     "after-last: expected nil, got " .. tostring(hit_after))
 
 p:close()
 
--- ---------------------------------------------------------------------------
 section("Index survives segment roll")
 
 rmtree(BASE)
@@ -238,7 +208,7 @@ local td2 = fs_m.join_path(BASE, "roll")
 fs_m.mkdir(td2)
 local topic2 = Topic.new("roll")
 local pr, prerr = SegmentedPartition.new(topic2, 1, td2, {
-    max_segment_size     = 80,   -- forces roll every ~1 message
+    max_segment_size     = 80,
     index_interval_bytes = 1,
 })
 check(pr ~= nil, "partition opened; err=" .. tostring(prerr))
@@ -251,7 +221,6 @@ end
 check(#pr.segments >= 2,
     "rolled into multiple segments: " .. #pr.segments)
 
--- Lookup across segments.
 local across = pr:offset_for_timestamp(2030)
 check(across == roll_offsets[3],
     "cross-segment lookup: expected " .. roll_offsets[3] ..
@@ -259,6 +228,5 @@ check(across == roll_offsets[3],
 
 pr:close()
 
--- ---------------------------------------------------------------------------
 io.stdout:write(string.format("\nfailures: %d\n", failures))
 os.exit(failures == 0 and 0 or 1)
