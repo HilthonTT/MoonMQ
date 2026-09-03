@@ -379,6 +379,16 @@ function SegmentedPartition:_ensure_append_position()
     log:error("segment %020d: physical EOF %d != tracked %d "
         .. "(previous failed write left partial bytes); sealing and rolling",
         self.active_segment.base_offset, pos, self.active_segment.bytes_written)
+    -- Trim the torn bytes first. The roll seals this segment at
+    -- base + bytes_written; if the garbage stayed on disk, a clean shutdown
+    -- (which skips tail verification) would reopen the sealed segment at its
+    -- on-disk size and it would overlap the next segment's base offset.
+    local tok, terr = io_sync.truncate(self.active_segment.file,
+        self.active_segment.bytes_written)
+    if not tok then
+        return string.format("failed to trim torn tail before roll: %s",
+            tostring(terr))
+    end
     local rerr = self:_roll_now()
     if rerr then return rerr end
 
@@ -413,7 +423,11 @@ function SegmentedPartition:write_message(msg)
     if not ok then
         return nil, string.format("failed to write message: %s", werr)
     end
-    self.active_segment.file:flush()
+    -- file:write only fills the stdio buffer; ENOSPC and friends surface here.
+    local fok, ferr = self.active_segment.file:flush()
+    if not fok then
+        return nil, string.format("failed to flush message: %s", tostring(ferr))
+    end
 
     self.active_segment.bytes_written = self.active_segment.bytes_written + #bytes
     self.offset = self.offset + #bytes

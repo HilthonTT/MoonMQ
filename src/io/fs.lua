@@ -29,10 +29,14 @@ local has_bit, bit = pcall(require, "bit")
 local function join_path(...)
     local sep   = os_utils.IS_WINDOWS and "\\" or "/"
     local parts = {}
-    for _, p in ipairs({ ... }) do
-        p = p:gsub("[/\\]+$", "")
-        if p ~= "" then
-            parts[#parts+1] = p
+    for i, p in ipairs({ ... }) do
+        local stripped = p:gsub("[/\\]+$", "")
+        if stripped ~= "" then
+            parts[#parts+1] = stripped
+        elseif i == 1 and p ~= "" then
+            -- A bare root ("/" or "C:\" after stripping is non-empty, but
+            -- "/" alone is) must not silently turn the result relative.
+            parts[#parts+1] = ""
         end
     end
     return table.concat(parts, sep)

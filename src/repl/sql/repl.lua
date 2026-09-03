@@ -35,7 +35,7 @@ end
 local function print_help(topic, out)
     if topic then
         local entry = help[topic]
-        if not entry then
+        if type(entry) ~= "table" or not entry.usage then
             out(paint("yellow", "no help for '" .. topic .. "'") .. "\n")
             return
         end
@@ -123,11 +123,11 @@ function M.run(opts)
 
         local tokens, lerr = Lexer.tokenize(pending)
         if not tokens then
-            if lerr.message == "unterminated string literal" then
-            else
-                print_error(lerr, pending, out)
-                pending = ""
-            end
+            -- The lexer rejects a newline inside a quoted string, and the
+            -- newline is already in `pending`, so waiting for more input
+            -- can never succeed: report it and start over.
+            print_error(lerr, pending, out)
+            pending = ""
         else
             local semi = last_semicolon(tokens)
             if semi then

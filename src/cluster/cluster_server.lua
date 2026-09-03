@@ -94,7 +94,7 @@ function M:_append(topic_name, partition_id, payload, forwarded)
     local part = topic.partitions[partition_id]
     if not part then return 404, "append: no such partition" end
 
-    local pos, applied = 1, 0
+    local pos, applied, first_offset = 1, 0, nil
     while pos <= #payload do
         if #payload - pos + 1 < 8 then return 400, "append: short record header" end
         local total_size = string.unpack(">I8", payload, pos)
@@ -104,8 +104,9 @@ function M:_append(topic_name, partition_id, payload, forwarded)
         local msg, derr = msg_m.decode_body(payload:sub(pos + 8, pos + 7 + total_size))
         if not msg then return 400, "append: decode: " .. tostring(derr) end
 
-        local _, werr = part:write_message(msg)
+        local woff, werr = part:write_message(msg)
         if werr then return 500, "append: write: " .. tostring(werr) end
+        if first_offset == nil then first_offset = woff end
         if forwarded and self.broker.traffic then
             self.broker.traffic:add_in(topic_name, partition_id, #msg.key + #msg.value)
         end
@@ -113,11 +114,16 @@ function M:_append(topic_name, partition_id, payload, forwarded)
         pos = pos + 8 + total_size
     end
 
+    -- Capture the post-append LEO *before* request_sync: with a group
+    -- committer attached it yields, and other writers to this partition may
+    -- append in the meantime. The forwarder derives the acked record offset
+    -- from these values, so they must describe this batch only.
+    local leo = part.offset
     if applied > 0 and part.request_sync then
         local sok, serr = part:request_sync()
         if not sok then return 500, "append: sync: " .. tostring(serr) end
     end
-    return 200, { offset = part.offset, applied = applied }
+    return 200, { offset = leo, first_offset = first_offset, applied = applied }
 end
 
 function M:_leo(query)
@@ -138,6 +144,9 @@ function M:_owner(body)
         "topic", "string", "partition", "number", "owner", "string",
     })
     if not req then return 400, derr end
+    if req.partition < 1 or req.partition % 1 ~= 0 then
+        return 400, "owner: partition must be a positive integer"
+    end
     local ok, err = self.assignments:set_owner(req.topic, req.partition, req.owner)
     if not ok then return 500, "owner: " .. tostring(err) end
     log:info("ownership: %s/partition-%d -> %s", req.topic, req.partition, req.owner)

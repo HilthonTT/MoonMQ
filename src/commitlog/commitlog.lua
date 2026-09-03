@@ -197,6 +197,11 @@ function CommitLog:split()
     if cleaned then
         self.segments = cleaned
         self.active_segment = cleaned[#cleaned]
+    else
+        -- The cleaner rejected the whole list: the new segment was never
+        -- installed, so drop its handle and empty files or the next split
+        -- would open a second handle on the same %020d.log.
+        segment:delete()
     end
     if cerr then return cerr end
     return nil

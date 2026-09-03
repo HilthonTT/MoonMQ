@@ -171,13 +171,19 @@ function Connection:close(reason, err_code, err_msg)
     self.state = Connection.STATE_CLOSED
     self.close_reason = reason
 
-    if err_code then
+    local reactor = self.server.reactor
+    -- Skip the courtesy error frame when the sender is already blocked on
+    -- this socket: the peer has stopped reading, and a second writer would
+    -- both stall here and clobber the sender's wait registration.
+    local sender_parked = type(reactor.write_waiters) == "table"
+        and reactor.write_waiters[self.sock] ~= nil
+    if err_code and not sender_parked then
         local ok, frame = pcall(proto.encode_error,
             uuid.ZERO, err_code, err_msg or reason)
         if ok then
             local deadline = socket.gettime() + 0.25
             pcall(function()
-                self.server.reactor:send_all(self.sock, frame, deadline)
+                reactor:send_all(self.sock, frame, deadline)
             end)
         end
     end
@@ -185,6 +191,9 @@ function Connection:close(reason, err_code, err_msg)
     self:_log_close()
 
     pcall(function() self.sock:close() end)
+    -- Wake the reader/sender if they are parked on the now-closed socket, or
+    -- their coroutines (and this Connection) leak in the waiter tables.
+    if reactor.release then reactor:release(self.sock) end
     self.server:_unregister_conn(self)
 
     metrics.delete("moonmq_pending_bytes", { conn = self.id_short })

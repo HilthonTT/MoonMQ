@@ -21,7 +21,8 @@ if not os_utils.IS_WINDOWS then
 
     local function sync(luafile)
         if not luafile then return false, "no file" end
-        luafile:flush()
+        local fok, ferr = luafile:flush()
+        if not fok then return false, "flush failed: " .. tostring(ferr) end
         local fd = stdio.fileno(luafile)
         if not fd then return false, "fileno failed" end
         local ok, err = unistd.fsync(fd)
@@ -42,7 +43,8 @@ if not os_utils.IS_WINDOWS then
     local function truncate(luafile, length)
         if not luafile then return false, "no file" end
         assert(type(length) == "number", "length must be a number")
-        luafile:flush()
+        local fok, ferr = luafile:flush()
+        if not fok then return false, "flush failed: " .. tostring(ferr) end
         local fd = stdio.fileno(luafile)
         if not fd then return false, "fileno failed" end
         local ok, err = unistd.ftruncate(fd, length)
@@ -85,7 +87,8 @@ end
 
 local function sync(luafile)
     if not luafile then return false, "no file" end
-    luafile:flush()
+    local fok, ferr = luafile:flush()
+    if not fok then return false, "flush failed: " .. tostring(ferr) end
     local fd, err = file_fd(luafile)
     if not fd then return false, err end
     if ffi.C._commit(fd) ~= 0 then
@@ -97,7 +100,8 @@ end
 local function truncate(luafile, length)
     if not luafile then return false, "no file" end
     assert(type(length) == "number", "length must be a number")
-    luafile:flush()
+    local fok, ferr = luafile:flush()
+    if not fok then return false, "flush failed: " .. tostring(ferr) end
     local fd, err = file_fd(luafile)
     if not fd then return false, err end
     if ffi.C._chsize_s(fd, length) ~= 0 then

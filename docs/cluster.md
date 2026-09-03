@@ -86,11 +86,15 @@ new owner.
 convention; it is now **fenced** (`src/cluster/controller_fence.lua`): the
 loop claims a controller epoch (persisted at `<data_dir>/controller-epoch.json`)
 and re-announces it to every peer each pass over
-`POST /cluster/controller/claim`. Every mutating request the reassigner sends
-carries the epoch (`X-Controller-Epoch`/`X-Controller-Id` headers), and a
-broker that has seen a newer claim refuses it with 409 — so if a second broker
+`POST /cluster/controller/claim`. Every control-plane request the reassigner
+sends (`/cluster/ensure`, `/cluster/owner`, `/cluster/offsets`) carries the
+epoch (`X-Controller-Epoch`/`X-Controller-Id` headers), and a broker that has
+seen a newer claim refuses it with 409 — so if a second broker
 starts the loop, exactly one survives: the elder claimant's next pass is
 rejected and it stops acting (permanently, until an operator restarts it).
+Data-plane forwards (`/cluster/append`, group and txn routes) never carry the
+epoch: a broker whose balance loop was superseded must keep forwarding
+produces to partition owners.
 This is fencing, not consensus — two brokers claiming simultaneously against
 disjoint reachable peers can both act until their claims meet; requests
 without epoch headers (hand-driven reassignment, old peers) bypass the fence.

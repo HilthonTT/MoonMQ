@@ -204,36 +204,11 @@ function Segment:delete()
     return nil
 end
 
-function Segment:replace(old)
-    local sok, serr = self:sync()
-    if not sok then
-        return string.format("sync cleaned segment failed: %s", tostring(serr))
-    end
-
-    old:close()
-    self:close()
-
+-- (Re)open this segment on its canonical (suffix-less) files and rebuild
+-- the index from whatever log is there.
+function Segment:_open_canonical()
     local canon_log = log_path(self.dir, self.base_offset, "")
     local canon_idx = index_path(self.dir, self.base_offset, "")
-    local clean_log = log_path(self.dir, self.base_offset, self.suffix)
-    local clean_idx = index_path(self.dir, self.base_offset, self.suffix)
-
-    local ok, err = io_sync.atomic_rename(clean_log, canon_log)
-    if not ok then
-        return string.format("rename %s -> %s failed: %s",
-                             clean_log, canon_log, tostring(err))
-    end
-    ok, err = io_sync.atomic_rename(clean_idx, canon_idx)
-    if not ok then
-        return string.format("rename %s -> %s failed: %s",
-                             clean_idx, canon_idx, tostring(err))
-    end
-
-    local dok, derr = io_sync.sync_dir(self.dir)
-    if not dok then
-        log:warn("segment %020d: dir fsync after compaction replace failed: %s",
-            self.base_offset, tostring(derr))
-    end
 
     self.suffix = ""
     local file, ferr = io.open(canon_log, "a+b")
@@ -249,6 +224,51 @@ function Segment:replace(old)
     self.index = idx
 
     return self:build_index()
+end
+
+function Segment:replace(old)
+    local sok, serr = self:sync()
+    if not sok then
+        return string.format("sync cleaned segment failed: %s", tostring(serr))
+    end
+
+    old:close()
+    self:close()
+
+    local canon_log = log_path(self.dir, self.base_offset, "")
+    local canon_idx = index_path(self.dir, self.base_offset, "")
+    local clean_log = log_path(self.dir, self.base_offset, self.suffix)
+    local clean_idx = index_path(self.dir, self.base_offset, self.suffix)
+
+    -- On failure the caller keeps using `old`, so it must be reopened on
+    -- whatever now sits at the canonical path (build_index re-derives the
+    -- index, so a half-done rename pair is still consistent).
+    local function fail(msg)
+        local rerr = old:_open_canonical()
+        if rerr then
+            msg = msg .. string.format(" (and reopening the original failed: %s)", rerr)
+        end
+        return msg
+    end
+
+    local ok, err = io_sync.atomic_rename(clean_log, canon_log)
+    if not ok then
+        return fail(string.format("rename %s -> %s failed: %s",
+                                  clean_log, canon_log, tostring(err)))
+    end
+    ok, err = io_sync.atomic_rename(clean_idx, canon_idx)
+    if not ok then
+        return fail(string.format("rename %s -> %s failed: %s",
+                                  clean_idx, canon_idx, tostring(err)))
+    end
+
+    local dok, derr = io_sync.sync_dir(self.dir)
+    if not dok then
+        log:warn("segment %020d: dir fsync after compaction replace failed: %s",
+            self.base_offset, tostring(derr))
+    end
+
+    return self:_open_canonical()
 end
 
 return {

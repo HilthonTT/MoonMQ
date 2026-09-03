@@ -324,7 +324,13 @@ function Auth:_record_failure(ip, now)
     local rec = self.failures[ip]
     local existed = rec ~= nil
     if not rec or (now - (rec.first_at or 0)) > self.failure_window then
-        rec = { count = 1, first_at = now }
+        -- Starting a fresh window must not forgive an active ban: a failure
+        -- that lands after the window lapsed (e.g. a SCRAM final that was
+        -- already past the AUTH_SCRAM ban check) would otherwise erase
+        -- banned_until and lift the lockout early.
+        local banned_until = rec and rec.banned_until
+        if banned_until and banned_until <= now then banned_until = nil end
+        rec = { count = 1, first_at = now, banned_until = banned_until }
     else
         rec.count = rec.count + 1
     end

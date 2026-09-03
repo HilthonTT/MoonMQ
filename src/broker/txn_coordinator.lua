@@ -57,16 +57,36 @@ function Coordinator.new(broker, opts)
         txns   = {},
         remote = {},
         router = nil,
+        recovery_pending = false,
     }, Coordinator)
 
-    local rerr = self:_recover()
-    if rerr then return nil, rerr end
+    -- In a cluster, in-flight transactions may have participants owned by
+    -- peers; finishing them needs the router, which is attached later. The
+    -- server defers recovery until then (see Coordinator:recover) so the
+    -- owners get their txn_resolve instead of markers landing in local
+    -- non-owner copies and the owner's LSO staying pinned forever.
+    self:_load_txns()
+    if opts and opts.defer_recovery then
+        self.recovery_pending = true
+    else
+        local rerr = self:_resolve_inflight()
+        if rerr then return nil, rerr end
+    end
     return self, nil
 end
 
 function Coordinator.topic_name() return STATE_TOPIC end
 
 function Coordinator:set_router(router) self.router = router end
+
+-- Run deferred crash recovery (no-op unless `defer_recovery` was set).
+function Coordinator:recover()
+    if not self.recovery_pending then return true end
+    self.recovery_pending = false
+    local rerr = self:_resolve_inflight()
+    if rerr then return nil, rerr end
+    return true
+end
 
 function Coordinator:_partition_for(txn_id)
     return (hash_m.fnv1a(txn_id) % self.nparts) + 1
@@ -223,12 +243,16 @@ function Coordinator:_write_remote_marker(peer, participant, marker, pid, epoch,
     local bytes, serr = msg_m.serialize_message(rec)
     if not bytes then return nil, tostring(serr) end
 
-    local leo, aerr = peer:append(participant.topic, participant.partition, bytes)
+    local leo, first_or_err = peer:append(participant.topic, participant.partition, bytes)
     if not leo then
         return nil, string.format("marker forward to %s for %s/partition-%d failed: %s",
-            tostring(peer.id), participant.topic, participant.partition, tostring(aerr))
+            tostring(peer.id), participant.topic, participant.partition,
+            tostring(first_or_err))
     end
-    local moffset = leo - #bytes
+    -- Prefer the owner's reported record offset: LEO minus byte length is
+    -- only right for byte-addressed backends, and a wrong `upto` makes the
+    -- owner's AbortIndex silently ignore the range.
+    local moffset = type(first_or_err) == "number" and first_or_err or (leo - #bytes)
 
     local rok, rerr = peer:txn_resolve(txn_id, participant.topic, participant.partition, {
         aborted = (marker == MARKER_ABORT),
@@ -410,7 +434,8 @@ function Coordinator:is_aborted(topic, partition, pid, epoch, offset)
 end
 
 
-function Coordinator:_recover()
+-- Replay __transaction_state into memory (no side effects on other topics).
+function Coordinator:_load_txns()
     for _, part in ipairs(self.topic.partitions) do
         local serr = part:scan(function(_offset, m)
             local ok, decoded = pcall(decode_txn, m.value)
@@ -426,7 +451,10 @@ function Coordinator:_recover()
                 STATE_TOPIC, part.id, serr)
         end
     end
+end
 
+-- Finish every transaction the previous process left in flight.
+function Coordinator:_resolve_inflight()
     local resolved = 0
     for txn_id, t in pairs(self.txns) do
         if t.state == S.ONGOING or t.state == S.PREPARE_ABORT then

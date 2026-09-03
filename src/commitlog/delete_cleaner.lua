@@ -28,11 +28,16 @@ function DeleteCleaner:clean(segments)
         local stop
         for i = n - 1, 1, -1 do
             local s = segments[i]
-            total_bytes = total_bytes + s.position
-            if total_bytes > self.retention.bytes then
+            -- Delete a segment only once the *newer* segments alone already
+            -- exceed the budget (Kafka's rule). Checking after adding `s`
+            -- would delete the segment that straddles the budget, i.e. the
+            -- one just sealed, taking freshly acked records with it whenever
+            -- max_log_bytes is smaller than one segment.
+            if total_bytes >= self.retention.bytes then
                 stop = i
                 break
             end
+            total_bytes = total_bytes + s.position
             table.insert(kept, 1, s)
         end
 

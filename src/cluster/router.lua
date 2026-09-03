@@ -28,13 +28,16 @@ function Router:forward(peer, topic_name, partition_id, msg)
     local bytes, serr = msg_m.serialize_message(msg)
     if not bytes then return nil, serr end
 
-    local leo, aerr = peer:append(topic_name, partition_id, bytes, true)
+    local leo, first_or_err = peer:append(topic_name, partition_id, bytes, true)
     if not leo then
-        return nil, string.format("forward to %s failed: %s", peer.id, aerr)
+        return nil, string.format("forward to %s failed: %s", peer.id, first_or_err)
     end
+    -- The owner reports where the record actually landed; fall back to the
+    -- LEO arithmetic only for peers that predate first_offset.
+    local offset = type(first_or_err) == "number" and first_or_err or (leo - #bytes)
     log:debug("forwarded %s/partition-%d -> %s (offset %d)",
-        topic_name, partition_id, peer.id, leo - #bytes)
-    return leo - #bytes
+        topic_name, partition_id, peer.id, offset)
+    return offset
 end
 
 return Router

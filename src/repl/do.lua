@@ -50,7 +50,7 @@ dump = function(t, inc, seen)
 
                 io.write "] = "
             elseif typeK == "string" then
-                io.write(colors.blue .. k:format("%q") .. colors.reset
+                io.write(colors.blue .. ("%q"):format(k) .. colors.reset
                     .. " = ")
             else
                 io.write("["

@@ -293,6 +293,16 @@ function M.auth_scram_final(server, conn, correl, payload)
         conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED, reason)
     end
 
+    -- The ban check at AUTH_SCRAM time is not enough: the IP may have been
+    -- banned by other connections between the two round trips.
+    local banned = server.authenticator:is_banned(conn.ip)
+    if banned then
+        metrics.inc("moonmq_auth_failures_total", 1, { mechanism = "scram" })
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
+            "too many failed attempts; try again later")
+        return
+    end
+
     if final.nonce ~= state.nonce then
         reject("scram nonce mismatch")
         return
@@ -1249,7 +1259,12 @@ function M.begin_txn(server, conn, correl, _payload)
 end
 
 function M.end_txn(server, conn, correl, payload)
-    if not conn.in_txn or not conn.producer_name then
+    -- A transaction left PREPARE_* by a failed finish outlives the session
+    -- that began it; the coordinator tells such a producer to "retry
+    -- END_TXN", so a reconnected session must be allowed to.
+    local resumable = conn.producer_name
+        and server.broker.transactions:has_unresolved(conn.producer_name)
+    if not conn.producer_name or (not conn.in_txn and not resumable) then
         return fail(conn, correl, proto.ERR_INVALID_TXN_STATE, "no transaction in progress")
     end
     local e, derr = proto.decode_end_txn(payload)

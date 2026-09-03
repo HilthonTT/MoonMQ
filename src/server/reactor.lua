@@ -54,16 +54,46 @@ local function safe_resume(co, ...)
     return ok
 end
 
-function Reactor:wait_readable(sock)
-    local co = assert(coroutine.running(), "wait_readable needs a coroutine")
-    self.read_waiters[sock] = co
-    coroutine.yield()
+-- Park the running coroutine on `waiters[sock]`. With a `deadline` (absolute
+-- socket.gettime() seconds) the coroutine is also registered as a timer, so
+-- a peer that never becomes ready cannot strand it: whichever fires first
+-- wins and the other registration is removed. Returns true when woken by
+-- socket readiness (or an external wake-up) and false on deadline.
+function Reactor:_wait(sock, waiters, deadline)
+    local co = assert(coroutine.running(), "wait needs a coroutine")
+    waiters[sock] = co
+    if deadline then self.timer_waiters[co] = deadline end
+    local woke_by = coroutine.yield()
+    if deadline then self.timer_waiters[co] = nil end
+    if woke_by == "timeout" and waiters[sock] == co then
+        waiters[sock] = nil
+        return false
+    end
+    return true
 end
 
-function Reactor:wait_writable(sock)
-    local co = assert(coroutine.running(), "wait_writable needs a coroutine")
-    self.write_waiters[sock] = co
-    coroutine.yield()
+function Reactor:wait_readable(sock, deadline)
+    return self:_wait(sock, self.read_waiters, deadline)
+end
+
+function Reactor:wait_writable(sock, deadline)
+    return self:_wait(sock, self.write_waiters, deadline)
+end
+
+-- Wake every coroutine parked on `sock` (typically because it was just
+-- closed locally). They resume as if the socket became ready, retry their
+-- I/O and observe "closed" instead of leaking in the waiter tables forever
+-- (select silently skips closed sockets).
+function Reactor:release(sock)
+    local me = coroutine.running()
+    for _, waiters in ipairs({ self.read_waiters, self.write_waiters }) do
+        local co = waiters[sock]
+        if co and co ~= me then
+            waiters[sock] = nil
+            self.timer_waiters[co] = nil
+            self:schedule(co)
+        end
+    end
 end
 
 function Reactor:sleep(seconds)
@@ -72,22 +102,25 @@ function Reactor:sleep(seconds)
     coroutine.yield()
 end
 
-function Reactor:park(sock, err, fallback)
+-- Returns false for a non-blocking error (nothing to park on). With a
+-- deadline, also returns false, "deadline" when the timer fired first.
+function Reactor:park(sock, err, fallback, deadline)
+    local woke
     if err == "wantread" then
-        self:wait_readable(sock)
-        return true
+        woke = self:wait_readable(sock, deadline)
     elseif err == "wantwrite" then
-        self:wait_writable(sock)
-        return true
+        woke = self:wait_writable(sock, deadline)
     elseif err == "timeout" then
         if fallback == "write" then
-            self:wait_writable(sock)
+            woke = self:wait_writable(sock, deadline)
         else
-            self:wait_readable(sock)
+            woke = self:wait_readable(sock, deadline)
         end
-        return true
+    else
+        return false
     end
-    return false
+    if not woke then return false, "deadline" end
+    return true
 end
 
 function Reactor.would_block(err)
@@ -119,7 +152,9 @@ function Reactor:read_exact(sock, n, deadline)
                 if deadline and socket.gettime() > deadline then
                     return nil, "deadline exceeded"
                 end
-                self:park(sock, err, "read")
+                if not self:park(sock, err, "read", deadline) then
+                    return nil, "deadline exceeded"
+                end
             else
                 return nil, err
             end
@@ -144,7 +179,9 @@ function Reactor:send_all(sock, data, deadline)
                 if deadline and socket.gettime() > deadline then
                     return nil, "write deadline exceeded"
                 end
-                self:park(sock, err, "write")
+                if not self:park(sock, err, "write", deadline) then
+                    return nil, "write deadline exceeded"
+                end
             else
                 return nil, err
             end
@@ -190,7 +227,9 @@ function Reactor:tls_handshake(sock, params, deadline)
         if deadline and socket.gettime() > deadline then
             return fail("handshake deadline exceeded")
         end
-        self:park(wrapped, herr, "read")
+        if not self:park(wrapped, herr, "read", deadline) then
+            return fail("handshake deadline exceeded")
+        end
     end
 end
 
@@ -277,7 +316,7 @@ function Reactor:run()
 
         for i = 1, #fired do
             self.timer_waiters[fired[i]] = nil
-            safe_resume(fired[i])
+            safe_resume(fired[i], "timeout")
         end
 
         local soonest = math.huge

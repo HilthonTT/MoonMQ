@@ -19,7 +19,8 @@ end
 local iterations = auth.DEFAULT_PBKDF2_ITERATIONS
 if args[2] and args[2] ~= "" then
     iterations = tonumber(args[2])
-    if not iterations or iterations < 1 or iterations ~= math.floor(iterations) then
+    iterations = iterations and math.tointeger(iterations)
+    if not iterations or iterations < 1 then
         io.stderr:write(string.format(
             "iterations must be a positive integer (got: %q)\n", tostring(args[2])))
         os.exit(1)

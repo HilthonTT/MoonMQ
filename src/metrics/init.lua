@@ -20,7 +20,7 @@ local function escape_label_value(v)
 end
 
 local function key(name, labels)
-    if not labels then return name end
+    if not labels or next(labels) == nil then return name end
     local parts = {}
     for k, v in pairs(labels) do
         parts[#parts+1] = k .. '="' .. escape_label_value(v) .. '"'
@@ -125,7 +125,9 @@ function M.render_prometheus()
         end
         out[#out + 1] = string.format("# TYPE %s %s",
             base, (meta and meta.type) or fam.type)
-        table.sort(fam.lines)
+        -- Histogram lines are already emitted in bucket order (a lexical
+        -- sort would put le="+Inf" first, which OpenMetrics rejects).
+        if fam.type ~= "histogram" then table.sort(fam.lines) end
         for _, line in ipairs(fam.lines) do
             out[#out + 1] = line
         end

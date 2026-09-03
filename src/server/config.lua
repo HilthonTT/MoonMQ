@@ -10,19 +10,32 @@ local function read_file(path)
     return content
 end
 
+local function deep_copy(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, x in pairs(v) do out[k] = deep_copy(x) end
+    return out
+end
+
 local function deep_merge(base, override)
     if type(override) ~= "table" then return override end
-    if type(base) ~= "table" then return deep_merge({}, override) end
+    if type(base) ~= "table" then return deep_copy(override) end
 
-    if override[1] ~= nil or base[1] ~= nil then
-        local copy = {}
-        for i = 1, #override do copy[i] = override[i] end
-        return copy
+    -- A list in the overlay replaces the base value wholesale (merging
+    -- arrays element-wise is never what a config author means). An *empty*
+    -- or object-shaped overlay must not erase a base list, though: an overlay
+    -- of `{}` (or one that only touches unrelated keys) has to leave
+    -- Auth.Users / Cluster.Peers / ... intact.
+    if override[1] ~= nil then
+        return deep_copy(override)
+    end
+    if base[1] ~= nil and next(override) == nil then
+        return deep_copy(base)
     end
 
     local result = {}
     for k, v in pairs(base) do
-        result[k] = (type(v) == "table") and deep_merge(v, {}) or v
+        result[k] = deep_copy(v)
     end
 
     for k, v in pairs(override) do

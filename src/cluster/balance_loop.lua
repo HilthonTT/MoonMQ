@@ -120,6 +120,9 @@ function BalanceLoop:_ensure_controller()
                 peer:claim_controller(self.controller_epoch, self.self_id)
             if accepted == false then
                 self.fenced = true
+                for _, p in pairs(self.peers) do
+                    if p.set_controller then p:set_controller(nil) end
+                end
                 log:error("fenced: peer %s holds controller epoch %s (%s); "
                     .. "this balance loop stops acting",
                     id, tostring(highest), tostring(reason))

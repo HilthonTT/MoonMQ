@@ -82,6 +82,8 @@ function Server.new(opts)
     local broker, berr = brk_m.Broker.new(opts.data_dir, {
         default_backend = opts.default_backend,
         dlq             = opts.dlq,
+        -- With a cluster, txn recovery must wait for the router (below).
+        transactions    = { defer_recovery = opts.cluster ~= nil },
     })
     if not broker then return nil, berr end
 
@@ -187,6 +189,10 @@ function Server.new(opts)
 
     if cluster and broker.transactions then
         broker.transactions:set_router(cluster.router)
+    end
+    if broker.transactions and broker.transactions.recover then
+        local rok, rerr = broker.transactions:recover()
+        if not rok then return nil, rerr end
     end
 
     local server = setmetatable({

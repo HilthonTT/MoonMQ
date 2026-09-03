@@ -19,32 +19,31 @@ function Pool.new(opts)
 end
 
 function Pool:acquire()
-    while #self.available > 0 do
-        local c = table.remove(self.available)
-        if not c.closed then return c end
-        self.active = self.active - 1
-    end
-
-    if self.active < self.max then
-        self.active = self.active + 1
-        local c, err = Client.new(self.opts)
-        if not c then
-            self.active = self.active - 1
-            return nil, err
-        end
-        return c
-    end
-
     local co = assert(coroutine.running(), "Pool:acquire needs a coroutine")
-    table.insert(self.waiters, co)
-    coroutine.yield()
+    -- Loop rather than "wait once": a wakeup only means the pool *changed*.
+    -- The released client may have been closed (so nothing went back to
+    -- `available`, but a slot opened up), or another request may have taken
+    -- it between the schedule and our resume. Either way, re-evaluate.
+    while true do
+        while #self.available > 0 do
+            local c = table.remove(self.available)
+            if not c.closed then return c end
+            self.active = self.active - 1
+        end
 
-    while #self.available > 0 do
-        local c = table.remove(self.available)
-        if not c.closed then return c end
-        self.active = self.active - 1
+        if self.active < self.max then
+            self.active = self.active + 1
+            local c, err = Client.new(self.opts)
+            if not c then
+                self.active = self.active - 1
+                return nil, err
+            end
+            return c
+        end
+
+        table.insert(self.waiters, co)
+        coroutine.yield()
     end
-    return nil, "pool empty after wakeup"
 end
 
 function Pool:release(c)

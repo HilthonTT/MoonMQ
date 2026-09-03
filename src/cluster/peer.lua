@@ -23,6 +23,16 @@ function Peer.new(id, address, opts)
     }, Peer)
 end
 
+-- Control-plane routes carry the controller epoch so a superseded balance
+-- loop is fenced. Data-plane forwards (append, group, txn) deliberately do
+-- NOT: the same Peer objects serve the Router, and a broker whose balance
+-- loop lost the controller role must keep forwarding produces to owners.
+local CONTROL_PLANE = {
+    ["/cluster/ensure"]  = true,
+    ["/cluster/owner"]   = true,
+    ["/cluster/offsets"] = true,
+}
+
 function Peer:_request(method, path, headers, body)
     local timeout = self.timeout
     local response_body = {}
@@ -30,7 +40,7 @@ function Peer:_request(method, path, headers, body)
     headers = headers or {}
     headers["Content-Length"] = tostring(#(body or ""))
     if self.token then headers["X-Cluster-Token"] = self.token end
-    if self.controller then
+    if self.controller and CONTROL_PLANE[path] then
         headers["X-Controller-Epoch"] = tostring(self.controller.epoch)
         headers["X-Controller-Id"]    = self.controller.id
     end
@@ -86,7 +96,11 @@ function Peer:append(topic, partition, payload, forwarded)
     if type(resp.offset) ~= "number" then
         return nil, string.format("peer %s: response missing offset", self.id)
     end
-    return resp.offset
+    -- first_offset is where the first appended record landed on the owner;
+    -- older peers omit it and callers fall back to leo - #payload.
+    local first = resp.first_offset
+    if type(first) ~= "number" then first = nil end
+    return resp.offset, first
 end
 
 function Peer:leo(topic, partition)

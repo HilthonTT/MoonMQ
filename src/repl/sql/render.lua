@@ -7,13 +7,20 @@ local function paint(color, s)
     local c = colors[color]
     if type(c) == "function" then return c(s) end
     if type(c) == "string" then return c .. s .. colors.reset end
+    -- lua-term exposes colors as callable tables (__call/__tostring).
+    if type(c) == "table" then
+        local mt = getmetatable(c)
+        if mt and mt.__call then return c(s) end
+        return tostring(c) .. s .. tostring(colors.reset)
+    end
     return s
 end
 
 M.paint = paint
 
 local function display_width(s)
-    return #(tostring(s):gsub("[\r\n]", " "))
+    local line = tostring(s):gsub("[\r\n]", " ")
+    return utf8.len(line) or #line
 end
 
 local function one_line(s)
@@ -44,7 +51,7 @@ function M.table(columns, rows)
         local segs = {}
         for i = 1, #columns do
             local cell = one_line(cells[i] == nil and "" or cells[i])
-            local pad = string.rep(" ", widths[i] - #cell)
+            local pad = string.rep(" ", widths[i] - (utf8.len(cell) or #cell))
             local text = " " .. cell .. pad .. " "
             segs[i] = painter and painter(text) or text
         end

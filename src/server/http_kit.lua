@@ -25,7 +25,9 @@ function M.read_headers(reactor, sock, deadline)
         if idx then return buf:sub(1, idx + 3), buf:sub(idx + 4) end
 
         if reactor.would_block and reactor.would_block(err) then
-            reactor:park(sock, err, "read")
+            if not reactor:park(sock, err, "read", deadline) then
+                return nil, "read deadline"
+            end
         elseif err == "closed" then return nil, "peer closed"
         elseif err then return nil, err
         elseif not progressed then reactor:sleep(0.02) end
@@ -46,7 +48,9 @@ function M.read_body(reactor, sock, have, want, deadline, max_body)
         elseif partial and #partial > 0 then parts[#parts + 1] = partial; got = got + #partial end
         if got >= want then break end
         if reactor.would_block and reactor.would_block(err) then
-            reactor:park(sock, err, "read")
+            if not reactor:park(sock, err, "read", deadline) then
+                return nil, "read deadline"
+            end
         elseif err == "closed" then return nil, "peer closed"
         elseif err then return nil, err end
     end

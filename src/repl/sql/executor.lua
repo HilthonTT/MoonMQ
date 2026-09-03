@@ -116,7 +116,7 @@ end
 function Session:fetch(node)
     local c, err = self:require_client()
     if not c then return fail(err) end
-    local records, ferr = c:fetch(node.topic, node.group, node.limit)
+    local records, ferr = c:fetch(node.topic, node.group or "", node.limit)
     if not records then return fail(ferr) end
     return self:_records_result(records)
 end
@@ -124,7 +124,7 @@ end
 function Session:subscribe(node)
     local c, err = self:require_client()
     if not c then return fail(err) end
-    local ok, serr = c:subscribe(node.topic, node.group)
+    local ok, serr = c:subscribe(node.topic, node.group or "")
     if not ok then return fail(serr) end
 
     local records = {}

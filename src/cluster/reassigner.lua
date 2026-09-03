@@ -109,6 +109,13 @@ function Reassigner:_move(topic_name, partition_id, dest_id)
     if self.broker.offsets and peer.push_offsets then
         local snapshot = self.broker.offsets:offsets_for_partition(
             topic_name, partition_id)
+        if from > 0 then
+            -- Source bytes [from, LEO) were copied to dest [0, LEO-from);
+            -- committed offsets are byte positions and must shift with them.
+            for group, offset in pairs(snapshot) do
+                snapshot[group] = math.max(0, offset - from)
+            end
+        end
         if next(snapshot) ~= nil then
             local applied, oerr = peer:push_offsets(topic_name, partition_id, snapshot)
             if applied then
