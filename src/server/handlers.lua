@@ -676,6 +676,25 @@ local function subscriber_loop(server, conn)
             return
         end
         if records and #records > 0 then
+            local consumer = conn.consumer
+            local advanced, order = {}, {}
+            for i = 1, #records do
+                local r = records[i]
+                local by_topic = advanced[r.topic]
+                if not by_topic then
+                    by_topic = {}
+                    advanced[r.topic] = by_topic
+                end
+                if by_topic[r.partition] == nil then
+                    local pos = consumer.offsets[r.topic]
+                        and consumer.offsets[r.topic][r.partition]
+                    if pos then
+                        by_topic[r.partition] = pos
+                        order[#order + 1] = { r.topic, r.partition, pos }
+                    end
+                end
+            end
+
             local wait = meter_delivery(server, conn, records, #records)
             if wait > 0 then
                 server.reactor:sleep(wait)
@@ -687,18 +706,22 @@ local function subscriber_loop(server, conn)
                 local r = records[i]
                 local frame = proto.encode_record(uuid.ZERO,
                     r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
+                if conn.pending_bytes > 0
+                    and conn.pending_bytes + #frame > server.max_pending_bytes then
+                    if not conn:wait_flushed() then return end
+                end
                 if not conn:send(frame) then return end
                 metrics.inc("moonmq_fetch_records_total", 1, { topic = r.topic })
                 server.broker.traffic:add_out(r.topic, r.partition, #r.key + #r.value)
-                local adv = conn.consumer.offsets[r.topic]
-                    and conn.consumer.offsets[r.topic][r.partition]
-                if adv then
-                    local cok, cerr =
-                        conn.consumer:commit_offset(r.topic, r.partition, adv)
-                    if not cok then
-                        push_log:error("conn=%s commit: %s", conn.id_short, cerr)
-                        return
-                    end
+            end
+
+            if not conn:wait_flushed() then return end
+
+            for _, entry in ipairs(order) do
+                local cok, cerr = consumer:commit_offset(entry[1], entry[2], entry[3])
+                if not cok then
+                    push_log:error("conn=%s commit: %s", conn.id_short, cerr)
+                    return
                 end
             end
         else

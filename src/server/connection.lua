@@ -46,6 +46,9 @@ function Connection.new(server, sock, peer, ip)
         send_queue = {},
         send_head = 1,
         send_tail = 0,
+        send_flushed = 0,
+        flush_waiter = nil,
+        flush_waiter_seq = nil,
         pending_bytes = 0,
         sender_co = nil,
         sender_suspended = nil,
@@ -203,6 +206,30 @@ function Connection:close(reason, err_code, err_msg)
         self.sender_suspended = nil
         self.server.reactor:schedule(co)
     end
+
+    self:_wake_flush_waiter()
+end
+
+function Connection:_wake_flush_waiter()
+    local co = self.flush_waiter
+    if not co then return end
+    if self.state ~= Connection.STATE_CLOSED
+        and self.send_flushed < self.flush_waiter_seq then
+        return
+    end
+    self.flush_waiter = nil
+    self.flush_waiter_seq = nil
+    self.server.reactor:schedule(co)
+end
+
+function Connection:wait_flushed(seq)
+    seq = seq or self.send_tail
+    while self.state ~= Connection.STATE_CLOSED and self.send_flushed < seq do
+        self.flush_waiter = coroutine.running()
+        self.flush_waiter_seq = seq
+        coroutine.yield()
+    end
+    return self.state ~= Connection.STATE_CLOSED
 end
 
 function Connection:run_sender()
@@ -225,9 +252,11 @@ function Connection:run_sender()
                 self.pending_bytes = self.pending_bytes - #frame
                 self.bytes_sent = self.bytes_sent + #frame
                 self.frames_sent = self.frames_sent + 1
+                self.send_flushed = self.send_flushed + 1
 
                 metrics.inc("moonmq_frames_sent_total")
                 metrics.inc("moonmq_bytes_sent_total", #frame)
+                self:_wake_flush_waiter()
             else
                 if err == "write deadline exceeded" then
                     self:close(Connection.REASON_WRITE_DEADLINE)
