@@ -42,7 +42,10 @@ function M:_apply(topic_name, partition_id, payload)
 
     local _, werr = part:write_message(msg)
     if werr then return nil, "write: " .. tostring(werr) end
-    if part.request_sync then part:request_sync() end
+    if part.request_sync then
+        local sok, serr = part:request_sync()
+        if not sok then return nil, "sync: " .. tostring(serr) end
+    end
     return part.offset, nil
 end
 

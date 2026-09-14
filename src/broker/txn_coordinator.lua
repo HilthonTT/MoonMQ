@@ -295,7 +295,13 @@ function Coordinator:_write_marker(participant, marker, pid, epoch, txn_id)
         return nil, string.format("marker write to %s/partition-%d failed: %s",
             participant.topic, participant.partition, tostring(werr))
     end
-    if part.request_sync then part:request_sync() end
+    if part.request_sync then
+        local sok, serr = part:request_sync()
+        if not sok then
+            return nil, string.format("marker sync on %s/partition-%d failed: %s",
+                participant.topic, participant.partition, tostring(serr))
+        end
+    end
     return true, moffset
 end
 
@@ -459,10 +465,14 @@ function Coordinator:_resolve_inflight()
     for txn_id, t in pairs(self.txns) do
         if t.state == S.ONGOING or t.state == S.PREPARE_ABORT then
             t.state = S.PREPARE_ABORT
-            self:_persist(txn_id)
-            local ok, err = self:_finish(txn_id, false)
-            if not ok then
-                log:error("recovery: txn %s abort incomplete: %s", txn_id, tostring(err))
+            local pok, perr = self:_persist(txn_id)
+            if not pok then
+                log:error("recovery: txn %s abort not started: %s", txn_id, tostring(perr))
+            else
+                local ok, err = self:_finish(txn_id, false)
+                if not ok then
+                    log:error("recovery: txn %s abort incomplete: %s", txn_id, tostring(err))
+                end
             end
             resolved = resolved + 1
         elseif t.state == S.PREPARE_COMMIT then
