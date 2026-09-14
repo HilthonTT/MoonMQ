@@ -1,6 +1,5 @@
 local json    = require("dkjson")
 local fs_m    = require("src.io.fs")
-local io_sync = require("src.io.io_sync")
 
 local FILE_NAME = "controller-epoch.json"
 
@@ -35,14 +34,9 @@ function ControllerFence:_load()
 end
 
 function ControllerFence:_save()
-    local tmp = self.path .. ".tmp"
-    local f, ferr = io.open(tmp, "wb")
-    if not f then return nil, ferr end
-    f:write(json.encode({ epoch = self.epoch, claimant = self.claimant },
-        { indent = true }))
-    f:flush()
-    f:close()
-    return io_sync.atomic_rename(tmp, self.path)
+    return fs_m.atomic_write(self.path,
+        json.encode({ epoch = self.epoch, claimant = self.claimant },
+            { indent = true }))
 end
 
 function ControllerFence:highest()

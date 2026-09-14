@@ -312,15 +312,8 @@ end
 
 function SegmentedPartition:_write_checkpoint(value)
     local cp_path = fs_m.join_path(self.dir, "recovery-checkpoint")
-    local tmp     = cp_path .. ".tmp"
-    local f, ferr = io.open(tmp, "wb")
-    if not f then return false, ferr end
-    f:write(tostring(value))
-    io_sync.sync(f)
-    f:close()
-    local ok, rerr = io_sync.atomic_rename(tmp, cp_path)
-    if not ok then return false, rerr end
-    io_sync.sync_dir(self.dir)
+    local ok, err = fs_m.atomic_write(cp_path, tostring(value))
+    if not ok then return false, err end
     return true, nil
 end
 

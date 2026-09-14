@@ -68,7 +68,24 @@ ffi.cdef[[
     int _fileno(FILE *stream);
     int _commit(int fd);
     int _chsize_s(int fd, int64_t size);
+    int MoveFileExA(const char *lpExistingFileName, const char *lpNewFileName, unsigned long dwFlags);
 ]]
+
+local MOVEFILE_REPLACE_EXISTING = 0x1
+local MOVEFILE_WRITE_THROUGH    = 0x8
+
+local kok, kernel32 = pcall(ffi.load, "kernel32")
+if kok and kernel32 then
+    atomic_rename = function(from, to)
+        assert(type(from) == "string", "from must be a string")
+        assert(type(to)   == "string", "to must be a string")
+        local flags = MOVEFILE_REPLACE_EXISTING + MOVEFILE_WRITE_THROUGH
+        if kernel32.MoveFileExA(from, to, flags) ~= 0 then
+            return true, nil
+        end
+        return false, string.format("MoveFileExA %s -> %s failed", from, to)
+    end
+end
 
 local function file_ptr(luafile)
     local s = tostring(luafile)

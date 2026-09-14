@@ -1,5 +1,4 @@
 local fs_m    = require("src.io.fs")
-local io_sync = require("src.io.io_sync")
 
 local FILE_NAME = "topic.config"
 
@@ -94,16 +93,9 @@ local function save(topic_dir, opts)
     end
 
     local path = fs_m.join_path(topic_dir, FILE_NAME)
-    local tmp  = path .. ".tmp"
-
-    local f, ferr = io.open(tmp, "wb")
-    if not f then return false, ferr end
-    f:write(table.concat(lines, "\n"))
-    f:write("\n")
-    f:flush()
-    f:close()
-
-    return io_sync.atomic_rename(tmp, path)
+    local ok, err = fs_m.atomic_write(path, table.concat(lines, "\n") .. "\n")
+    if not ok then return false, err end
+    return true
 end
 
 return {

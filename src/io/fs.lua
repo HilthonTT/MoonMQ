@@ -382,15 +382,36 @@ else
     backend = "shell"
 end
 
+local function dir_name(path)
+    local d = path:match("^(.*)[/\\][^/\\]*$")
+    if d == nil then return "." end
+    if d == "" then return path:sub(1, 1) end
+    return d
+end
+
 local function atomic_write(path, data)
     assert(type(path) == "string", "path must be a string")
+    assert(type(data) == "string", "data must be a string")
     local tmp = path .. ".tmp"
     local f, ferr = io.open(tmp, "wb")
     if not f then return nil, ferr end
-    f:write(data)
-    f:flush()
+    local wok, werr = f:write(data)
+    if not wok then
+        f:close()
+        os.remove(tmp)
+        return nil, string.format("write %s failed: %s", tmp, tostring(werr))
+    end
+    local sok, serr = io_sync.sync(f)
     f:close()
-    return io_sync.atomic_rename(tmp, path)
+    if not sok then
+        os.remove(tmp)
+        return nil, string.format("sync %s failed: %s", tmp, tostring(serr))
+    end
+    local rok, rerr = io_sync.atomic_rename(tmp, path)
+    if not rok then return nil, rerr end
+    local dok, derr = io_sync.sync_dir(dir_name(path))
+    if not dok then return nil, derr end
+    return true, nil
 end
 
 return {
