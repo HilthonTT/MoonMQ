@@ -52,24 +52,16 @@ end
 function CommitLogPartition:read_message(offset)
     assert(type(offset) == "number", "offset must be a number")
 
-    local msg, next_offset, err = self.commitlog:read_at(offset)
+    local msg, next_offset, err, at = self.commitlog:read_at(offset)
     if not msg then
         if offset < self.commitlog:oldest_offset() then
             return nil, offset,
                 string.format("offset %d below oldest retained: unexpected EOF",
                               offset)
         end
-        local nxt = self.commitlog:next_readable_offset(offset)
-        if nxt and nxt > offset then
-            local gmsg, gnext, gerr = self.commitlog:read_at(nxt)
-            if gmsg then
-                return gmsg, gnext, nil
-            end
-            err = gerr
-        end
         return nil, offset, err
     end
-    return msg, next_offset, nil
+    return msg, next_offset, nil, at
 end
 
 function CommitLogPartition:oldest_offset()
@@ -80,10 +72,15 @@ function CommitLogPartition:offset_for_timestamp(ts)
     assert(type(ts) == "number", "ts must be a number")
     local oldest = self.commitlog:oldest_offset()
     local newest = self.commitlog:newest_offset()
-    for off = oldest, newest - 1 do
-        local msg = self.commitlog:read_at(off)
-        if msg and msg.timestamp >= ts then
-            return off
+    local off = oldest
+    while off < newest do
+        local msg, next_offset, _, at = self.commitlog:read_at(off)
+        if not msg then
+            off = off + 1
+        elseif msg.timestamp >= ts then
+            return at or off
+        else
+            off = next_offset
         end
     end
     return nil

@@ -17,9 +17,12 @@ function CompactCleaner:clean(segments)
         return segments, nil
     end
 
+    self.m = {}
     for _, seg in ipairs(segments) do
         seg:each(function(offset, msg)
-            self.m[msg.key] = offset
+            if not msg:is_control() then
+                self.m[msg.key] = offset
+            end
         end)
     end
 
@@ -40,20 +43,25 @@ function CompactCleaner:clean(segments)
         local write_err
         seg:each(function(offset, msg)
             if write_err then return end
-            if self.m[msg.key] <= offset and #msg.value > 0 then
+            local keep = msg:is_control()
+                or (self.m[msg.key] <= offset and #msg.value > 0)
+            if keep then
                 local record, serr = message_m.serialize_message(msg)
                 if not record then
                     write_err = string.format("serialize during compaction: %s",
                                               tostring(serr))
                     return
                 end
-                local ok, werr = cs:write(record)
+                local ok, werr = cs:append_at(record, offset)
                 if not ok then write_err = werr end
             end
         end)
         if write_err then return abort_twins(write_err) end
 
-        cs:sync()
+        local sok, serr = cs:sync_all()
+        if not sok then
+            return abort_twins(string.format("sync compacted segment: %s", tostring(serr)))
+        end
     end
 
     local out = {}

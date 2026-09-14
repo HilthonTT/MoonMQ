@@ -61,14 +61,18 @@ function Segment.new(dir, base_offset, max_bytes, suffix)
 end
 
 function Segment:build_index()
-    local terr = self.index:truncate_entries(0)
-    if terr then return terr end
+    local aerr = self.index:align()
+    if aerr then return aerr end
+
+    local existing = self.index:count()
+    local trusted  = true
 
     local file_end = self.file:seek("end") or 0
     self.file:seek("set", 0)
 
     local next_offset = self.base_offset
     local position    = 0
+    local slot        = 0
 
     while true do
         local size_bytes = self.file:read(8)
@@ -87,11 +91,34 @@ function Segment:build_index()
             break
         end
 
-        local werr = self.index:write_entry(next_offset, position)
-        if werr then return werr end
+        local offset = next_offset
+        if trusted then
+            local abs, ipos
+            if slot < existing then
+                abs, ipos = self.index:entry_at(slot)
+            end
+            if abs and ipos == position and abs >= next_offset then
+                offset = abs
+            else
+                trusted = false
+                local terr = self.index:truncate_entries(slot)
+                if terr then return terr end
+            end
+        end
+        if not trusted then
+            local werr = self.index:write_entry(offset, position)
+            if werr then return werr end
+        end
 
+        self.file:seek("set", position + framed)
         position    = position + framed
-        next_offset = next_offset + 1
+        next_offset = offset + 1
+        slot        = slot + 1
+    end
+
+    if trusted and slot < existing then
+        local terr = self.index:truncate_entries(slot)
+        if terr then return terr end
     end
 
     if position < file_end then
@@ -161,22 +188,47 @@ function Segment:read_at(position)
     return message_m.deserialize_record(self.file)
 end
 
+function Segment:append_at(record, offset)
+    assert(type(offset) == "number", "offset must be a number")
+    if offset < self.next_offset then
+        return false, string.format("offset %d below next offset %d",
+                                    offset, self.next_offset)
+    end
+    local position = self.position
+    local ok, werr = self:write(record)
+    if not ok then return false, werr end
+    local ierr = self.index:write_entry(offset, position)
+    if ierr then
+        self:rewind(position, self.next_offset - 1)
+        return false, ierr
+    end
+    self.next_offset = offset + 1
+    return true, nil
+end
+
 function Segment:each(callback)
-    self.file:seek("set", 0)
-    local offset   = self.base_offset
-    local position = 0
-    while true do
-        local msg, framed = message_m.deserialize_record(self.file)
+    local count = self.index:count()
+    for slot = 0, count - 1 do
+        local offset, position = self.index:entry_at(slot)
+        if not offset then break end
+        self.file:seek("set", position)
+        local msg = message_m.deserialize_record(self.file)
         if not msg then break end
         callback(offset, msg, position)
-        offset   = offset + 1
-        position = position + framed
     end
 end
 
 function Segment:sync()
     local ok, err = io_sync.sync(self.file)
     if not ok then return false, err end
+    return true, nil
+end
+
+function Segment:sync_all()
+    local ok, err = self:sync()
+    if not ok then return false, err end
+    local iok, ierr = self.index:sync()
+    if not iok then return false, ierr end
     return true, nil
 end
 
@@ -227,7 +279,7 @@ function Segment:_open_canonical()
 end
 
 function Segment:replace(old)
-    local sok, serr = self:sync()
+    local sok, serr = self:sync_all()
     if not sok then
         return string.format("sync cleaned segment failed: %s", tostring(serr))
     end

@@ -148,7 +148,11 @@ function Consumer:poll(opts)
                 and self:owns(topic_name, partition_id)
                 and self.broker:serves_partition(topic_name, partition_id)
                 and partition and offset < hi do
-                local msg, next_offset, read_err = partition:read_message(offset)
+                local msg, next_offset, read_err, at = partition:read_message(offset)
+                if msg and at then
+                    if at >= hi then break end
+                    offset = at
+                end
                 local skip_aborted = msg ~= nil and not msg:is_control()
                     and self.isolation == "read_committed"
                     and msg:is_txn() and self.broker.transactions ~= nil

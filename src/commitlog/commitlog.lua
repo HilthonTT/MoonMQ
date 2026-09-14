@@ -112,25 +112,52 @@ function CommitLog:open()
 
     local CLEANED = ".cleaned"
     local repaired = false
+    local present = {}
+    for _, name in ipairs(files) do present[name] = true end
+
+    local function promote(clean_name, canon_name)
+        local ok, rerr = io_sync.atomic_rename(
+            fs_m.join_path(self.path, clean_name),
+            fs_m.join_path(self.path, canon_name))
+        if not ok then
+            return string.format("adopt orphan %s failed: %s",
+                                 clean_name, tostring(rerr))
+        end
+        log:warn("recovered interrupted compaction: promoted %s", clean_name)
+        return nil
+    end
+
     for _, name in ipairs(files) do
         if string_m.endswith(name, LogFileSuffix .. CLEANED) then
             local canon      = string_m.trimsuffix(name, CLEANED)
-            local canon_full = fs_m.join_path(self.path, canon)
-            local clean_full = fs_m.join_path(self.path, name)
-            if not fs_m.exists(canon_full) then
-                local ok, rerr = io_sync.atomic_rename(clean_full, canon_full)
-                if not ok then
-                    return string.format("adopt orphan %s failed: %s",
-                                         name, tostring(rerr))
+            local stem       = string_m.trimsuffix(canon, LogFileSuffix)
+            local idx_clean  = stem .. IndexFileSuffix .. CLEANED
+            if not present[canon] then
+                local perr = promote(name, canon)
+                if perr then return perr end
+                if present[idx_clean] then
+                    perr = promote(idx_clean, stem .. IndexFileSuffix)
+                    if perr then return perr end
                 end
-                log:warn("recovered interrupted compaction: promoted %s", name)
             else
-                os.remove(clean_full)
+                os.remove(fs_m.join_path(self.path, name))
+                os.remove(fs_m.join_path(self.path, idx_clean))
             end
             repaired = true
         elseif string_m.endswith(name, IndexFileSuffix .. CLEANED) then
-            os.remove(fs_m.join_path(self.path, name))
+            local stem = string_m.trimsuffix(name, IndexFileSuffix .. CLEANED)
+            if not present[stem .. LogFileSuffix .. CLEANED] then
+                local perr = promote(name, stem .. IndexFileSuffix)
+                if perr then return perr end
+            end
             repaired = true
+        end
+    end
+    if repaired then
+        local dok, derr = io_sync.sync_dir(self.path)
+        if not dok then
+            return string.format("dir fsync after compaction recovery failed: %s",
+                                 tostring(derr))
         end
     end
     if repaired then
@@ -180,6 +207,11 @@ function CommitLog:check_split()
 end
 
 function CommitLog:split()
+    local aok, aerr = self.active_segment:sync()
+    if not aok then
+        return string.format("fsync before segment roll failed: %s", tostring(aerr))
+    end
+
     local segment, serr = Segment.new(self.path, self:newest_offset(),
                                       self.options.max_segment_bytes)
     if not segment then return serr end
@@ -266,21 +298,25 @@ end
 function CommitLog:read_at(offset)
     assert(type(offset) == "number", "offset must be a number")
 
-    local seg = self:segment_for_offset(offset)
-    if not seg then
+    if #self.segments == 0 or offset < self.segments[1].base_offset then
         return nil, nil, string.format("offset %d out of range", offset)
     end
 
-    local position, lerr = seg.index:lookup(offset)
-    if not position then
-        return nil, nil, lerr
+    for i = 1, #self.segments do
+        local seg = self.segments[i]
+        if offset < seg.next_offset then
+            local abs, position = seg.index:ceil(offset)
+            if abs then
+                local msg, _, derr = seg:read_at(position)
+                if not msg then
+                    return nil, nil, derr
+                end
+                return msg, abs + 1, nil, abs
+            end
+        end
     end
 
-    local msg, _, derr = seg:read_at(position)
-    if not msg then
-        return nil, nil, derr
-    end
-    return msg, offset + 1, nil
+    return nil, nil, string.format("offset %d out of range", offset)
 end
 
 function CommitLog:each_message(fn)

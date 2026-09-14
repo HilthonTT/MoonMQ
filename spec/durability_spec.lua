@@ -1,3 +1,4 @@
+local commitlog  = require("src.commitlog")
 local message    = require("src.record.message")
 local os_utils   = require("src.core.os")
 local fs_m       = require("src.io.fs")
@@ -18,6 +19,17 @@ local function rmdir(path)
     else
         os.execute(string.format("rm -rf '%s'", path))
     end
+end
+
+local function new_log(opts)
+    opts = opts or {}
+    fs_m.mkdir(BASE_DIR)
+    local options = commitlog.Options.new(
+        fs_m.join_path(BASE_DIR, "log"),
+        opts.max_segment_bytes or 0,
+        opts.max_log_bytes or 0,
+        opts.cleanup_policy or "")
+    return assert(commitlog.CommitLog.new(options))
 end
 
 local function msg(k, v, ts)
@@ -57,6 +69,123 @@ describe("fs.atomic_write", function()
         local ok, err = fs_m.atomic_write(path, "data")
         assert.is_nil(ok)
         assert.is_not_nil(err)
+    end)
+end)
+
+describe("commitlog compaction keeps offsets stable", function()
+    before_each(function() rmdir(BASE_DIR) end)
+    after_each(function()  rmdir(BASE_DIR) end)
+
+    local function populate()
+        local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
+        assert.are.equal(0, l:append_message(msg("a", "a-old", 1)))
+        assert.are.equal(1, l:append_message(msg("b", "b-only", 2)))
+        assert.are.equal(2, l:append_message(msg("a", "a-new", 3)))
+        assert.are.equal(3, l:append_message(msg("c", "c-only", 4)))
+        assert.are.equal(4, l:append_message(msg("d", "d-only", 5)))
+        return l
+    end
+
+    local function assert_offsets(l)
+        local seen, count = {}, 0
+        l:each_message(function(offset, m)
+            seen[m.key] = offset
+            count = count + 1
+        end)
+        assert.are.equal(4, count)
+        assert.are.equal(1, seen.b)
+        assert.are.equal(2, seen.a)
+        assert.are.equal(3, seen.c)
+
+        local m, next_offset, err, at = l:read_at(2)
+        assert.is_nil(err)
+        assert.are.equal("a-new", m.value)
+        assert.are.equal(3, next_offset)
+        assert.are.equal(2, at)
+
+        m, next_offset, err, at = l:read_at(0)
+        assert.is_nil(err)
+        assert.are.equal("b-only", m.value)
+        assert.are.equal(1, at)
+        assert.are.equal(2, next_offset)
+
+        assert.are.equal(5, l:newest_offset())
+    end
+
+    it("reads survivors at their original offsets", function()
+        local l = populate()
+        assert_offsets(l)
+        l:close()
+    end)
+
+    it("keeps the original offsets across a reopen", function()
+        populate():close()
+        local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
+        assert_offsets(l)
+        assert.are.equal(5, l:append_message(msg("e", "e-only", 6)))
+        l:close()
+    end)
+
+    it("keeps transaction control records", function()
+        local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
+        l:append_message(message.Message.new("", "m1", 1, message.ATTR_CONTROL))
+        l:append_message(message.Message.new("", "m2", 2, message.ATTR_CONTROL))
+        l:append_message(msg("k", "v", 3))
+        l:append_message(msg("z", "v", 4))
+
+        local controls = 0
+        l:each_message(function(_, m)
+            if m:is_control() then controls = controls + 1 end
+        end)
+        assert.are.equal(2, controls)
+        l:close()
+    end)
+
+    it("promotes a compacted index left behind by a crash between renames", function()
+        populate():close()
+
+        local dir = fs_m.join_path(BASE_DIR, "log")
+        local canon = fs_m.join_path(dir, string.format("%020d.index", 0))
+        local cleaned = canon .. ".cleaned"
+        assert(os.rename(canon, cleaned))
+        local f = assert(io.open(canon, "wb"))
+        f:close()
+
+        local l = new_log({ max_segment_bytes = 1, cleanup_policy = "compact" })
+        assert.is_false(fs_m.exists(cleaned))
+        assert_offsets(l)
+        l:close()
+    end)
+end)
+
+describe("commitlog segment roll", function()
+    before_each(function() rmdir(BASE_DIR) end)
+    after_each(function()  rmdir(BASE_DIR) end)
+
+    it("fsyncs the outgoing segment before opening the next one", function()
+        local l = new_log({ max_segment_bytes = 1 })
+        l:append_message(msg("a", "1", 1))
+        local outgoing = l.active_segment
+        local synced = false
+        local real_sync = outgoing.sync
+        outgoing.sync = function(self)
+            synced = true
+            return real_sync(self)
+        end
+        l:append_message(msg("b", "2", 2))
+        assert.is_true(synced)
+        assert.are_not.equal(outgoing, l.active_segment)
+        l:close()
+    end)
+
+    it("refuses to roll when the outgoing segment cannot be synced", function()
+        local l = new_log({ max_segment_bytes = 1 })
+        l:append_message(msg("a", "1", 1))
+        l.active_segment.sync = function() return false, "disk gone" end
+        local offset, err = l:append_message(msg("b", "2", 2))
+        assert.is_nil(offset)
+        assert.matches("disk gone", err)
+        l:close()
     end)
 end)
 
