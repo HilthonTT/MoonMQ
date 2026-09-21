@@ -397,12 +397,29 @@ end
 
 function SegmentedPartition:write_message(msg)
     assert(getmetatable(msg) == msg_m.Message, "msg must be a Message instance")
+    if self.read_only then
+        return nil, "partition is read-only: this replica is not the leader"
+    end
 
     local bytes, serr = msg_m.serialize_message(msg)
     if not bytes then
         return nil, string.format("failed to serialize message: %s", serr)
     end
 
+    return self:_append_bytes(bytes, msg.timestamp)
+end
+
+function SegmentedPartition:append_raw(offset, bytes, timestamp)
+    assert(type(offset) == "number", "offset must be a number")
+    assert(type(bytes) == "string", "bytes must be a string")
+    if offset ~= self.offset then
+        return nil, string.format(
+            "replica append at offset %d but the log ends at %d", offset, self.offset)
+    end
+    return self:_append_bytes(bytes, timestamp or 0)
+end
+
+function SegmentedPartition:_append_bytes(bytes, timestamp)
     local rerr = self:_roll_if_full(#bytes)
     if rerr then return nil, rerr end
 
@@ -425,7 +442,7 @@ function SegmentedPartition:write_message(msg)
     self.active_segment.bytes_written = self.active_segment.bytes_written + #bytes
     self.offset = self.offset + #bytes
 
-    time_index.maybe_append(self.active_segment, msg.timestamp,
+    time_index.maybe_append(self.active_segment, timestamp,
         file_pos_in_segment, self.index_interval_bytes)
 
     metrics.set("moonmq_partition_log_bytes", self.offset,
@@ -553,6 +570,107 @@ function SegmentedPartition:read_message(offset)
     local next_offset = offset + 8 + total_size
 
     return m, next_offset, nil
+end
+
+function SegmentedPartition:read_raw(offset)
+    assert(type(offset) == "number", "offset must be a number")
+
+    local seg = self:_segment_for_offset(offset)
+    if not seg then
+        return nil, offset, "failed to read record: unexpected EOF"
+    end
+
+    local local_pos = offset - seg.base_offset
+    local pos, serr = seg.file:seek("set", local_pos)
+    if not pos then
+        return nil, offset, string.format("failed to seek offset: %s", serr)
+    end
+
+    local size_bytes = seg.file:read(8)
+    if not size_bytes or #size_bytes < 8 then
+        return nil, offset, "failed to read record size: unexpected EOF"
+    end
+    local total_size = string.unpack(">I8", size_bytes)
+    if total_size < msg_m.MIN_BODY
+       or total_size > seg.bytes_written - (local_pos + 8) then
+        return nil, offset, "corrupt length prefix"
+    end
+
+    local body = seg.file:read(total_size)
+    if not body or #body < total_size then
+        return nil, offset, "failed to read record body: unexpected EOF"
+    end
+    return size_bytes .. body, offset + 8 + total_size, nil, offset
+end
+
+function SegmentedPartition:_remove_segment(segment)
+    segment:close()
+    os.remove(segment:file_path(self.dir))
+    os.remove(segment:meta_path(self.dir))
+    os.remove(segment:index_path(self.dir))
+    if self._last_seg == segment then self._last_seg = nil end
+end
+
+function SegmentedPartition:truncate_to(offset)
+    assert(type(offset) == "number", "offset must be a number")
+    if offset >= self.offset then return true end
+    if offset <= self:oldest_offset() then return self:reset_to(offset) end
+
+    local kept = {}
+    for _, seg in ipairs(self.segments) do
+        if seg.base_offset >= offset then
+            self:_remove_segment(seg)
+        else
+            kept[#kept + 1] = seg
+        end
+    end
+
+    local last = kept[#kept]
+    local size = offset - last.base_offset
+    if size < last.bytes_written then
+        last.file:flush()
+        local tok, terr = io_sync.truncate(last.file, size)
+        if not tok then
+            return nil, string.format("failed to truncate segment: %s", tostring(terr))
+        end
+        last.bytes_written = size
+        if last.index_file then
+            last.index_file:flush()
+            local at, ierr = time_index.recover(last.index_file, size)
+            if ierr then
+                return nil, string.format("failed to truncate timeindex: %s", tostring(ierr))
+            end
+            last.last_indexed_at = at
+        end
+    end
+
+    self.segments = kept
+    self.active_segment = last
+    self.offset = offset
+    self._last_seg = nil
+
+    local sok, serr = io_sync.sync(last.file)
+    if not sok then
+        return nil, string.format("failed to fsync truncated segment: %s", tostring(serr))
+    end
+    io_sync.sync_dir(self.dir)
+    self:_write_checkpoint(last.base_offset)
+    return true
+end
+
+function SegmentedPartition:reset_to(offset)
+    assert(type(offset) == "number", "offset must be a number")
+    for _, seg in ipairs(self.segments) do
+        self:_remove_segment(seg)
+    end
+    self.segments = {}
+    self.active_segment = nil
+    self._last_seg = nil
+
+    local cerr = self:create_new_segment(offset)
+    if cerr then return nil, cerr end
+    self:_write_checkpoint(offset)
+    return true
 end
 
 function SegmentedPartition:scan(fn)

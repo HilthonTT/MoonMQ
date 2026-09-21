@@ -143,6 +143,10 @@ function Consumer:poll(opts)
                 local lso = self.broker.transactions:lso(topic_name, partition_id)
                 if lso ~= nil and lso < hi then hi = lso end
             end
+            if self.broker.high_watermark then
+                local hwm = self.broker.high_watermark(topic_name, partition_id)
+                if hwm ~= nil and hwm < hi then hi = hwm end
+            end
             local taken = 0
             while taken < max_per_partition
                 and self:owns(topic_name, partition_id)

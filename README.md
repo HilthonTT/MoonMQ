@@ -27,7 +27,8 @@ records.
 | **Delivery** | Pull (`FETCH`) or push (`SUBSCRIBE`), consumer groups with a range assignor and durable offsets, DLQ with NACK. |
 | **Throughput** | Record batching on both sides: one frame for N records, one fsync per partition instead of per record. |
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
-| **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups, single-leader replication with `acks=all`. Optional Raft consensus over cluster metadata: a majority-elected controller and a replicated ownership table. |
+| **Replication** | Automatic failover: a Raft-elected leader per replica group, an in-sync replica set that `acks=all` waits for, a high watermark consumers read up to, and epoch-based log truncation when an old leader returns. Clients follow `leader=` hints across a bootstrap host list. |
+| **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups. Optional Raft consensus over cluster metadata: a majority-elected controller and a replicated ownership table. |
 | **Admin** | Create/describe/delete topics, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
 | **Security** | TLS on every listener (mutual TLS optional, `SIGHUP` reloads certificates), multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 with `tls-server-end-point` channel binding, per-user and per-topic quotas, optional auth on the metrics port. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
@@ -331,6 +332,29 @@ path is untouched — records still go to one owner per partition; consensus onl
 decides who that is. Omit the block and the broker keeps the previous
 epoch-fencing behaviour. Details: [docs/cluster.md](docs/cluster.md).
 
+Replication with automatic failover is configured under `Server.Replication`
+on three (or five) brokers that each hold a full copy of the data:
+
+```json
+"Server": {
+  "Acks": "all",
+  "Replication": { "Enabled": true, "ReplicaId": 1, "Role": "leader",
+                   "ReplicatePort": 9095, "ClientAddress": "10.0.0.1:9092",
+                   "Peers": [ { "Id": 2, "Address": "10.0.0.2:9095", "ClientAddress": "10.0.0.2:9092" },
+                              { "Id": 3, "Address": "10.0.0.3:9095", "ClientAddress": "10.0.0.3:9092" } ],
+                   "Failover": { "Enabled": true } }
+}
+```
+
+The replicas elect a leader by majority; followers copy every partition log
+(internal topics included) at identical offsets and refuse clients with a
+`leader=` hint, which `Client.new{ hosts = {...} }` follows. When the leader
+dies, an in-sync follower takes over with every `acks=all` record, rebuilds
+committed offsets and producer state from the replicated internal topics, and
+the old leader truncates its unreplicated tail when it returns. Without the
+`Failover` block, replication stays the static push mode. Details:
+[docs/replication.md](docs/replication.md).
+
 ## Testing
 
 ```bash
@@ -368,6 +392,7 @@ and fetch paths, wire protocol, and metrics — then
 | Doc | Covers |
 | --- | --- |
 | [DESIGN.md](DESIGN.md) | Architecture: layering, code layout, data flow, wire protocol, observability |
+| [docs/replication.md](docs/replication.md) | Replication, automatic failover, the in-sync replica set |
 | [docs/cluster.md](docs/cluster.md) | Clustering, partition reassignment, autobalancer |
 | [docs/transactions.md](docs/transactions.md) | Idempotent producer, transactions, `read_committed` |
 | [docs/batching.md](docs/batching.md) | Batch wire formats, guarantees, limits |

@@ -40,6 +40,9 @@ end
 
 function CommitLogPartition:write_message(msg)
     assert(getmetatable(msg) == message_m.Message, "msg must be a Message instance")
+    if self.read_only then
+        return -1, "partition is read-only: this replica is not the leader"
+    end
 
     local offset, err = self.commitlog:append_message(msg)
     if err then
@@ -62,6 +65,36 @@ function CommitLogPartition:read_message(offset)
         return nil, offset, err
     end
     return msg, next_offset, nil, at
+end
+
+function CommitLogPartition:append_raw(offset, bytes)
+    assert(type(offset) == "number", "offset must be a number")
+    assert(type(bytes) == "string", "bytes must be a string")
+    local at, err = self.commitlog:append_at(bytes, offset)
+    if not at then return nil, err end
+    self.offset = self.commitlog:newest_offset()
+    return at, nil
+end
+
+function CommitLogPartition:read_raw(offset)
+    assert(type(offset) == "number", "offset must be a number")
+    return self.commitlog:read_raw(offset)
+end
+
+function CommitLogPartition:truncate_to(offset)
+    assert(type(offset) == "number", "offset must be a number")
+    local err = self.commitlog:truncate_tail(offset)
+    self.offset = self.commitlog:newest_offset()
+    if err then return nil, err end
+    return true
+end
+
+function CommitLogPartition:reset_to(offset)
+    assert(type(offset) == "number", "offset must be a number")
+    local err = self.commitlog:reset(offset)
+    if err then return nil, err end
+    self.offset = self.commitlog:newest_offset()
+    return true
 end
 
 function CommitLogPartition:oldest_offset()

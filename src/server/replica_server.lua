@@ -3,6 +3,7 @@ local json    = require("dkjson")
 local msg_m   = require("src.record.message")
 local httpk   = require("src.server.http_kit")
 local tls_m   = require("src.io.tls")
+local ct      = require("src.core.ct")
 local log     = require("src.log.logger").get("replica_server")
 
 local M = {}
@@ -19,6 +20,8 @@ function M.new(opts)
         host    = opts.host or "127.0.0.1",
         port    = assert(opts.port, "port required"),
         tls     = opts.tls,
+        group   = opts.group,
+        token   = opts.token,
     }, M)
 end
 
@@ -49,6 +52,54 @@ function M:_apply(topic_name, partition_id, payload)
     return part.offset, nil
 end
 
+function M:_handle_group(sock, headers, leftover, deadline, method, path)
+    local group = self.group
+    local function reply(status, ctype, body)
+        pcall(function()
+            respond(self.reactor, sock, status, ctype, body)
+            sock:close()
+        end)
+    end
+    local function reply_json(status, value)
+        reply(status, "application/json", json.encode(value))
+    end
+
+    if self.token and not ct.equal(self.token,
+            httpk.header(headers, "X%-Cluster%-Token") or "") then
+        return reply(401, "text/plain", "bad or missing X-Cluster-Token\n")
+    end
+    if method == "GET" and path == "/replication/status" then
+        return reply_json(200, group:status())
+    end
+    if method ~= "POST" then
+        return reply(405, "text/plain", "replication endpoints take POST\n")
+    end
+
+    local clen = tonumber(httpk.header(headers, "Content%-Length")) or 0
+    local body, berr = httpk.read_body(self.reactor, sock, leftover, clen, deadline, MAX_BODY)
+    if not body then
+        return reply(400, "text/plain", "body: " .. tostring(berr) .. "\n")
+    end
+    local args = json.decode(body)
+    if type(args) ~= "table" then
+        return reply(400, "text/plain", "body must be a JSON object\n")
+    end
+
+    local raft_kind = path:match("^/replication/raft/(%a+)$")
+    if raft_kind then
+        local result, err = group:handle_raft(raft_kind, args)
+        if not result then return reply(400, "text/plain", tostring(err) .. "\n") end
+        return reply_json(200, result)
+    elseif path == "/replication/manifest" then
+        return reply_json(group:handle_manifest(args))
+    elseif path == "/replication/epochs" then
+        return reply_json(group:handle_epochs(args))
+    elseif path == "/replication/fetch" then
+        return reply(group:handle_fetch(args))
+    end
+    return reply(404, "text/plain", "unknown replication endpoint\n")
+end
+
 function M:_handle(sock)
     local deadline = socket.gettime() + READ_DEADLINE
     local headers, leftover = httpk.read_headers(self.reactor, sock, deadline)
@@ -56,6 +107,17 @@ function M:_handle(sock)
 
     local method, path = headers:match("^(%S+)%s+(%S+)")
     path = path and path:gsub("%?.*", "") or ""
+    if self.group then
+        if path:sub(1, 13) == "/replication/" then
+            return self:_handle_group(sock, headers, leftover, deadline, method, path)
+        end
+        pcall(function()
+            respond(self.reactor, sock, 404, "text/plain",
+                "failover replication serves /replication/* only\n")
+            sock:close()
+        end)
+        return
+    end
     if method ~= "POST" or path ~= "/replicate" then
         pcall(function()
             respond(self.reactor, sock, method ~= "POST" and 405 or 404,
@@ -103,8 +165,10 @@ function M:start()
         log:error("replica listen failed on %s:%d: %s", self.host, self.port, lerr)
         return nil, lerr
     end
-    log:info("replica endpoint listening on %s:%d (POST /replicate, %s)",
-        self.host, self.port, tls_m.describe(self.tls))
+    log:info("replica endpoint listening on %s:%d (%s, %s%s)",
+        self.host, self.port,
+        self.group and "failover: /replication/*" or "POST /replicate",
+        tls_m.describe(self.tls), self.token and ", token auth on" or "")
     return true
 end
 

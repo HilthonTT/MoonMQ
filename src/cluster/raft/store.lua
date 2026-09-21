@@ -32,10 +32,10 @@ local function sanitize_entry(raw, expected_index)
     }
 end
 
-function Store.new(data_dir)
+function Store.new(data_dir, file_name)
     assert(type(data_dir) == "string", "data_dir must be a string")
     local self = setmetatable({
-        path = fs_m.join_path(data_dir, FILE_NAME),
+        path = fs_m.join_path(data_dir, file_name or FILE_NAME),
     }, Store)
 
     local state, lerr = self:_load()

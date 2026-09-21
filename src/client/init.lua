@@ -19,11 +19,15 @@ local CODEC_BY_NAME = {
 local Client = {}
 Client.__index = Client
 
-function Client.new(opts)
-    opts = opts or {}
-    local host = opts.host or "127.0.0.1"
-    local port = opts.port or 9092
+local MAX_LEADER_REDIRECTS = 3
 
+local function split_address(address)
+    local host, port = tostring(address):match("^%[?([^%]]-)%]?:(%d+)$")
+    if not host or host == "" then return nil end
+    return host, tonumber(port)
+end
+
+local function connect(opts, host, port)
     local cbind = nil
     local sock, cerr = socket.connect(host, port)
     if not sock then
@@ -154,6 +158,35 @@ function Client.new(opts)
     end
 
     return c
+end
+
+function Client.new(opts)
+    opts = opts or {}
+    local targets = {}
+    if type(opts.hosts) == "table" and #opts.hosts > 0 then
+        for _, address in ipairs(opts.hosts) do
+            local host, port = split_address(address)
+            if host then targets[#targets + 1] = { host = host, port = port } end
+        end
+        if #targets == 0 then return nil, "opts.hosts has no host:port entries" end
+    else
+        targets[1] = { host = opts.host or "127.0.0.1", port = opts.port or 9092 }
+    end
+
+    local last_err
+    for _, target in ipairs(targets) do
+        local host, port = target.host, target.port
+        for _ = 0, MAX_LEADER_REDIRECTS do
+            local c, err = connect(opts, host, port)
+            if c then return c end
+            last_err = err
+            local next_host, next_port = split_address(
+                type(err) == "string" and err:match("leader=(%S+)") or "")
+            if not next_host or (next_host == host and next_port == port) then break end
+            host, port = next_host, next_port
+        end
+    end
+    return nil, last_err
 end
 
 function Client:_mark_closed_on(err)

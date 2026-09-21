@@ -29,6 +29,7 @@ function Broker.new(data_dir, opts)
         id = uuid.bytes(),
         topic_manager = topic_manager,
         traffic = traffic_m.new(),
+        opts = opts,
     }, Broker)
 
     local lerr = broker:load_topics()
@@ -52,6 +53,39 @@ function Broker.new(data_dir, opts)
     broker.dlq = dlq_m.DlqManager.new(broker, opts.dlq)
 
     return broker, nil
+end
+
+function Broker:reload_state()
+    local opts = self.opts or {}
+
+    local offsets, oerr = offmgr_m.OffsetManager.new(self.topic_manager, opts.offsets)
+    if not offsets then return nil, oerr end
+
+    local prod_state, perr =
+        prodstate_m.ProducerStateManager.new(self.topic_manager, opts.producer_state)
+    if not prod_state then return nil, perr end
+
+    local txn_opts = {}
+    for k, v in pairs(opts.transactions or {}) do txn_opts[k] = v end
+    txn_opts.defer_recovery = true
+
+    local previous = { offsets = self.offsets, producer_state = self.producer_state }
+    self.offsets = offsets
+    self.producer_state = prod_state
+
+    local txn, terr = txn_m.Coordinator.new(self, txn_opts)
+    if not txn then
+        self.offsets = previous.offsets
+        self.producer_state = previous.producer_state
+        return nil, terr
+    end
+    self.transactions = txn
+    self.dlq = dlq_m.DlqManager.new(self, opts.dlq)
+    return true
+end
+
+function Broker:_topic_changed(kind, name, topic)
+    if self.on_topic_change then self.on_topic_change(kind, name, topic) end
 end
 
 function Broker:load_topics()
@@ -122,6 +156,7 @@ function Broker:create_topic(name, num_partitions, opts)
             self._committer_factory(p)
         end
     end
+    if topic then self:_topic_changed("create", name, topic) end
     return topic, err
 end
 
@@ -145,6 +180,7 @@ function Broker:delete_topic(name)
 
     local ok, err = self.topic_manager:delete_topic(name)
     if not ok then return nil, err end
+    self:_topic_changed("delete", name)
 
     if self.offsets then
         local _, oerr = self.offsets:delete_topic_offsets(name)
@@ -233,6 +269,7 @@ function Broker:alter_topic_config(name, changes)
 
     local ok, serr = self.topic_manager:set_config(name, merged)
     if not ok then return nil, serr end
+    self:_topic_changed("alter", name)
 
     for key, value in pairs(parsed) do
         if LIVE_PARTITION_FIELDS[key] then

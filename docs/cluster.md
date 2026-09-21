@@ -5,9 +5,9 @@ into a statically-configured cluster that can **move partitions between
 brokers at runtime** — either by hand (drive the `Reassigner` yourself) or
 automatically via the AutoMQ-style autobalancer (`src/autobalancer/`).
 
-It follows the same philosophy as MoonMQ's replication: static membership
-from config, HTTP for inter-broker transport, no consensus protocol, and
-every boundary documented rather than hidden.
+It follows the same philosophy as MoonMQ's static replication: static
+membership from config, HTTP for inter-broker transport, and every boundary
+documented rather than hidden. Consensus is opt-in (`Raft`, below).
 
 ## The pieces
 

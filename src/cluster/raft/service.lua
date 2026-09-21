@@ -30,6 +30,9 @@ function Service.new(opts)
         last_ack    = {},
         next_beat   = 0,
         leader_generation = nil,
+        path_prefix   = opts.path_prefix or "/cluster/raft",
+        metric_prefix = opts.metric_prefix or "moonmq_raft",
+        can_campaign  = opts.can_campaign,
     }, Service)
 end
 
@@ -63,7 +66,7 @@ function Service:_elect()
         log:error("election aborted: %s", tostring(generation))
         return
     end
-    metrics.inc("moonmq_raft_elections_total")
+    metrics.inc(self.metric_prefix .. "_elections_total")
 
     if node:quorum() == 1 then
         node:record_vote(node.id, term, generation)
@@ -79,7 +82,7 @@ function Service:_elect()
 
     for _, peer_id in ipairs(node.peers) do
         self.reactor:spawn(function()
-            local reply, err = self:_call(peer_id, "/cluster/raft/vote", args)
+            local reply, err = self:_call(peer_id, self.path_prefix .. "/vote", args)
             if not reply then
                 log:debug("vote request to %s failed: %s", peer_id, tostring(err))
                 return
@@ -120,7 +123,7 @@ function Service:_replicate(peer_id)
 
     self.inflight[peer_id] = true
     self.reactor:spawn(function()
-        local reply, err = self:_call(peer_id, "/cluster/raft/append", args)
+        local reply, err = self:_call(peer_id, self.path_prefix .. "/append", args)
         self.inflight[peer_id] = nil
         if not reply then
             log:debug("append to %s failed: %s", peer_id, tostring(err))
@@ -152,7 +155,7 @@ function Service:_send_snapshot(peer_id)
 
     self.inflight[peer_id] = true
     self.reactor:spawn(function()
-        local reply, err = self:_call(peer_id, "/cluster/raft/snapshot", args)
+        local reply, err = self:_call(peer_id, self.path_prefix .. "/snapshot", args)
         self.inflight[peer_id] = nil
         if not reply then
             log:debug("snapshot to %s failed: %s", peer_id, tostring(err))
@@ -200,12 +203,18 @@ function Service:step()
         end
     else
         self.leader_generation = nil
-        if now >= node.election_deadline then self:_elect() end
+        if now >= node.election_deadline then
+            if self.can_campaign and not self.can_campaign() then
+                node:reset_election_timer()
+            else
+                self:_elect()
+            end
+        end
     end
 
-    metrics.set("moonmq_raft_term", node:term())
-    metrics.set("moonmq_raft_is_controller", node:is_leader() and 1 or 0)
-    metrics.set("moonmq_raft_commit_index", node.commit_index)
+    metrics.set(self.metric_prefix .. "_term", node:term())
+    metrics.set(self.metric_prefix .. "_is_controller", node:is_leader() and 1 or 0)
+    metrics.set(self.metric_prefix .. "_commit_index", node.commit_index)
 end
 
 function Service:run(running)

@@ -14,6 +14,8 @@ local tls_m            = require("src.io.tls")
 local Replicator       = require("src.server.replicator")
 local ReplicaServer    = require("src.server.replica_server")
 local replica_m        = require("src.server.replica")
+local ReplicationGroup = require("src.replication.group")
+local ReplicaFetcher   = require("src.replication.fetcher")
 local version_m        = require("src.core.version")
 local Assignments      = require("src.cluster.assignments")
 local Peer             = require("src.cluster.peer")
@@ -53,6 +55,47 @@ local function build_replicator(reactor, rc)
     })
 end
 
+local function build_group(reactor, broker, rc, data_dir)
+    local fo = rc.failover
+    local members = {}
+    for _, peer in ipairs(rc.peers or {}) do
+        if peer.id == nil or type(peer.address) ~= "string" then
+            return nil, "Replication.Peers entries need Id and Address for failover"
+        end
+        members[#members + 1] = {
+            id             = tostring(peer.id),
+            address        = peer.address,
+            client_address = peer.client_address,
+        }
+    end
+    local role = rc.role or "leader"
+    local group, err = ReplicationGroup.new({
+        id              = tostring(rc.replica_id or 1),
+        data_dir        = data_dir,
+        broker          = broker,
+        reactor         = reactor,
+        members         = members,
+        client_address  = rc.client_address,
+        preferred       = role == "leader" or role == "both",
+        token           = rc.token,
+        tls             = rc.tls,
+        election_min    = fo.election_min,
+        election_max    = fo.election_max,
+        heartbeat_s     = fo.heartbeat_s,
+        rpc_timeout     = fo.rpc_timeout,
+        commit_wait     = fo.commit_wait,
+        max_log_entries = fo.max_log_entries,
+        isr_lag_s       = fo.isr_lag_s,
+        min_isr         = fo.min_isr,
+        max_fetch_wait  = fo.max_fetch_wait,
+        max_fetch_bytes = fo.max_fetch_bytes,
+        ack_timeout     = rc.ack_timeout,
+    })
+    if not group then return nil, err end
+    ReplicaFetcher.new(group)
+    return group
+end
+
 local DEFAULT_MAX_FRAME           = 1 * 1024 * 1024
 local DEFAULT_MAX_PENDING_BYTES   = 16 * 1024 * 1024
 local DEFAULT_SEND_DEADLINE       = 30
@@ -84,11 +127,17 @@ function Server.new(opts)
     opts = opts or {}
     assert(opts.data_dir, "opts.data_dir required")
 
+    local rc = opts.replication
+    local failover = rc ~= nil and rc.enabled == true and rc.failover ~= nil
+    if failover and opts.cluster and opts.cluster.enabled ~= false then
+        return nil, "Replication.Failover cannot be combined with Server.Cluster"
+    end
+
     local broker, berr = brk_m.Broker.new(opts.data_dir, {
         default_backend = opts.default_backend,
         dlq             = opts.dlq,
         -- With a cluster, txn recovery must wait for the router (below).
-        transactions    = { defer_recovery = opts.cluster ~= nil },
+        transactions    = { defer_recovery = opts.cluster ~= nil or failover },
     })
     if not broker then return nil, berr end
 
@@ -130,6 +179,22 @@ function Server.new(opts)
         "Highest committed index in the controller metadata log.")
     metrics.describe("moonmq_raft_elections_total", "counter",
         "Controller elections this broker has started.")
+    metrics.describe("moonmq_replication_is_leader", "gauge",
+        "1 when this replica is the elected replication leader serving clients.")
+    metrics.describe("moonmq_replication_epoch", "gauge",
+        "Current replication leader epoch.")
+    metrics.describe("moonmq_replication_isr_size", "gauge",
+        "Replicas in the committed in-sync set, the leader included.")
+    metrics.describe("moonmq_replication_isr_shrinks_total", "counter",
+        "Replicas dropped from the in-sync set for falling behind.")
+    metrics.describe("moonmq_replication_isr_expands_total", "counter",
+        "Replicas added back to the in-sync set after catching up.")
+    metrics.describe("moonmq_replication_leader_changes_total", "counter",
+        "Times this replica took over as replication leader.")
+    metrics.describe("moonmq_replication_truncations_total", "counter",
+        "Partition logs truncated to match a new leader.")
+    metrics.describe("moonmq_replication_fetched_records_total", "counter",
+        "Records a follower copied from the replication leader.")
     metrics.describe("moonmq_tls_handshakes_total", "counter",
         "Completed TLS handshakes across every listener.")
     metrics.describe("moonmq_tls_reloads_total", "counter",
@@ -154,7 +219,18 @@ function Server.new(opts)
             requested_connections, reactor.fd_limit, fd_reserve, max_connections)
     end
 
-    local replicator = build_replicator(reactor, opts.replication)
+    local replicator, group
+    if failover then
+        local gerr
+        group, gerr = build_group(reactor, broker, rc, opts.data_dir)
+        if not group then return nil, gerr end
+        replicator = group
+        broker.high_watermark = function(topic, partition)
+            return group:high_watermark(topic, partition)
+        end
+    else
+        replicator = build_replicator(reactor, opts.replication)
+    end
 
     local cluster = nil
     local cc = opts.cluster
@@ -263,7 +339,7 @@ function Server.new(opts)
     if cluster and broker.transactions then
         broker.transactions:set_router(cluster.router)
     end
-    if broker.transactions and broker.transactions.recover then
+    if broker.transactions and broker.transactions.recover and not failover then
         local rok, rerr = broker.transactions:recover()
         if not rok then return nil, rerr end
     end
@@ -274,6 +350,9 @@ function Server.new(opts)
         reactor     = reactor,
         replicator  = replicator,
         replication = opts.replication,
+        replication_group = group,
+        acks        = acks,
+        max_groups  = opts.max_groups or DEFAULT_MAX_GROUPS,
         cluster     = cluster,
         autobalance = opts.autobalance,
         coordinator = GroupCoordinator.new(broker, {
@@ -334,7 +413,42 @@ function Server.new(opts)
 
     broker.group_coordinator = server.coordinator
 
+    if group then
+        group.on_promote = function(epoch) return server:_on_promote(epoch) end
+        group.on_demote  = function() server:_on_demote() end
+    end
+
     return server
+end
+
+function Server:_writable()
+    local group = self.replication_group
+    return group == nil or group:is_leader()
+end
+
+function Server:_on_promote(epoch)
+    local ok, err = self.broker:reload_state()
+    if not ok then return nil, err end
+    local rok, rerr = self.broker.transactions:recover()
+    if not rok then return nil, rerr end
+
+    self.coordinator = GroupCoordinator.new(self.broker, { max_groups = self.max_groups })
+    self.broker.group_coordinator = self.coordinator
+    self.producer = prd_m.Producer.new(self.broker, self.acks, {
+        replicator = self.replicator,
+    })
+    log:info("serving clients as the replication leader for epoch %d", epoch)
+    return true
+end
+
+function Server:_on_demote()
+    local message = self.replication_group:not_leader_message()
+    local open = {}
+    for _, conn in pairs(self.connections_by_id) do open[#open + 1] = conn end
+    for _, conn in ipairs(open) do
+        conn:close(Connection.REASON_NOT_LEADER, proto.ERR_NOT_LEADER, message)
+    end
+    log:info("no longer the replication leader; closed %d client connection(s)", #open)
 end
 
 function Server:_register_conn(ip)
@@ -356,7 +470,7 @@ function Server:_unregister_conn(conn)
 
     self.coordinator:handle_disconnect(conn)
 
-    if conn.in_txn and conn.producer_name then
+    if conn.in_txn and conn.producer_name and self:_writable() then
         pcall(function()
             self.broker.transactions:end_txn(
                 conn.producer_name, conn.pid, conn.epoch, false)
@@ -429,6 +543,18 @@ function Server:dispatch(conn, op, correl, payload)
         "moonmq_dispatch_duration_seconds",
         { op = string.format("0x%02x", op) })
 
+    local group = self.replication_group
+    if group and not group:is_leader() then
+        local frame = proto.encode_error(correl, proto.ERR_NOT_LEADER,
+            group:not_leader_message())
+        pcall(function()
+            self.reactor:send_all(conn.sock, frame, socket.gettime() + 0.25)
+        end)
+        conn:close(Connection.REASON_NOT_LEADER)
+        stop()
+        return
+    end
+
     local handler = handlers.BY_OP[op]
     if handler then
         handler(self, conn, correl, payload)
@@ -451,7 +577,7 @@ end
 
 function Server:_run_group_reaper()
     self:_every(self.group_reaper_interval, "group reaper", function()
-        self.coordinator:reap()
+        if self:_writable() then self.coordinator:reap() end
     end)
 end
 
@@ -464,6 +590,7 @@ end
 function Server:_run_producer_expiry()
     local max_idle_ms = self.producer_expiry_s * 1000
     self:_every(self.producer_expiry_check_interval, "producer expiry sweep", function()
+        if not self:_writable() then return end
         local expired, err = self.broker:expire_idle_producers(max_idle_ms, {
             is_active = function(_name, pid)
                 for _, conn in pairs(self.connections_by_id) do
@@ -661,7 +788,25 @@ function Server:start()
     end
 
     local rc = self.replication
-    if rc and rc.enabled then
+    if self.replication_group then
+        local group = self.replication_group
+        local rs = ReplicaServer.new({
+            reactor = self.reactor,
+            broker  = self.broker,
+            host    = rc.replicate_host or "127.0.0.1",
+            port    = rc.replicate_port,
+            tls     = rc.server_tls,
+            group   = group,
+            token   = rc.token,
+        })
+        local rok, rerr = rs:start()
+        if not rok then return nil, rerr end
+        self.reactor:spawn(function()
+            group:run(function() return self.running end)
+        end)
+        log:info("replication failover: replica %s of %d, raft restored at term %d",
+            group.id, #group.members, group.node:term())
+    elseif rc and rc.enabled then
         local role = rc.role or "leader"
         if role == "follower" or role == "both" then
             local rs = ReplicaServer.new({
@@ -758,6 +903,7 @@ function Server:snapshot()
             listed_truncated = truncated,
             top_by_bytes     = top_n,
         },
+        replication = self.replication_group and self.replication_group:status() or nil,
     }
 end
 

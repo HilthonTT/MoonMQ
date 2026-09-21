@@ -178,9 +178,27 @@ if is_main(arg, ...) then
     local rep = s.Replication or {}
     local peers = {}
     for _, p in ipairs(rep.Peers or {}) do
-        peers[#peers + 1] = { id = p.Id, address = p.Address }
+        peers[#peers + 1] = { id = p.Id, address = p.Address, client_address = p.ClientAddress }
     end
     local rep_server_tls, rep_client_tls = build_tls(rep.Tls, "Replication.Tls")
+    local failover = nil
+    local fo = rep.Failover
+    if fo and fo.Enabled ~= false then
+        failover = {
+            election_min    = fo.ElectionTimeoutMs and fo.ElectionTimeoutMs / 1000 or nil,
+            election_max    = fo.ElectionTimeoutMaxMs and fo.ElectionTimeoutMaxMs / 1000
+                              or (fo.ElectionTimeoutMs and fo.ElectionTimeoutMs * 1.6 / 1000)
+                              or nil,
+            heartbeat_s     = fo.HeartbeatMs and fo.HeartbeatMs / 1000 or nil,
+            rpc_timeout     = fo.RpcTimeoutMs and fo.RpcTimeoutMs / 1000 or nil,
+            commit_wait     = fo.CommitTimeoutSeconds,
+            max_log_entries = fo.MaxLogEntries,
+            isr_lag_s       = fo.IsrLagSeconds,
+            min_isr         = fo.MinInsyncReplicas,
+            max_fetch_wait  = fo.MaxFetchWaitMs and fo.MaxFetchWaitMs / 1000 or nil,
+            max_fetch_bytes = fo.MaxFetchBytes,
+        }
+    end
     local replication = {
         enabled        = rep.Enabled or false,
         replica_id     = rep.ReplicaId or 1,
@@ -192,6 +210,9 @@ if is_main(arg, ...) then
         ack_timeout    = rep.AckTimeout,
         server_tls     = rep_server_tls,
         tls            = rep_client_tls,
+        failover       = failover,
+        token          = rep.Token,
+        client_address = rep.ClientAddress,
     }
 
     local cluster = nil
@@ -285,5 +306,9 @@ if is_main(arg, ...) then
 
     log:info("env=%s host=%s port=%d data_dir=%s",
         cfg._environment, srv.host, srv.port, s.DataDir or "./data_server")
-    srv:start()
+    local started, serr = srv:start()
+    if not started then
+        log:error("server: %s", tostring(serr))
+        os.exit(1)
+    end
 end

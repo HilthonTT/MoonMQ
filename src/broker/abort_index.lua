@@ -13,8 +13,9 @@ end
 function AbortIndex.new(data_dir)
     assert(type(data_dir) == "string", "data_dir must be a string")
     local self = setmetatable({
-        path = fs_m.join_path(data_dir, FILE_NAME),
-        map  = {},
+        path    = fs_m.join_path(data_dir, FILE_NAME),
+        map     = {},
+        version = 0,
     }, AbortIndex)
     local lerr = self:_load()
     if lerr then return nil, lerr end
@@ -32,8 +33,13 @@ function AbortIndex:_load()
     if type(parsed) ~= "table" then
         return string.format("%s: %s", self.path, tostring(perr or "not a JSON object"))
     end
-    for _, e in ipairs(parsed.entries or {}) do
-        if type(e.topic) == "string" and type(e.partition) == "number"
+    self:_fill(parsed.entries)
+    return nil
+end
+
+function AbortIndex:_fill(raw)
+    for _, e in ipairs(raw or {}) do
+        if type(e) == "table" and type(e.topic) == "string" and type(e.partition) == "number"
             and type(e.pid) == "number" and type(e.first) == "number"
             and type(e.upto) == "number" then
             local k = key(e.topic, e.partition)
@@ -46,10 +52,9 @@ function AbortIndex:_load()
             }
         end
     end
-    return nil
 end
 
-function AbortIndex:_save()
+function AbortIndex:all()
     local entries = {}
     for k, list in pairs(self.map) do
         local topic, partition = k:match("^(.*)%z(%d+)$")
@@ -65,9 +70,26 @@ function AbortIndex:_save()
         if a.partition ~= b.partition then return a.partition < b.partition end
         return a.first < b.first
     end)
+    return entries
+end
 
+function AbortIndex:_save()
+    self.version = self.version + 1
     return fs_m.atomic_write(self.path,
-        json.encode({ entries = entries }, { indent = true }))
+        json.encode({ entries = self:all() }, { indent = true }))
+end
+
+function AbortIndex:replace(entries)
+    assert(type(entries) == "table", "entries must be a list")
+    local prev = self.map
+    self.map = {}
+    self:_fill(entries)
+    local ok, err = self:_save()
+    if not ok then
+        self.map = prev
+        return nil, string.format("persist abort index: %s", tostring(err))
+    end
+    return true
 end
 
 function AbortIndex:add(topic, partition, pid, epoch, first, upto)

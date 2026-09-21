@@ -56,9 +56,9 @@ function M.post(reactor, opts)
         sock = secured
     end
 
-    local function done(result, err)
+    local function done(result, err, code)
         pcall(function() sock:close() end)
-        return result, err
+        return result, err, code
     end
 
     local body = opts.body or ""
@@ -86,8 +86,9 @@ function M.post(reactor, opts)
     if not text then return done(nil, tostring(berr)) end
 
     if code ~= 200 then
-        return done(nil, string.format("HTTP %d: %s", code, text))
+        return done(nil, string.format("HTTP %d: %s", code, text), code)
     end
+    if opts.raw then return done(text) end
 
     local parsed, _, perr = json.decode(text)
     if type(parsed) ~= "table" then

@@ -272,6 +272,121 @@ function CommitLog:append_message(msg)
     return self:append(record)
 end
 
+function CommitLog:append_at(record, offset)
+    assert(type(record) == "string", "record must be a string")
+    assert(type(offset) == "number", "offset must be a number")
+    if offset < self:newest_offset() then
+        return nil, string.format("replica append at offset %d below the log end %d",
+            offset, self:newest_offset())
+    end
+
+    if self:check_split() then
+        local serr = self:split()
+        if serr then return nil, serr end
+    end
+
+    local ok, err = self.active_segment:append_at(record, offset)
+    if not ok then return nil, err end
+    return offset, nil
+end
+
+function CommitLog:read_raw(offset)
+    assert(type(offset) == "number", "offset must be a number")
+
+    if #self.segments == 0 or offset < self.segments[1].base_offset then
+        return nil, nil, string.format("offset %d out of range", offset)
+    end
+
+    for i = 1, #self.segments do
+        local seg = self.segments[i]
+        if offset < seg.next_offset then
+            local abs, position = seg.index:ceil(offset)
+            if abs then
+                local pos, serr = seg.file:seek("set", position)
+                if not pos then
+                    return nil, nil, string.format("seek failed: %s", tostring(serr))
+                end
+                local size_bytes = seg.file:read(8)
+                if not size_bytes or #size_bytes < 8 then
+                    return nil, nil, "failed to read record size: unexpected EOF"
+                end
+                local total_size = string.unpack(">I8", size_bytes)
+                if total_size < message_m.MIN_BODY
+                   or total_size > seg.position - (position + 8) then
+                    return nil, nil, "corrupt length prefix"
+                end
+                local body = seg.file:read(total_size)
+                if not body or #body < total_size then
+                    return nil, nil, "failed to read record body: unexpected EOF"
+                end
+                return size_bytes .. body, abs + 1, nil, abs
+            end
+        end
+    end
+
+    return nil, nil, string.format("offset %d out of range", offset)
+end
+
+function CommitLog:truncate_tail(offset)
+    assert(type(offset) == "number", "offset must be a number")
+    if offset >= self:newest_offset() then return nil end
+    if offset <= self:oldest_offset() then return self:reset(offset) end
+
+    local kept = {}
+    for i = 1, #self.segments do
+        local segment = self.segments[i]
+        if segment.base_offset >= offset then
+            local derr = segment:delete()
+            if derr then return derr end
+        else
+            kept[#kept + 1] = segment
+        end
+    end
+
+    local last = kept[#kept]
+    if last.next_offset > offset then
+        local slot = last.index:ceil_slot(offset)
+        if slot then
+            local _, position = last.index:entry_at(slot)
+            local terr = last.index:truncate_entries(slot)
+            if terr then return terr end
+            local ok, rerr = last:rewind(position, offset)
+            if not ok then
+                return string.format("failed to truncate segment: %s", tostring(rerr))
+            end
+        else
+            last.next_offset = offset
+        end
+    end
+
+    self.segments       = kept
+    self.active_segment = last
+
+    local sok, serr = last:sync_all()
+    if not sok then
+        return string.format("fsync after truncation failed: %s", tostring(serr))
+    end
+    io_sync.sync_dir(self.path)
+    return nil
+end
+
+function CommitLog:reset(offset)
+    assert(type(offset) == "number", "offset must be a number")
+    for i = 1, #self.segments do
+        local derr = self.segments[i]:delete()
+        if derr then return derr end
+    end
+    self.segments = {}
+    self.active_segment = nil
+
+    local segment, serr = Segment.new(self.path, offset, self.options.max_segment_bytes)
+    if not segment then return serr end
+    self.segments[1]    = segment
+    self.active_segment = segment
+    io_sync.sync_dir(self.path)
+    return nil
+end
+
 function CommitLog:segment_for_offset(offset)
     for i = 1, #self.segments do
         local s = self.segments[i]

@@ -98,7 +98,8 @@ client ──frame──> server/connection.lua   (framing, state machine, deadl
 * `acks=leader` — ack after fsync. Concurrent producers coalesce into ONE
   fsync via the group committer (`storage/group_committer.lua`).
 * `acks=all` — additionally wait until every configured follower's LEO
-  covers the record (`server/replicator.lua`).
+  covers the record (`server/replicator.lua`), or, with failover, every
+  member of the in-sync replica set (`replication/group.lua`).
 
 ## Storage
 
@@ -230,12 +231,22 @@ their reads at the Last Stable Offset and filter aborted data records via
 
 ## Replication vs clustering
 
-Two orthogonal features, both statically configured:
+Two orthogonal features:
 
 * **Replication** (`server/replicator.lua` + `replica_server.lua`):
   single-leader full-copy for durability. The leader ships every record to
   followers over `POST /replicate`; `acks=all` blocks on follower LEOs. No
   election.
+* **Replication with failover** (`src/replication/`, `Replication.Failover`):
+  the replicas run their own Raft group (`/replication/raft/*`) whose log holds
+  the leadership claim (its term is the leader epoch) and in-sync-set changes;
+  only ISR members may stand for election. Followers pull raw record bytes
+  (`/replication/fetch`) for every partition, internal topics included, so
+  offsets match the leader's, and truncate against a per-partition leader-epoch
+  history (`replication-epochs.json`) when the leader changes. `acks=all` waits
+  for the ISR, consumers read below the high watermark, and a newly elected
+  leader rebuilds offsets, producer state and transactions from the replicated
+  internal topics before serving. See [docs/replication.md](docs/replication.md).
 * **Clustering** (`src/cluster/` + `src/autobalancer/`): partition *placement*
   for load distribution — ownership table, live partition migration, produce
   forwarding, autobalancer. Consumer groups span the cluster (each group hashes
