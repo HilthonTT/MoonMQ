@@ -188,6 +188,16 @@ function Fetcher:_apply_manifest(resp)
         local topic = tm.topics[name]
         local config = type(t.config) == "table" and t.config or {}
         local local_uid = self.cache:uid(name)
+        if topic and #topic.partitions < t.partitions and not is_internal(name)
+           and not (local_uid and type(t.uid) == "string" and local_uid ~= t.uid) then
+            -- Same topic, grown on the leader: add the partitions here rather
+            -- than dropping the topic and recopying every existing one.
+            local added, aerr = self.broker:add_partitions(name, t.partitions)
+            if not added then
+                return nil, string.format("grow topic %s: %s", name, tostring(aerr))
+            end
+            log:info("grew topic %s to %d partitions to match the leader", name, t.partitions)
+        end
         if topic and #topic.partitions ~= t.partitions then
             if is_internal(name) then
                 return nil, string.format(

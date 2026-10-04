@@ -54,19 +54,21 @@ function Consumer:subscribe(topic_name)
         self.offsets[topic_name] = {}
     end
 
-    for _, partition in ipairs(topic.partitions) do
-        if self.offsets[topic_name][partition.id] == nil then
-            local stored_offset, load_err = self:load_offset(topic_name, partition.id)
-            if stored_offset then
-                self.offsets[topic_name][partition.id] = stored_offset
-            else
-                self.offsets[topic_name][partition.id] = 0
-                _ = load_err
-            end
-        end
-    end
+    self:_track_partitions(topic_name, topic)
 
     return true, nil
+end
+
+-- Starts tracking any partition of the topic this consumer has no position
+-- for yet: all of them on subscribe, and the new ones after the topic grows.
+function Consumer:_track_partitions(topic_name, topic)
+    local positions = self.offsets[topic_name]
+    for _, partition in ipairs(topic.partitions) do
+        if positions[partition.id] == nil then
+            local stored_offset = self:load_offset(topic_name, partition.id)
+            positions[partition.id] = stored_offset or 0
+        end
+    end
 end
 
 function Consumer:set_assignment(by_topic)
@@ -135,6 +137,8 @@ function Consumer:poll(opts)
             topic = t
             self.topics[topic_name] = t
         end
+
+        self:_track_partitions(topic_name, topic)
 
         for partition_id, offset in pairs(partition_offsets) do
             local partition = topic.partitions[partition_id]

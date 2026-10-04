@@ -74,10 +74,12 @@ function M:_ensure(body)
 
     local existing = self.broker.topic_manager.topics[req.topic]
     if existing then
-        if #existing.partitions < req.partitions then
-            return 400, string.format(
-                "ensure: topic exists with %d partitions, need %d",
-                #existing.partitions, req.partitions)
+        local have = #existing.partitions
+        if have < req.partitions then
+            local _, gerr = self.broker:add_partitions(req.topic, req.partitions)
+            if gerr then return 500, "ensure: " .. tostring(gerr) end
+            log:info("grew topic %s from %d to %d partitions for reassignment",
+                req.topic, have, req.partitions)
         end
         return 200, { ok = true }
     end

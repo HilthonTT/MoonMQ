@@ -293,10 +293,24 @@ end
 
 function Group:_topic_changed(kind, name, topic)
     self.meta_version = self.meta_version + 1
-    if kind == "create" and topic then
+    if (kind == "create" or kind == "grow") and topic then
         for _, p in ipairs(topic.partitions) do p.read_only = not self.serving end
     end
     if not self:is_leader() then return end
+    if kind == "grow" and topic then
+        local items = {}
+        for id, p in ipairs(topic.partitions) do
+            if not self.cache:has(name, id) then
+                items[#items + 1] = {
+                    topic = name, partition = id,
+                    epoch = self.state.epoch, start = p:oldest_offset(),
+                }
+            end
+        end
+        local ok, err = self.cache:assign_many(items)
+        if not ok then log:error("leader epochs for new partitions of %s: %s", name, tostring(err)) end
+        return
+    end
     if kind == "create" and topic then
         self.cache:forget_topic(name)
         self:_ensure_uid(name)

@@ -120,7 +120,7 @@ silently never fires.
 | `TXN_OFFSET_COMMIT` | `group:read` and `topic:read` per offset |
 | `CREATE_TOPIC` | `topic:create` on the name, **or** `cluster:create` |
 | `DELETE_TOPIC` | `topic:delete` |
-| `ALTER_TOPIC_CONFIG` | `topic:alter` |
+| `ALTER_TOPIC_CONFIG`, `CREATE_PARTITIONS` | `topic:alter` |
 | `DESCRIBE_TOPIC`, `LIST_OFFSETS` | `topic:describe` |
 | `DESCRIBE_GROUP` | `group:describe` |
 | `DELETE_GROUP` | `group:delete` |

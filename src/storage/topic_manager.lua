@@ -93,6 +93,57 @@ function TopicManager:create_topic(name, numPartitions, opts)
     return topic, nil
 end
 
+-- Grows an existing topic to `total` partitions. New partitions are appended
+-- to topic.partitions in place, so every holder of the Topic sees them.
+-- Partitions never shrink: keyed records already live where the old count
+-- hashed them.
+function TopicManager:add_partitions(name, total)
+    assert(type(name) == "string", "name must be a string")
+    assert(type(total) == "number", "total must be a number")
+
+    local topic = self.topics[name]
+    if not topic then
+        return nil, string.format("topic '%s' does not exist", name)
+    end
+
+    local current = #topic.partitions
+    if total <= current then
+        return nil, string.format(
+            "topic '%s' already has %d partition(s); the new count must be larger, got %d",
+            name, current, total)
+    end
+
+    local topicDir = self:topic_dir(name)
+    local opts, cerr = topic_config.load(topicDir)
+    if not opts then return nil, cerr end
+
+    -- The live partitions, not the config file, say which backend this topic
+    -- runs: a segmented topic's config does not record its backend.
+    local backend_name = getmetatable(topic.partitions[1]) == CommitLogPartition
+        and "commitlog" or "segmented"
+    local factory = BACKENDS[backend_name]
+
+    local opened = {}
+    for i = current + 1, total do
+        local partition, pErr = factory(topic, i, topicDir, opts)
+        if not partition then
+            for j, p in ipairs(opened) do
+                p:close()
+                fs_m.remove_all(fs_m.join_path(topicDir,
+                    string.format("partition-%d", current + j)))
+            end
+            fs_m.remove_all(fs_m.join_path(topicDir, string.format("partition-%d", i)))
+            return nil, string.format("failed to create partition %d: %s", i, pErr)
+        end
+        opened[#opened + 1] = partition
+    end
+
+    for j, p in ipairs(opened) do
+        topic.partitions[current + j] = p
+    end
+    return opened, nil
+end
+
 function TopicManager:topic_dir(name)
     return fs_m.join_path(self.baseDir, name)
 end

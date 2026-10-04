@@ -29,7 +29,7 @@ records.
 | **Correctness** | Idempotent producer (PID + sequence dedupe), multi-partition transactions, `read_committed` isolation with LSO. |
 | **Replication** | Automatic failover: a Raft-elected leader per replica group, an in-sync replica set that `acks=all` waits for, a high watermark consumers read up to, and epoch-based log truncation when an old leader returns. Clients follow `leader=` hints across a bootstrap host list. |
 | **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups. Optional Raft consensus over cluster metadata: a majority-elected controller and a replicated ownership table. |
-| **Admin** | Create/describe/delete topics, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
+| **Admin** | Create/describe/delete topics, add partitions, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
 | **Security** | TLS on every listener (mutual TLS optional, `SIGHUP` reloads certificates), multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 with `tls-server-end-point` channel binding, per-user and per-topic quotas, optional auth on the metrics port. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
 
@@ -91,6 +91,7 @@ deleted at runtime, and consumer groups inspected:
 
 ```lua
 assert(c:alter_topic_config("orders", { retention = 86400 }))  -- seconds
+assert(c:create_partitions("orders", 8))                       -- grow to 8 in total
 local d = assert(c:describe_group("billing"))
 -- d.members[i].assignment, d.offsets[i] = { topic, partition, offset }
 ```
@@ -100,6 +101,13 @@ lag a broker-side fact rather than something a sidecar has to reconstruct. A
 group holding committed offsets but no live members — an abandoned or
 between-deploys consumer — shows up in `list_groups` with state `empty`, which
 is usually the thing you went looking for.
+
+`create_partitions` takes the new **total**, not the number to add, and only
+grows. Existing records stay where they are, and consumer groups rebalance
+right away so the new partitions get a reader. A key's partition is
+`hash(key) % count`, so after growing, new records for a key may land on a
+different partition than its older ones. Ordering per key holds only from
+that point on, as in Kafka.
 
 Runnable examples: `src/examples/tcp_client.lua`,
 `src/examples/consumer_group.lua`.

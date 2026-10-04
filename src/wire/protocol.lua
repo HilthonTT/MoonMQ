@@ -44,6 +44,8 @@ M.OP_DELETE_GROUP     = 0x1E
 M.OP_AUTH_SCRAM       = 0x1F
 M.OP_AUTH_SCRAM_FINAL = 0x20
 
+M.OP_CREATE_PARTITIONS = 0x21
+
 M.OP_HEARTBEAT_REQ   = 0x0B
 M.OP_HEARTBEAT_RESP  = 0x0C
 
@@ -105,6 +107,7 @@ M.ERR_INVALID_CONFIG       = 17
 M.ERR_TOPIC_FORBIDDEN      = 18
 M.ERR_NOT_AUTHORIZED       = 19
 M.ERR_NOT_LEADER           = 20
+M.ERR_INVALID_PARTITIONS   = 21
 M.ERR_PRODUCER_FENCED      = 50
 M.ERR_INVALID_TXN_STATE    = 51
 M.ERR_TRANSACTION_TIMED_OUT = 52
@@ -439,6 +442,11 @@ function M.encode_alter_topic_config(correl_id, name, config)
     return encode_frame(M.OP_ALTER_TOPIC_CONFIG, correl_id, table.concat(parts))
 end
 
+function M.encode_create_partitions(correl_id, name, total)
+    local payload = encode_string(name) .. string.pack(">I4", total)
+    return encode_frame(M.OP_CREATE_PARTITIONS, correl_id, payload)
+end
+
 function M.encode_list_groups(correl_id)
     return encode_frame(M.OP_LIST_GROUPS, correl_id, "")
 end
@@ -749,6 +757,13 @@ function M.decode_create_topic(payload)
     if not name then return nil, err end
     if #payload - p + 1 < 4 then return nil, "short create_topic" end
     return { name = name, num_partitions = string.unpack(">I4", payload, p) }, nil
+end
+
+function M.decode_create_partitions(payload)
+    local name, p, err = decode_string(payload, 1, MAX_TOPIC_NAME)
+    if not name then return nil, err end
+    if #payload - p + 1 < 4 then return nil, "short create_partitions" end
+    return { name = name, total = string.unpack(">I4", payload, p) }, nil
 end
 
 local function single_name_decoder(field, max_len)

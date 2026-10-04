@@ -638,6 +638,18 @@ function Client:alter_topic_config(name, config)
     return true
 end
 
+function Client:create_partitions(name, total)
+    assert(type(name) == "string", "name must be a string")
+    assert(math.type(total) == "integer" and total >= 1,
+        "total must be a positive integer")
+
+    local payload, err = self:_call(function(correl)
+        return proto.encode_create_partitions(correl, name, total)
+    end)
+    if not payload then return nil, err end
+    return true
+end
+
 function Client:list_groups()
     local payload, err = self:_call(proto.encode_list_groups,
         proto.OP_GROUP_LIST, "GROUP_LIST")

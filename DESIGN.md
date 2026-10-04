@@ -291,6 +291,7 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | `COMMIT` · `NACK` | Commit a group offset · reject a record (→ DLQ) |
 | `CREATE_TOPIC` · `LIST_TOPICS` · `LIST_OFFSETS` | Topic admin · per-partition offset bounds (and offset-for-timestamp) |
 | `DELETE_TOPIC` · `DESCRIBE_TOPIC` · `ALTER_TOPIC_CONFIG` | Remove a topic · read its config · change it |
+| `CREATE_PARTITIONS` | Grow a topic to a larger partition count (never shrinks) |
 | `LIST_GROUPS` · `DESCRIBE_GROUP` · `DELETE_GROUP` | Consumer-group admin |
 | `INIT_PRODUCER_ID` · `PRODUCE_IDEMPOTENT` | Request a u64 PID · append `(PID, seq, …)` |
 | `BEGIN_TXN` · `END_TXN` · `TXN_OFFSET_COMMIT` | Transaction lifecycle |

@@ -326,6 +326,21 @@ function ConsumerGroup:forget_topic(topic_name)
     return true
 end
 
+function ConsumerGroup:grow_topic(topic_name, num_partitions)
+    assert(type(topic_name) == "string", "topic_name must be a string")
+    assert(type(num_partitions) == "number", "num_partitions must be a number")
+    if self.fsm:is(STATES.DEAD) then return false end
+    local partitions = self.topics[topic_name]
+    if not partitions or #partitions >= num_partitions then return false end
+
+    local grown = {}
+    for i = 1, num_partitions do grown[i] = i end
+    self.topics[topic_name] = grown
+
+    self:_run_rebalance()
+    return true
+end
+
 function ConsumerGroup:_rebalance()
     local assignments = self.strategy(self.members, self.topics)
 

@@ -264,6 +264,17 @@ function GroupCoordinator:forget_topic(topic_name)
     return n
 end
 
+function GroupCoordinator:grow_topic(topic_name, num_partitions)
+    assert(type(topic_name) == "string", "topic_name must be a string")
+    assert(type(num_partitions) == "number", "num_partitions must be a number")
+
+    local n = 0
+    for _, group in pairs(self.groups) do
+        if group:grow_topic(topic_name, num_partitions) then n = n + 1 end
+    end
+    return n
+end
+
 function GroupCoordinator:reap()
     for gid, group in pairs(self.groups) do
         group:check_heartbeats()

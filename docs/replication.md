@@ -169,6 +169,9 @@ leader's log start.
 * A replica that rejoins after a partition can trigger one extra election
   (there is no Raft pre-vote). No acknowledged data is at risk; clients see one
   more reconnect.
+* A topic grown with `CREATE_PARTITIONS` on the leader grows on each
+  follower when it next reads the leader's manifest. Only the new partitions
+  are copied; the existing ones are kept.
 * Consumer offsets, producer ids and transaction state are replicated, but
   consumer-group membership is not: after a failover, members rejoin their
   groups on the new leader.

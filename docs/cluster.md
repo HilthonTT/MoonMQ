@@ -271,6 +271,12 @@ treat it as broker data, not as a cache.
   transaction is in-memory: if the owner restarts mid-transaction,
   read_committed readers there may see the txn's records until the markers
   arrive. Reassigning a partition away mid-transaction is unsupported.
+* **`CREATE_PARTITIONS` grows the topic on the broker that receives it.**
+  New partitions are owned by that broker until moved. Topics are not
+  shared metadata: any other broker that has the topic keeps its own
+  partition count, so grow the topic on each of those brokers too. Moving
+  a partition to a broker that has fewer partitions grows that broker's
+  copy first.
 * **Internal topics (`__*`) never move.**
 * **Inter-broker HTTP is plaintext unless `Cluster.Tls` is set.** With it,
   the cluster listener and every peer client speak HTTPS (`Verify:

@@ -1150,6 +1150,37 @@ function M.alter_topic_config(server, conn, correl, payload)
     conn:send(proto.encode_ok(correl))
 end
 
+function M.create_partitions(server, conn, correl, payload)
+    local c = decode(conn, correl, proto.decode_create_partitions, payload)
+    if not c then return end
+
+    if not authorize(conn, correl, acl_m.RES_TOPIC, c.name,
+                     acl_m.OP_ALTER) then return end
+    if not charge(server, conn, correl, c.name, quota_m.DIM_REQUESTS, 1) then return end
+
+    if server.broker.is_internal(c.name) then
+        return fail(conn, correl, proto.ERR_TOPIC_FORBIDDEN,
+            "cannot add partitions to internal topic '%s'", c.name)
+    end
+    local topic = server.broker.topic_manager.topics[c.name]
+    if not topic then
+        return fail(conn, correl, proto.ERR_TOPIC_MISSING, "topic %s does not exist", c.name)
+    end
+    local current = #topic.partitions
+    if c.total <= current or c.total > 1024 then
+        return fail(conn, correl, proto.ERR_INVALID_PARTITIONS,
+            "topic '%s' has %d partition(s); the new count must be in %d..1024, got %d",
+            c.name, current, current + 1, c.total)
+    end
+
+    local _, aerr = server.broker:add_partitions(c.name, c.total)
+    if aerr then
+        return fail(conn, correl, proto.ERR_INTERNAL, aerr)
+    end
+    log:info("topic '%s' grown from %d to %d partitions", c.name, current, c.total)
+    conn:send(proto.encode_ok(correl))
+end
+
 function M.list_groups(server, conn, correl, _payload)
     local groups = server.coordinator:list()
 
@@ -1362,7 +1393,8 @@ M.BY_OP = {
     [proto.OP_DELETE_TOPIC]       = M.delete_topic,
     [proto.OP_DESCRIBE_TOPIC]     = M.describe_topic,
     [proto.OP_ALTER_TOPIC_CONFIG] = M.alter_topic_config,
-    [proto.OP_LIST_GROUPS]        = M.list_groups,
+    [proto.OP_CREATE_PARTITIONS]  = M.create_partitions,
+    [proto.OP_LIST_GROUPS]      = M.list_groups,
     [proto.OP_DESCRIBE_GROUP]     = M.describe_group,
     [proto.OP_DELETE_GROUP]       = M.delete_group,
     [proto.OP_JOIN_GROUP]         = M.join_group,

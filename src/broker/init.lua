@@ -164,6 +164,29 @@ function Broker.is_internal(name)
     return name:sub(1, 2) == "__"
 end
 
+function Broker:add_partitions(name, total)
+    assert(type(name) == "string", "name must be a string")
+    assert(type(total) == "number", "total must be a number")
+
+    if Broker.is_internal(name) then
+        return nil, string.format(
+            "refusing to add partitions to internal topic '%s'", name)
+    end
+
+    local added, err = self.topic_manager:add_partitions(name, total)
+    if not added then return nil, err end
+
+    if self._committer_factory then
+        for _, p in ipairs(added) do self._committer_factory(p) end
+    end
+    local topic = self.topic_manager.topics[name]
+    if self.group_coordinator then
+        self.group_coordinator:grow_topic(name, #topic.partitions)
+    end
+    self:_topic_changed("grow", name, topic)
+    return added, nil
+end
+
 function Broker:delete_topic(name)
     assert(type(name) == "string", "name must be a string")
 
