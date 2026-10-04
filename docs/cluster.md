@@ -272,6 +272,7 @@ treat it as broker data, not as a cache.
   read_committed readers there may see the txn's records until the markers
   arrive. Reassigning a partition away mid-transaction is unsupported.
 * **Internal topics (`__*`) never move.**
-* **Inter-broker HTTP is plaintext.** Bind to loopback/private networks,
-  set `Token`, firewall the port — same posture as `/replicate` and
-  `/metrics`.
+* **Inter-broker HTTP is plaintext unless `Cluster.Tls` is set.** With it,
+  the cluster listener and every peer client speak HTTPS (`Verify:
+  "required"` makes it mutual TLS) — see [security.md](security.md). Either
+  way, set `Token` and keep the port on a private network.
