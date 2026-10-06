@@ -1,6 +1,6 @@
 local M = {}
 
-M.Version   = "dev"
+M.Version   = "0.1.0"
 M.GitCommit = "unknown"
 M.BuildTime = "unknown"
 
