@@ -24,24 +24,45 @@ local function build_user(spec, index)
         return nil, string.format("%s: Username contains control characters", where)
     end
 
+    local cert_names = spec.CertificateNames or spec.certificate_names
+    if cert_names ~= nil then
+        if type(cert_names) ~= "table" or #cert_names == 0 then
+            return nil, string.format(
+                "%s: CertificateNames must be a non-empty list of names", where)
+        end
+        for _, n in ipairs(cert_names) do
+            if type(n) ~= "string" or n == "" or n:find("[%c]") then
+                return nil, string.format(
+                    "%s: CertificateNames entries must be non-empty strings", where)
+            end
+        end
+    end
+
     local stored = spec.PasswordHash or spec.password_hash
     if stored == "" then stored = nil end
 
     if not stored then
         local plain = spec.Password or spec.password
-        if type(plain) ~= "string" or plain == "" then
+        if type(plain) == "string" and plain ~= "" then
+            log:warn("hashing plaintext password for %q on startup. Generate a "
+                .. "stored credential instead: lua bin/moonmq-hash.lua <password> --scram",
+                username)
+            stored = auth_m.hash_password(plain)
+        elseif not cert_names then
             return nil, string.format(
-                "%s: PasswordHash (or Password) is required", where)
+                "%s: PasswordHash (or Password, or CertificateNames) is required", where)
         end
-        log:warn("hashing plaintext password for %q on startup. Generate a "
-            .. "stored credential instead: lua bin/moonmq-hash.lua <password> --scram",
-            username)
-        stored = auth_m.hash_password(plain)
     end
 
-    local parsed, perr = auth_m.parse_credential(stored)
-    if not parsed then
-        return nil, string.format("%s: %s", where, perr)
+    -- A user with only CertificateNames has no password: it can log in with
+    -- a client certificate (EXTERNAL) and with nothing else.
+    local parsed
+    if stored then
+        local perr
+        parsed, perr = auth_m.parse_credential(stored)
+        if not parsed then
+            return nil, string.format("%s: %s", where, perr)
+        end
     end
 
     local superuser = spec.Superuser == true or spec.superuser == true
@@ -66,6 +87,7 @@ local function build_user(spec, index)
         username   = username,
         credential = stored,
         parsed     = parsed,
+        cert_names = cert_names,
         acl        = user_acl,
         quota      = quota,
         superuser  = superuser,
@@ -88,6 +110,7 @@ function M.load(auth_cfg)
                 Superuser    = auth_cfg.Superuser ~= false,
                 Acls         = auth_cfg.Acls,
                 Quota        = auth_cfg.Quota,
+                CertificateNames = auth_cfg.CertificateNames,
             }
         else
             log:warn("Auth.Username is set but no credential is configured; "
@@ -103,11 +126,22 @@ function M.load(auth_cfg)
 
     local by_name = {}
     local names   = {}
+    local by_cert = {}
     for i, spec in ipairs(specs) do
         local user, err = build_user(spec, i)
         if not user then return nil, err end
         if by_name[user.username] then
             return nil, string.format("duplicate user %q", user.username)
+        end
+        -- One certificate name, one user: otherwise which principal a
+        -- certificate logs in as would depend on the request.
+        for _, cn in ipairs(user.cert_names or {}) do
+            if by_cert[cn] then
+                return nil, string.format(
+                    "certificate name %q is claimed by both %q and %q",
+                    cn, by_cert[cn].username, user.username)
+            end
+            by_cert[cn] = user
         end
         by_name[user.username] = user
         names[#names + 1] = user.username
@@ -122,7 +156,7 @@ function M.load(auth_cfg)
         end
     end
 
-    return setmetatable({ by_name = by_name, names = names }, Store), nil
+    return setmetatable({ by_name = by_name, names = names, by_cert = by_cert }, Store), nil
 end
 
 function M.single(username, credential, opts)
@@ -139,6 +173,19 @@ end
 function Store:get(username)
     if type(username) ~= "string" then return nil end
     return self.by_name[username]
+end
+
+-- The distinct users a certificate's names map to, in name order.
+function Store:for_certificate(cert_names)
+    local found, seen = {}, {}
+    for _, n in ipairs(cert_names or {}) do
+        local user = self.by_cert and self.by_cert[n]
+        if user and not seen[user.username] then
+            seen[user.username] = true
+            found[#found + 1] = user
+        end
+    end
+    return found
 end
 
 function Store:count()
@@ -162,8 +209,11 @@ function Store:describe()
     local out = {}
     for _, name in ipairs(self.names) do
         local user = self.by_name[name]
+        local kinds = {}
+        if user.parsed then kinds[#kinds + 1] = user.parsed.kind end
+        if user.cert_names then kinds[#kinds + 1] = "cert" end
         out[#out + 1] = string.format("%s[%s%s]", name,
-            user.parsed.kind,
+            table.concat(kinds, "+"),
             user.superuser and ",superuser" or "")
     end
     return table.concat(out, " ")

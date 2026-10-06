@@ -197,10 +197,9 @@ prober cannot spot the difference, and guaranteed to fail at proof
 verification. Password AUTH does the same with a decoy derivation, so response
 time does not answer "does this account exist?" either.
 
-Channel binding is advertised as unsupported (`n,,`), which is honest: there is
-no TLS channel to bind to yet. The client-final `c=` field is still verified
-against the header the client opened with, so a stripped binding request would
-be detected the day there is one.
+On a plaintext connection the client opens with `n,,` (no channel binding);
+over TLS it binds the exchange to the connection — see
+[Channel binding](#channel-binding).
 
 ---
 
@@ -384,14 +383,30 @@ messages to the real broker, and own the session afterwards. Channel binding
 closes that by mixing something unique to *this* TLS connection into the
 exchange.
 
-MoonMQ implements `tls-server-end-point` (RFC 5929): the binding value is the
-SHA-256 of the listener's DER-encoded certificate. The server derives it from
-`CertFile` at boot; the client derives it from the certificate it was actually
-handed during the handshake. A relay presenting a different certificate produces
-a different hash, the proof no longer verifies, and the login fails.
+MoonMQ implements two binding types:
 
-It is on by default on any TLS listener and needs nothing from the client
-beyond `mechanism = "scram-sha-256"` — the client offers binding whenever it
+* **`tls-exporter`** (RFC 9266), used on TLS 1.3. Both ends derive 32 bytes
+  of keying material from the TLS session itself, so the value is different
+  for every connection. A relay runs two separate sessions, one with the
+  client and one with the broker, and they cannot produce the same value
+  even when the relay holds a certificate the client trusts. The client
+  uses it whenever the session is TLS 1.3.
+* **`tls-server-end-point`** (RFC 5929), the fallback on TLS 1.2. The value
+  is the SHA-256 of the listener's DER-encoded certificate. The server
+  derives it from `CertFile` at boot; the client derives it from the
+  certificate it was actually handed during the handshake. A relay with a
+  different certificate produces a different hash, the proof no longer
+  verifies, and the login fails. A relay that holds the broker's own
+  certificate and key is not caught; `tls-exporter` catches it.
+
+`tls-unique` is not implemented. It is undefined under TLS 1.3, and
+RFC 9266 replaces it with `tls-exporter`. `tls-exporter` is not offered on
+TLS 1.2, where it is only safe with the extended-master-secret extension,
+which luasec cannot confirm.
+
+The broker accepts either type on any TLS listener. Binding is on by
+default and needs nothing from the client beyond
+`mechanism = "scram-sha-256"`, since the client offers binding whenever it
 has a TLS socket:
 
 ```json
@@ -401,7 +416,7 @@ has a TLS socket:
 
 | `ChannelBinding` | Behaviour |
 | --- | --- |
-| `preferred` (default) | Bind whenever the client asks (`p=tls-server-end-point`). An unbound `n,,` client still logs in. |
+| `preferred` (default) | Bind whenever the client asks (`p=tls-exporter` or `p=tls-server-end-point`). An unbound `n,,` client still logs in. |
 | `required` | Refuse any SCRAM login that is not bound. |
 | `disabled` | Do not offer binding; `p=` is refused. |
 
@@ -414,6 +429,9 @@ header **plus** the binding value, in constant time, so neither can be swapped
 independently.
 
 Passing `channel_binding = false` to `Client.new` opts a client out.
+`channel_binding = "tls-server-end-point"` pins the older type. Use it when
+connecting to a broker older than `tls-exporter` support, which refuses
+`p=tls-exporter`.
 
 ### Certificate rotation
 
@@ -442,12 +460,58 @@ The signal handler only sets a flag — the reload itself runs on the reactor,
 because reading and parsing certificates inside a signal handler is not
 something to do to a running broker.
 
-### Not covered
+### Certificate login (SASL EXTERNAL)
 
-* **Certificate-derived principals.** An mTLS client certificate authenticates
-  the *connection*; the MoonMQ principal still comes from AUTH or SCRAM.
-* **`tls-unique` binding.** Only `tls-server-end-point` is implemented;
-  `tls-unique` is not available under TLS 1.3 anyway.
+On a listener that verifies client certificates (`Verify: "peer"` or
+`"required"`), a client can log in with its certificate alone. The user's
+ACL, quota and superuser flag apply exactly as for a password login. Map
+certificates to users with `CertificateNames`:
+
+```json
+"Auth": {
+  "Users": [
+    { "Username": "orders-svc",
+      "CertificateNames": [ "orders.internal", "spiffe://prod/orders" ],
+      "Acls": [ { "Resource": "topic", "Name": "orders.*",
+                  "Operations": ["read", "write"] } ] },
+    { "Username": "ops", "PasswordHash": "scram-sha-256$…",
+      "CertificateNames": [ "ops@example.com" ], "Superuser": true }
+  ]
+}
+```
+
+```lua
+local c = assert(Client.new{
+    host = "broker.internal", port = 9092, mechanism = "external",
+    tls = { cafile = "/etc/moonmq/ca.crt",
+            certfile = "/etc/moonmq/orders.crt", keyfile = "/etc/moonmq/orders.key" },
+})
+```
+
+* **Which names count.** The certificate's subject common name, and its
+  subjectAltName DNS, URI and email entries. A user matches when any of
+  them equals one of its `CertificateNames`, compared exactly.
+* **One name, one user.** Two users claiming the same name is a boot error,
+  so a certificate never logs in as a user chosen by the request.
+* **Several users.** A certificate whose names match more than one user
+  must say which one with `username`. It is sent as the SASL authorization
+  identity and must be one of the matching users. Without it the login is
+  refused as ambiguous.
+* **Certificate-only users.** A user with `CertificateNames` and no
+  `PasswordHash` has no password. Password and SCRAM logins for it fail
+  exactly like a wrong password, decoy work included.
+* **Trust.** The certificate has to pass OpenSSL verification against the
+  listener's `CaFile`/`CaPath`, so whoever can get a certificate from that
+  CA with a mapped name can log in as that user. Use a CA dedicated to
+  MoonMQ clients, not a public one.
+* A refused EXTERNAL login counts toward the per-IP lockout like any other
+  failed login, and is logged with the reason. Successes and failures show
+  up in `moonmq_auth_success_total` / `moonmq_auth_failures_total` with
+  `mechanism="external"`.
+
+The exchange reuses the SASL frame: `AUTH_SCRAM` with mechanism `EXTERNAL`
+and the authorization identity (often empty) as the message, answered by
+`AUTH_OK` or an error.
 
 ---
 
@@ -489,7 +553,7 @@ wrong reasons.
 | --- | --- |
 | `moonmq_authz_denied_total` | `resource`, `operation` |
 | `moonmq_quota_throttled_total` | `scope` (`user`/`topic`), `dimension` |
-| `moonmq_auth_success_total` | `mechanism` (`plain`/`scram`) |
+| `moonmq_auth_success_total` | `mechanism` (`plain`/`scram`/`external`) |
 | `moonmq_auth_failures_total` | `mechanism` |
 | `moonmq_metrics_http_unauthorized_total` | — |
 | `moonmq_tls_handshakes_total` | — |

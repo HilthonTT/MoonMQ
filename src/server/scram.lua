@@ -9,6 +9,11 @@ M.MECHANISM = "SCRAM-SHA-256"
 M.GS2_HEADER  = "n,,"
 M.GS2_CBIND   = "biws"
 M.CBIND_TYPE  = "tls-server-end-point"
+M.CBIND_EXPORTER = "tls-exporter"
+
+-- SASL EXTERNAL (RFC 4422 appendix A): the identity comes from the TLS
+-- client certificate; the message is an optional authorization identity.
+M.EXTERNAL = "EXTERNAL"
 
 local function hmac_bin(key, msg)
     return sha2.hex_to_bin(sha2.hmac(sha2.sha256, key, msg))
@@ -127,24 +132,29 @@ function M.parse_client_first(message)
     }, nil
 end
 
-function M.negotiate_cbind(first, cbind_data, mode)
+-- `bindings` maps a channel-binding type to this connection's binding data;
+-- a bare string is the tls-server-end-point hash.
+function M.negotiate_cbind(first, bindings, mode)
     mode = mode or "preferred"
+    if type(bindings) == "string" then bindings = { [M.CBIND_TYPE] = bindings } end
+    local available = type(bindings) == "table" and next(bindings) ~= nil
 
     if first.cbind_flag == "p" then
-        if mode == "disabled" or not cbind_data then
+        if mode == "disabled" or not available then
             return nil, "channel binding is not available on this connection"
         end
-        if first.cbind_name ~= M.CBIND_TYPE then
+        local data = bindings[first.cbind_name]
+        if not data then
             return nil, string.format("unsupported channel-binding type %q",
                 tostring(first.cbind_name))
         end
-        return cbind_data
+        return data
     end
 
     if mode == "required" then
         return nil, "this listener requires SCRAM channel binding"
     end
-    if first.cbind_flag == "y" and cbind_data then
+    if first.cbind_flag == "y" and available then
         return nil, "channel-binding downgrade detected"
     end
     return ""

@@ -166,7 +166,8 @@ Auth.__index = Auth
 local function report_kdf_cost(store)
     local worst, worst_user = 0, nil
     for _, name in ipairs(store:names_sorted()) do
-        local iterations = store:get(name).parsed.iterations
+        local parsed = store:get(name).parsed
+        local iterations = parsed and parsed.iterations or 0
         if iterations > worst then worst, worst_user = iterations, name end
     end
     if worst < COST_CHECK_MIN_ITERATIONS then return worst end
@@ -406,7 +407,10 @@ function Auth:verify(user, pass, ip)
         return false, "auth busy, retry"
     end
 
-    local parsed = record and record.parsed or self.decoy
+    -- A certificate-only user has no password: run the decoy so the refusal
+    -- costs what a wrong password does, then refuse whatever matched.
+    local has_password = record ~= nil and record.parsed ~= nil
+    local parsed = has_password and record.parsed or self.decoy
 
     self.inflight = self.inflight + 1
     local ok, pass_ok = pcall(M.verify_password, parsed, pass or "",
@@ -416,7 +420,7 @@ function Auth:verify(user, pass, ip)
         return false, "auth aborted"
     end
 
-    if record and pass_ok then
+    if has_password and pass_ok then
         self.cred_cache[user] = digest
         self:note_success(ip)
         return true, nil, principal_of(record)
@@ -427,9 +431,39 @@ function Auth:verify(user, pass, ip)
 end
 
 
+-- Resolves a verified client certificate to a principal. `authzid` names
+-- the user to log in as; empty means "the one user this certificate maps
+-- to", which must then be unambiguous.
+function Auth:certificate_principal(cert_names, authzid)
+    if type(self.store.for_certificate) ~= "function" then
+        return nil, "no user is configured for certificate login"
+    end
+    local users = self.store:for_certificate(cert_names)
+    if #users == 0 then
+        return nil, "the client certificate maps to no user"
+    end
+
+    if authzid and authzid ~= "" then
+        for _, user in ipairs(users) do
+            if user.username == authzid then return principal_of(user) end
+        end
+        return nil, string.format(
+            "the client certificate may not log in as %q", authzid)
+    end
+
+    if #users > 1 then
+        local names = {}
+        for i, user in ipairs(users) do names[i] = user.username end
+        return nil, string.format(
+            "the client certificate maps to several users (%s); name one",
+            table.concat(names, ", "))
+    end
+    return principal_of(users[1])
+end
+
 function Auth:scram_credential(username)
     local record = self.store:get(username)
-    if record then
+    if record and record.parsed then
         local stored_key, server_key = M.scram_keys(record.parsed)
         return {
             salt       = record.parsed.salt,

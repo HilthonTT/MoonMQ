@@ -77,6 +77,83 @@ function M.peer_endpoint_hash(sock)
     return hash
 end
 
+-- RFC 9266 tls-exporter: keying material both ends derive from the session,
+-- so it is unique per connection rather than per certificate. Defined for
+-- TLS 1.3 only here: on 1.2 it is safe only with extended master secret,
+-- which luasec cannot report.
+M.CBIND_EXPORTER = "tls-exporter"
+local EXPORTER_LABEL = "EXPORTER-Channel-Binding"
+
+function M.exporter_binding(sock)
+    if type(sock) ~= "table" and type(sock) ~= "userdata" then return nil end
+    if type(sock.exportkeyingmaterial) ~= "function"
+       or type(sock.info) ~= "function" then
+        return nil
+    end
+    local ok, info = pcall(sock.info, sock)
+    if not ok or type(info) ~= "table" or info.protocol ~= "TLSv1.3" then return nil end
+    local got, ekm = pcall(sock.exportkeyingmaterial, sock, EXPORTER_LABEL, 32)
+    if not got or type(ekm) ~= "string" or #ekm ~= 32 then return nil end
+    return ekm
+end
+
+-- The names a verified client certificate vouches for: subject CN and the
+-- DNS, URI and email entries of subjectAltName. Returns nil when the peer
+-- sent no certificate or OpenSSL did not verify it.
+function M.peer_identity(sock)
+    if type(sock) ~= "table" and type(sock) ~= "userdata" then
+        return nil, "not a TLS connection"
+    end
+    if type(sock.getpeercertificate) ~= "function" then
+        return nil, "not a TLS connection"
+    end
+    local ok, cert = pcall(sock.getpeercertificate, sock)
+    if not ok or not cert then return nil, "no client certificate was presented" end
+
+    if type(sock.getpeerverification) == "function" then
+        local vok, verified = pcall(sock.getpeerverification, sock)
+        if not vok or verified ~= true then
+            return nil, "the client certificate was not verified"
+        end
+    end
+
+    local names, seen = {}, {}
+    local function add(value)
+        if type(value) == "string" and value ~= "" and not seen[value] then
+            seen[value] = true
+            names[#names + 1] = value
+        end
+    end
+    local function add_all(value)
+        if type(value) == "table" then
+            for _, v in ipairs(value) do add(tostring(v)) end
+        else
+            add(value)
+        end
+    end
+
+    local ok_sub, subject = pcall(cert.subject, cert)
+    if ok_sub and type(subject) == "table" then
+        for _, entry in ipairs(subject) do
+            if entry.name == "commonName" or entry.oid == "2.5.4.3" then
+                add(tostring(entry.value))
+            end
+        end
+    end
+    local ok_ext, extensions = pcall(cert.extensions, cert)
+    if ok_ext and type(extensions) == "table" then
+        local san = extensions["2.5.29.17"]
+        if type(san) == "table" then
+            add_all(san.dNSName)
+            add_all(san.uniformResourceIdentifier)
+            add_all(san.rfc822Name)
+        end
+    end
+
+    if #names == 0 then return nil, "the client certificate names no identity" end
+    return names, nil
+end
+
 local function copy(list)
     local out = {}
     for i = 1, #list do out[i] = list[i] end

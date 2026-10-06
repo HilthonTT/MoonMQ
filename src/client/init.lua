@@ -28,7 +28,7 @@ local function split_address(address)
 end
 
 local function connect(opts, host, port)
-    local cbind = nil
+    local cbind, cbind_type = nil, nil
     local sock, cerr = socket.connect(host, port)
     if not sock then
         return nil, string.format("connect %s:%d: %s", host, port, tostring(cerr))
@@ -53,13 +53,25 @@ local function connect(opts, host, port)
         end
         sock = secured
         if opts.channel_binding ~= false then
-            cbind = tls_m.peer_endpoint_hash(sock)
+            -- tls-exporter binds to this session; tls-server-end-point only
+            -- to the certificate. Brokers older than tls-exporter support
+            -- refuse it, so opts.channel_binding = "tls-server-end-point"
+            -- pins the older type.
+            local exporter = opts.channel_binding ~= tls_m.CBIND_TYPE
+                and tls_m.exporter_binding(sock)
+            if exporter then
+                cbind, cbind_type = exporter, tls_m.CBIND_EXPORTER
+            else
+                cbind = tls_m.peer_endpoint_hash(sock)
+                cbind_type = cbind and tls_m.CBIND_TYPE or nil
+            end
         end
     end
 
     local c = setmetatable({
         sock = sock,
         cbind = cbind,
+        cbind_type = cbind_type,
         reactor = opts.reactor,
         timeout = opts.timeout or DEFAULT_TIMEOUT,
         host = host,
@@ -105,8 +117,11 @@ local function connect(opts, host, port)
         c:_read_until(idc)
     end
 
-    if opts.username then
-        local mechanism = tostring(opts.mechanism or "plain"):lower()
+    local mechanism = tostring(opts.mechanism or "plain"):lower()
+    if mechanism == "external" then
+        local aerr = c:_auth_external(opts.username)
+        if aerr then c:close(); return nil, aerr end
+    elseif opts.username then
         if mechanism == "scram" or mechanism == "scram-sha-256" then
             local aerr = c:_auth_scram(opts.username, opts.password or "")
             if aerr then c:close(); return nil, aerr end
@@ -285,10 +300,31 @@ function Client:_call(encode, expect_op, expect_name)
     return payload or "", op
 end
 
+-- SASL EXTERNAL: the broker takes the identity from this connection's TLS
+-- client certificate. `username`, when given, picks which of the users
+-- the certificate maps to.
+function Client:_auth_external(username)
+    local correl = uuid.bytes()
+    local ok, err = self:_write(
+        proto.encode_auth_scram(correl, scram.EXTERNAL, username or ""))
+    if not ok then return "send external auth: " .. tostring(err) end
+
+    local op, _, payload, rerr = self:_read_until(correl)
+    if not op then return "read auth_ok: " .. tostring(rerr) end
+    if op == proto.OP_ERROR then
+        local e = proto.decode_error(payload)
+        return "external: " .. (e and e.message or "?")
+    end
+    if op ~= proto.OP_AUTH_OK then
+        return string.format("expected AUTH_OK, got 0x%02x", op)
+    end
+    return nil
+end
+
 function Client:_auth_scram(username, password)
     local client_nonce = scram.nonce(rng.bytes)
     local client_first, client_first_bare, gs2 = scram.client_first(
-        username, client_nonce, self.cbind and scram.CBIND_TYPE or nil)
+        username, client_nonce, self.cbind and self.cbind_type or nil)
 
     local correl = uuid.bytes()
     local ok, err = self:_write(

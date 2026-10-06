@@ -30,7 +30,7 @@ records.
 | **Replication** | Automatic failover: a Raft-elected leader per replica group, an in-sync replica set that `acks=all` waits for, a high watermark consumers read up to, and epoch-based log truncation when an old leader returns. Clients follow `leader=` hints across a bootstrap host list. |
 | **Cluster** | Static-membership peers, AutoMQ-style autobalancer, live partition migration, cluster-wide consumer groups. Optional Raft consensus over cluster metadata: a majority-elected controller and a replicated ownership table. |
 | **Admin** | Create/describe/delete topics, add partitions, alter topic config at runtime, list/describe/delete consumer groups, seek by timestamp. |
-| **Security** | TLS on every listener (mutual TLS optional, `SIGHUP` reloads certificates), multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 with `tls-server-end-point` channel binding, per-user and per-topic quotas, optional auth on the metrics port. |
+| **Security** | TLS on every listener (mutual TLS optional, `SIGHUP` reloads certificates), multiple users with per-topic/group/cluster ACLs, SCRAM-SHA-256 with `tls-exporter` / `tls-server-end-point` channel binding, client-certificate login (SASL EXTERNAL), per-user and per-topic quotas, optional auth on the metrics port. |
 | **Ops** | Prometheus `/metrics`, JSON `/stats`, PBKDF2 auth with per-IP lockout, an interactive SQL-like console (MQL). |
 
 ## Quick start
@@ -287,13 +287,21 @@ local c = assert(Client.new{ host = "broker.internal", port = 9092,
                              tls = { cafile = "/etc/moonmq/ca.crt" } })
 ```
 
-SCRAM over TLS additionally binds the exchange to the connection. The binding
-value is the SHA-256 of the listener's certificate (`tls-server-end-point`),
-so a relay that terminates TLS with a certificate of its own and replays the
-SCRAM messages to the real broker fails the proof — and a client that claims
-the broker cannot bind, when it can, is refused as a downgrade rather than
-quietly logged in. It is on by default; `"ChannelBinding": "required"` refuses
-any unbound SCRAM login once every client has been switched over.
+SCRAM over TLS additionally binds the exchange to the connection. On TLS 1.3
+the binding is keying material exported from the session (`tls-exporter`),
+which is different for every connection. On TLS 1.2 it falls back to the
+SHA-256 of the listener's certificate (`tls-server-end-point`). Either way, a
+relay that terminates TLS and replays the SCRAM messages to the real broker
+fails the proof. A client that claims the broker cannot bind, when it can, is
+refused as a downgrade rather than quietly logged in. Binding is on by
+default; `"ChannelBinding": "required"` refuses any unbound SCRAM login once
+every client has been switched over.
+
+On a listener with `Verify: "peer"` or `"required"`, a client can also log in
+with its certificate alone (`mechanism = "external"`). Each user lists the
+certificate names it accepts in `CertificateNames`, and a user with no
+`PasswordHash` is certificate-only. See
+[docs/security.md](docs/security.md#certificate-login-sasl-external).
 
 `SIGHUP` reloads every TLS listener's certificate without a restart. The new
 certificate and key are pushed through OpenSSL first, and a reload that cannot

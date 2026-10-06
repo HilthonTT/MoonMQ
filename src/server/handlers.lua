@@ -8,6 +8,7 @@ local metrics    = require("src.metrics")
 local acl_m      = require("src.server.acl")
 local quota_m    = require("src.server.quota")
 local scram_m    = require("src.server.scram")
+local tls_m      = require("src.io.tls")
 local rng        = require("src.core.rng")
 local log        = require("src.log.logger").get("server")
 local push_log   = require("src.log.logger").get("push")
@@ -220,9 +221,65 @@ function M.auth(server, conn, correl, payload)
     conn:send(proto.encode_auth_ok(correl))
 end
 
+local function auth_external(server, conn, correl, authzid)
+    local function refuse(reason)
+        if server.authenticator then server.authenticator:note_failure(conn.ip) end
+        metrics.inc("moonmq_auth_failures_total", 1, { mechanism = "external" })
+        log:warn("conn=%s EXTERNAL login refused: %s", conn.id_short, reason)
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED, reason)
+    end
+
+    if not server.authenticator then
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
+            "broker has no credentials configured; connect without AUTH")
+        return
+    end
+    local banned, remaining = server.authenticator:is_banned(conn.ip)
+    if banned then
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
+            string.format("ip banned for %d more seconds", remaining))
+        return
+    end
+    if not server.tls or server.tls.verify == "none" then
+        return refuse("EXTERNAL needs a TLS listener that verifies client certificates")
+    end
+
+    local names, nerr = tls_m.peer_identity(conn.sock)
+    if not names then return refuse(nerr) end
+
+    local principal, perr = server.authenticator:certificate_principal(names, authzid)
+    if not principal then return refuse(perr) end
+
+    server.authenticator:note_success(conn.ip)
+    conn.username  = principal.username
+    conn.principal = principal
+    metrics.inc("moonmq_auth_success_total", 1, { mechanism = "external" })
+    log:info("conn=%s authenticated as %q by client certificate",
+        conn.id_short, principal.username)
+    conn:transition_to(Connection.STATE_AUTHENTICATED)
+    conn:send(proto.encode_auth_ok(correl))
+end
+
+-- The channel bindings this connection can offer SCRAM, by type.
+local function scram_bindings(server, conn)
+    local tls_cfg = server.tls
+    if not tls_cfg or tls_cfg.channel_binding == "disabled" then return nil end
+    local bindings = {}
+    if tls_cfg.endpoint_hash then
+        bindings[scram_m.CBIND_TYPE] = tls_cfg.endpoint_hash
+    end
+    local exporter = tls_m.exporter_binding(conn.sock)
+    if exporter then bindings[scram_m.CBIND_EXPORTER] = exporter end
+    return bindings
+end
+
 function M.auth_scram(server, conn, correl, payload)
     local req = decode_or_close(conn, proto.decode_auth_scram, payload)
     if not req then return end
+
+    if req.mechanism:upper() == scram_m.EXTERNAL then
+        return auth_external(server, conn, correl, req.message)
+    end
 
     if req.mechanism:upper() ~= scram_m.MECHANISM then
         conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL,
@@ -253,7 +310,7 @@ function M.auth_scram(server, conn, correl, payload)
 
     local tls_cfg = server.tls
     local bound, cberr = scram_m.negotiate_cbind(first,
-        tls_cfg and tls_cfg.endpoint_hash or nil,
+        scram_bindings(server, conn),
         tls_cfg and tls_cfg.channel_binding or "disabled")
     if not bound then
         conn:close(Connection.REASON_BAD_PROTOCOL, proto.ERR_BAD_PROTOCOL, cberr)

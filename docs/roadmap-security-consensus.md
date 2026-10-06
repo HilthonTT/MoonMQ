@@ -38,6 +38,12 @@ records the integration points so the work can start without re-scoping.
 > recording is the `y,,` case — a client that supports binding but thinks the
 > server does not. Treating it as a plain unbound login would have made the
 > whole feature bypassable, so a broker that *can* bind refuses `y,,` outright.
+>
+> **Update (2026-10-07).** `tls-exporter` (RFC 9266) now binds SCRAM on
+> TLS 1.3, with `tls-server-end-point` kept for TLS 1.2. `tls-unique` was
+> deliberately left out. mTLS client certificates can now authenticate on
+> their own through SASL EXTERNAL, mapped to users by `CertificateNames`.
+> See [security.md](security.md#certificate-login-sasl-external).
 > `ChannelBinding` is `preferred` by default and `required` is available.
 >
 > Certificate reload is `SIGHUP`. The mechanism is smaller than expected —

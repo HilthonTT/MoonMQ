@@ -436,6 +436,46 @@ describe("tls over the reactor", function()
         assert.are.equal(expected, result.hash)
     end)
 
+    it("names the mTLS client and derives the same exporter on both ends", function()
+        local reactor = Reactor.new()
+        local server_cfg = assert(tls_m.server_config(
+            { CertFile = CERT, KeyFile = KEY, CaFile = CERT, Verify = "required" },
+            "test server"))
+        local seen, client_ekm, failure = {}, nil, nil
+
+        assert.is_nil(select(2, reactor:listen("127.0.0.1", 19311, function(sock)
+            seen.names = tls_m.peer_identity(sock)
+            seen.ekm = tls_m.exporter_binding(sock)
+            reactor:sleep(0.3)
+            pcall(function() sock:close() end)
+        end, { tls = server_cfg })))
+
+        reactor:spawn(function()
+            local ok, err = pcall(function()
+                local raw = assert(socket.connect("127.0.0.1", 19311))
+                local cfg = assert(tls_m.client_config(
+                    { CaFile = CERT, CertFile = CERT, KeyFile = KEY, Verify = "peer" },
+                    "test client"))
+                local sock = assert(reactor:tls_handshake(raw, cfg.params,
+                    socket.gettime() + 5))
+                client_ekm = tls_m.exporter_binding(sock)
+                reactor:sleep(0.5)
+                pcall(function() sock:close() end)
+            end)
+            if not ok then failure = err end
+            reactor:stop()
+        end)
+        reactor:spawn(function() reactor:sleep(10); reactor:stop() end)
+        reactor:run()
+        reactor:shutdown()
+
+        assert.is_nil(failure)
+        assert.is_truthy(seen.names)
+        assert.is_truthy(table.concat(seen.names, ","):find("localhost", 1, true))
+        assert.are.equal(32, #(client_ekm or ""))
+        assert.are.equal(client_ekm, seen.ekm)
+    end)
+
     it("refuses a plaintext client on a TLS listener", function()
         local reactor = Reactor.new()
         local server_cfg = assert(tls_m.server_config(
