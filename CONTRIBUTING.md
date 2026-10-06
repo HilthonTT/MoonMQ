@@ -82,9 +82,11 @@ The codebase is deliberately consistent; match what's around you.
 * If you change the wire protocol, the on-disk format, or an inter-broker
   endpoint: document the compatibility story in the PR description (clean
   break vs. read-compat), and update `docs/`.
-* New config keys: wire them through `main.lua` from `appsettings.json`,
-  document them in the README's Configuration table, and give them safe
-  defaults (features off, loopback binds).
+* New config keys: map them from `appsettings.json` in
+  `src/server/options.lua`, add a case to `spec/options_spec.lua`, document
+  them in the README's Configuration table, and give them safe defaults
+  (features off, loopback binds). Builders there return `nil, err` instead
+  of exiting; `main.lua` owns the one exit path.
 
 ## Docs map
 

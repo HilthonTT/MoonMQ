@@ -45,7 +45,8 @@ Layers, wire down to disk. Each directory depends only on the ones below it
 `storage`/`commitlog` reaches up into `server`.
 
 ```
-main.lua           CLI entrypoint: config, logging, auth wiring, server boot
+main.lua           CLI entrypoint: commands, config + logging, server boot
+                   (config → Server options lives in src/server/options.lua)
 bin/               operational tools (HTTP gateway, password hasher)
 src/
   server/          TCP front-end: reactor loop, framing, connection lifecycle,
