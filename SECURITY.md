@@ -31,7 +31,7 @@ have found a way around the documented boundary.
 
 - **The broker starts open when no usable credential is configured.** It logs
   a warning and accepts any `AUTH`. Set `Auth.PasswordHash` before exposing a
-  port. See [README § Configuration](README.md#configuration).
+  port. See [docs/configuration.md](docs/configuration.md).
 - **The metrics/stats HTTP endpoints are unauthenticated.** They bind
   `127.0.0.1:9090` by default. Keep them on loopback or firewall the port.
 - **There is no transport encryption.** Client↔broker and inter-broker traffic
