@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.jpg" alt="MoonMQ logo" width="180" style="border-radius: 16px;" />
+  <img src="assets/logo.svg" alt="MoonMQ logo" width="160" />
 </p>
 
 <h1 align="center">MoonMQ</h1>
