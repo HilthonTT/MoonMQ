@@ -119,7 +119,8 @@ Two interchangeable backends behind one duck-typed partition interface
 
 The on-disk record format (`src/record/message.lua`) is shared:
 `len(8) | header(13) | hdr_crc(4) | key | value | payload_crc(4)`, with an
-attrs byte carrying the compression codec and the transaction-control flag.
+attrs byte carrying the compression codec, the transaction-control flag and
+`ATTR_HEADERS`, which marks records that carry [headers](docs/headers.md).
 
 Internal topics (name prefix `__`) reuse the same machinery: consumer offsets
 (`__consumer_offsets`), producer state (`__producer_state`), transaction state

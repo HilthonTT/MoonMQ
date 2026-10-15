@@ -1,4 +1,5 @@
-local crc32 = require("src.core.crc32")
+local crc32     = require("src.core.crc32")
+local headers_m = require("src.record.headers")
 
 local Message = {}
 Message.__index = Message
@@ -10,13 +11,17 @@ local CODEC_SNAPPY = 2
 local ATTR_CODEC_MASK = 0x03
 local ATTR_CONTROL    = 0x04
 local ATTR_TXN        = 0x08
+local ATTR_HEADERS    = 0x10
 
-function Message.new(key, value, timestamp, attrs, pid, epoch)
+function Message.new(key, value, timestamp, attrs, pid, epoch, headers)
     assert(type(key) == "string", "key must be a string")
     assert(type(value) == "string", "value must be a string")
     assert(type(timestamp) == "number", "timestamp must be a number")
     if attrs ~= nil then
         assert(type(attrs) == "number", "attrs must be a number")
+    end
+    if headers ~= nil then
+        assert(type(headers) == "table", "headers must be a list")
     end
 
     return setmetatable({
@@ -26,6 +31,7 @@ function Message.new(key, value, timestamp, attrs, pid, epoch)
         attrs = attrs or 0,
         pid = pid,
         epoch = epoch,
+        headers = headers,
     }, Message)
 end
 
@@ -56,7 +62,14 @@ end
 
 local HEADER_LEN = 13
 local TXN_HEADER_LEN = HEADER_LEN + 8 + 2
+local HEADERS_FIELD_LEN = 4
 local MIN_BODY = HEADER_LEN + 4 + 4
+
+local function header_len(attrs)
+    local n = ((attrs & ATTR_TXN) ~= 0) and TXN_HEADER_LEN or HEADER_LEN
+    if (attrs & ATTR_HEADERS) ~= 0 then n = n + HEADERS_FIELD_LEN end
+    return n
+end
 
 local function serialize_message(msg)
     assert(getmetatable(msg) == Message, "msg must be a Message instance")
@@ -73,6 +86,15 @@ local function serialize_message(msg)
             tostring(attrs))
     end
 
+    local hblob = ""
+    attrs = attrs & (0xFF ~ ATTR_HEADERS)
+    if msg.headers and #msg.headers > 0 then
+        local list, herr = headers_m.normalize(msg.headers)
+        if not list then return nil, herr end
+        hblob = headers_m.encode(list)
+        attrs = attrs | ATTR_HEADERS
+    end
+
     local header
     if (attrs & ATTR_TXN) ~= 0 then
         if type(msg.pid) ~= "number" or type(msg.epoch) ~= "number" then
@@ -82,7 +104,10 @@ local function serialize_message(msg)
     else
         header = string.pack(">BI4I8", attrs, #msg.key, ts)
     end
-    local payload = msg.key .. msg.value
+    if (attrs & ATTR_HEADERS) ~= 0 then
+        header = header .. string.pack(">I4", #hblob)
+    end
+    local payload = hblob .. msg.key .. msg.value
 
     local header_crc  = crc32(header)
     local payload_crc = crc32(payload)
@@ -101,8 +126,7 @@ local function decode_body(body)
         return nil, "corrupt record: body shorter than minimum"
     end
 
-    local peek_attrs = body:byte(1)
-    local hlen = ((peek_attrs & ATTR_TXN) ~= 0) and TXN_HEADER_LEN or HEADER_LEN
+    local hlen = header_len(body:byte(1))
     if #body < hlen + 4 + 4 then
         return nil, "corrupt record: body shorter than its header form"
     end
@@ -123,17 +147,37 @@ local function decode_body(body)
 
     local attrs, key_size, timestamp = string.unpack(">BI4I8", header_bytes)
     local pid, epoch
+    local pos = HEADER_LEN + 1
     if (attrs & ATTR_TXN) ~= 0 then
-        pid, epoch = string.unpack(">I8I2", header_bytes, HEADER_LEN + 1)
+        pid, epoch, pos = string.unpack(">I8I2", header_bytes, pos)
     end
-    if key_size < 0 or key_size > #payload then
+
+    local headers
+    local kstart = 1
+    if (attrs & ATTR_HEADERS) ~= 0 then
+        local hblob_len = string.unpack(">I4", header_bytes, pos)
+        if hblob_len > #payload then
+            return nil, "corrupt header: headers_len out of range"
+        end
+        local list, next_pos = headers_m.decode(payload:sub(1, hblob_len), 1)
+        if not list then
+            return nil, "corrupt record headers: " .. tostring(next_pos)
+        end
+        if next_pos ~= hblob_len + 1 then
+            return nil, "corrupt record headers: trailing bytes"
+        end
+        headers = list
+        kstart = hblob_len + 1
+    end
+
+    if key_size < 0 or key_size > #payload - kstart + 1 then
         return nil, "corrupt header: key_size out of range"
     end
 
-    local key   = payload:sub(1, key_size)
-    local value = payload:sub(key_size + 1)
+    local key   = payload:sub(kstart, kstart + key_size - 1)
+    local value = payload:sub(kstart + key_size)
 
-    return Message.new(key, value, timestamp, attrs, pid, epoch), nil
+    return Message.new(key, value, timestamp, attrs, pid, epoch, headers), nil
 end
 
 local function deserialize_record(file)
@@ -181,4 +225,5 @@ return {
     ATTR_CODEC_MASK = ATTR_CODEC_MASK,
     ATTR_CONTROL    = ATTR_CONTROL,
     ATTR_TXN        = ATTR_TXN,
+    ATTR_HEADERS    = ATTR_HEADERS,
 }

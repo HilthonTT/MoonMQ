@@ -144,7 +144,7 @@ function DlqManager:_dead_letter(group, topic, topic_name, partition_id, offset,
         reason    = reason or "",
         value     = value,
     })
-    local rec = msg_m.Message.new(msg.key, env, self.now_ms())
+    local rec = msg_m.Message.new(msg.key, env, self.now_ms(), nil, nil, nil, msg.headers)
 
     local dlq_offset, werr = dlq_part:write_message(rec)
     if werr then

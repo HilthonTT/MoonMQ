@@ -2,6 +2,7 @@ local socket = require("socket")
 local proto = require("src.wire.protocol")
 local uuid = require("src.core.uuid")
 local msg_m = require("src.record.message")
+local headers_m = require("src.record.headers")
 local dlq_env = require("src.record.dlq_envelope")
 local scram = require("src.server.scram")
 local pbkdf2 = require("src.core.pbkdf2")
@@ -376,27 +377,14 @@ function Client:_auth_scram(username, password)
 end
 
 function Client:_decode_record(payload)
-    local topic, p, err = proto.decode_string(payload, 1)
-    if not topic then return nil, err end
-    local partition, offset, timestamp = string.unpack(">I4I8I8", payload, p)
-    p = p + 4 + 8 + 8
-    local key, p2, kerr = proto.decode_string(payload, p)
-    if not key then return nil, kerr end
-    local value, _, verr = proto.decode_string(payload, p2)
-    if not value then return nil, verr end
-    return {
-        topic     = topic,
-        partition = partition,
-        offset    = offset,
-        timestamp = timestamp,
-        key       = key,
-        value     = value,
-    }
+    return proto.decode_record(payload)
 end
 
-function Client:produce(topic, key, value)
+function Client:produce(topic, key, value, headers)
     assert(type(topic) == "string", "topic must be a string")
     assert(type(key) == "string", "key must be a string")
+    local hlist, herr = headers_m.normalize(headers)
+    if not hlist then return nil, herr end
 
     local correl = uuid.bytes()
     local frame
@@ -406,9 +394,9 @@ function Client:produce(topic, key, value)
         seq_used = self.next_seq[topic] or 0
         frame = proto.encode_produce_idempotent(
             correl, self.pid, seq_used, topic, key, value,
-            self.epoch or 0, self.compression)
+            self.epoch or 0, self.compression, hlist)
     else
-        frame = proto.encode_produce(correl, topic, key, value, self.compression)
+        frame = proto.encode_produce(correl, topic, key, value, self.compression, hlist)
     end
 
     local ok, err = self:_write(frame)
@@ -438,7 +426,9 @@ function Client:produce_batch(topic, records)
         if type(r) == "string" then
             normalized[i] = { key = "", value = r }
         else
-            normalized[i] = { key = r.key or "", value = r.value or "" }
+            local hlist, herr = headers_m.normalize(r.headers)
+            if not hlist then return nil, string.format("record %d: %s", i, herr) end
+            normalized[i] = { key = r.key or "", value = r.value or "", headers = hlist }
         end
     end
 
@@ -480,13 +470,15 @@ function Client:produce_batch(topic, records)
     return res.acks, nil
 end
 
-function Client:produce_at_seq(topic, key, value, seq)
+function Client:produce_at_seq(topic, key, value, seq, headers)
     assert(self.pid, "produce_at_seq requires an idempotent client")
     assert(type(seq) == "number" and seq >= 0, "seq must be a non-negative number")
+    local hlist, herr = headers_m.normalize(headers)
+    if not hlist then return nil, herr end
 
     local correl = uuid.bytes()
     local frame = proto.encode_produce_idempotent(
-        correl, self.pid, seq, topic, key, value, self.epoch or 0, self.compression)
+        correl, self.pid, seq, topic, key, value, self.epoch or 0, self.compression, hlist)
     local ok, err = self:_write(frame)
     if not ok then return nil, err end
 
@@ -504,8 +496,9 @@ function Client:fetch(topic, group, max_records, batched)
     if batched == nil then batched = true end
 
     local correl = uuid.bytes()
+    local flags = proto.FETCH_FLAG_HEADERS | (batched and proto.FETCH_FLAG_BATCHED or 0)
     local data = proto.encode_fetch(correl, topic, group, max_records,
-        self.isolation, batched and proto.FETCH_FLAG_BATCHED or 0)
+        self.isolation, flags)
     local ok, err = self:_write(data)
     if not ok then return nil, err end
 
@@ -518,7 +511,7 @@ function Client:fetch(topic, group, max_records, batched)
         end
         if op == proto.OP_OK then return records end
         if op == proto.OP_RECORD_BATCH then
-            local batch, derr = proto.decode_record_batch(payload)
+            local batch, derr = proto.decode_record_batch(payload, true)
             if not batch then return nil, "decode record_batch: " .. tostring(derr) end
             for i = 1, #batch do records[#records + 1] = batch[i] end
         elseif op == proto.OP_RECORD then

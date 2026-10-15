@@ -25,9 +25,10 @@ loop.
    work) and wraps the **original value in an envelope**
    (`src/record/dlq_envelope.lua`) carrying its provenance: source topic,
    partition, offset, timestamp, the group that gave up, the attempt count,
-   and the client-supplied reason. The value is stored decompressed. The v2
-   record format has no named headers, which is why provenance lives in the
-   value.
+   and the client-supplied reason. The value is stored decompressed. The
+   original record's [headers](headers.md) are copied onto the dead-letter
+   record unchanged; provenance stays in the envelope so that format does not
+   change.
 
 A dead-letter topic is an ordinary, visible topic — subscribe to it like any
 other to build reprocessing or alerting.

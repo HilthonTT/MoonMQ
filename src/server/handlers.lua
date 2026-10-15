@@ -4,6 +4,7 @@ local uuid       = require("src.core.uuid")
 local consumer_m = require("src.broker.consumer")
 local msg_m      = require("src.record.message")
 local compression = require("src.record.compression")
+local headers_m  = require("src.record.headers")
 local metrics    = require("src.metrics")
 local acl_m      = require("src.server.acl")
 local quota_m    = require("src.server.quota")
@@ -84,7 +85,8 @@ end
 local function record_bytes(records)
     local total = 0
     for i = 1, #records do
-        total = total + #records[i].key + #records[i].value
+        local r = records[i]
+        total = total + #r.key + #r.value + headers_m.size(r.headers)
     end
     return total
 end
@@ -129,7 +131,7 @@ local function delivery_allowed(server, conn, correl, topic)
     return true
 end
 
-local function build_stored_message(codec, key, value, txn)
+local function build_stored_message(codec, key, value, txn, headers)
     codec = codec or msg_m.CODEC_NONE
     local attrs = codec & msg_m.ATTR_CODEC_MASK
     local pid, epoch
@@ -138,7 +140,7 @@ local function build_stored_message(codec, key, value, txn)
         pid, epoch = txn.pid, txn.epoch
     end
     if codec == msg_m.CODEC_NONE then
-        return msg_m.Message.new(key, value, 0, attrs, pid, epoch)
+        return msg_m.Message.new(key, value, 0, attrs, pid, epoch, headers)
     end
     if not compression.available(codec) then
         return nil, string.format("compression codec %s unavailable on this broker",
@@ -149,7 +151,7 @@ local function build_stored_message(codec, key, value, txn)
         return nil, string.format("compress (%s) failed: %s",
             compression.codec_name(codec), cerr)
     end
-    return msg_m.Message.new(key, stored, 0, attrs, pid, epoch)
+    return msg_m.Message.new(key, stored, 0, attrs, pid, epoch, headers)
 end
 
 local function txn_err_code(code)
@@ -406,9 +408,10 @@ function M.produce(server, conn, correl, payload)
     if not p then return end
 
     if not authorize(conn, correl, acl_m.RES_TOPIC, p.topic, acl_m.OP_WRITE) then return end
-    if not charge_produce(server, conn, correl, p.topic, 1, #p.key + #p.value) then return end
+    if not charge_produce(server, conn, correl, p.topic, 1,
+                          #p.key + #p.value + headers_m.size(p.headers)) then return end
 
-    local msg, berr = build_stored_message(p.codec, p.key, p.value)
+    local msg, berr = build_stored_message(p.codec, p.key, p.value, nil, p.headers)
     if not msg then
         return fail(conn, correl, proto.ERR_INTERNAL, berr)
     end
@@ -426,7 +429,7 @@ local function build_batch_messages(records, codec, txn)
     local msgs = {}
     for i = 1, #records do
         local r = records[i]
-        local msg, berr = build_stored_message(codec, r.key, r.value, txn)
+        local msg, berr = build_stored_message(codec, r.key, r.value, txn, r.headers)
         if not msg then return nil, berr end
         msgs[i] = msg
     end
@@ -652,11 +655,12 @@ function M.produce_idempotent(server, conn, correl, payload)
     if not charge(server, conn, correl, p.topic,
                   quota_m.DIM_PRODUCE_RECORDS, 1) then return end
     if not charge(server, conn, correl, p.topic,
-                  quota_m.DIM_PRODUCE_BYTES, #p.key + #p.value) then return end
+                  quota_m.DIM_PRODUCE_BYTES,
+                  #p.key + #p.value + headers_m.size(p.headers)) then return end
 
     local in_txn = conn.in_txn and conn.producer_name ~= nil
     local msg, berr = build_stored_message(p.codec, p.key, p.value,
-        in_txn and { pid = conn.pid, epoch = conn.epoch } or nil)
+        in_txn and { pid = conn.pid, epoch = conn.epoch } or nil, p.headers)
     if not msg then
         return fail(conn, correl, proto.ERR_INTERNAL, berr)
     end
@@ -762,7 +766,7 @@ local function subscriber_loop(server, conn)
                 if conn.state == Connection.STATE_CLOSED then return end
                 local r = records[i]
                 local frame = proto.encode_record(uuid.ZERO,
-                    r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
+                    r.topic, r.partition, r.offset, r.timestamp, r.key, r.value, r.headers)
                 if conn.pending_bytes > 0
                     and conn.pending_bytes + #frame > server.max_pending_bytes then
                     if not conn:wait_flushed() then return end
@@ -864,7 +868,8 @@ function M.fetch(server, conn, correl, payload)
         if f.batched then
             local batch = {}
             for i = 1, limit do batch[i] = records[i] end
-            if limit > 0 and not conn:send(proto.encode_record_batch(correl, batch)) then
+            if limit > 0
+                and not conn:send(proto.encode_record_batch(correl, batch, f.headers)) then
                 for i = limit, 1, -1 do
                     local r = records[i]
                     consumer.offsets[r.topic][r.partition] = r.offset
@@ -879,7 +884,7 @@ function M.fetch(server, conn, correl, payload)
             for i = 1, limit do
                 local r = records[i]
                 local frame = proto.encode_record(correl,
-                    r.topic, r.partition, r.offset, r.timestamp, r.key, r.value)
+                    r.topic, r.partition, r.offset, r.timestamp, r.key, r.value, r.headers)
                 if not conn:send(frame) then
                     for j = limit, i, -1 do
                         local rr = records[j]

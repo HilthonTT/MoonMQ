@@ -23,7 +23,7 @@ append-only logs with CRC-checked on-disk records.
 | | |
 | --- | --- |
 | **Storage** | Segmented log with time + offset indexes, group-commit fsync, retention, crash recovery; jocko-style backend with key compaction |
-| **Delivery** | Pull (`FETCH`) or push (`SUBSCRIBE`), consumer groups with durable offsets, DLQ with NACK, batching on both sides |
+| **Delivery** | Pull (`FETCH`) or push (`SUBSCRIBE`), record headers, consumer groups with durable offsets, DLQ with NACK, batching on both sides |
 | **Correctness** | Idempotent producer, multi-partition transactions, `read_committed` |
 | **Replication** | Raft-elected leader, in-sync replica set for `acks=all`, high watermark, epoch-based truncation, client leader-following |
 | **Cluster** | Static peers, autobalancer, live partition migration, cluster-wide groups, optional Raft metadata controller |
@@ -43,7 +43,7 @@ local Client = require("src.client")
 local c = assert(Client.new{ host = "127.0.0.1", port = 9092,
                              username = "admin", password = "admin" })
 
-assert(c:produce("orders", "key-1", "payload"))
+assert(c:produce("orders", "key-1", "payload", { ["trace-id"] = "abc123" }))
 local res = assert(c:join_group("billing", { "orders" }))
 ```
 
@@ -70,6 +70,7 @@ Start with [DESIGN.md](DESIGN.md), then [CONTRIBUTING.md](CONTRIBUTING.md).
 | [installation](docs/installation.md) | Dependencies, fallbacks, luaposix build, Windows |
 | [configuration](docs/configuration.md) | `appsettings.json`, connection limits, password hashes, cluster/replication blocks |
 | [client](docs/client.md) | Client API, lag, seeking by time, admin calls |
+| [headers](docs/headers.md) | Record headers: API, limits, on-disk and wire encoding |
 | [security](docs/security.md) | TLS, users, ACLs, SCRAM, quotas, metrics auth |
 | [replication](docs/replication.md) | Replication, failover, in-sync replicas |
 | [cluster](docs/cluster.md) | Clustering, reassignment, autobalancer, Raft controller |

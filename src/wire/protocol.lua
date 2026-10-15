@@ -1,3 +1,5 @@
+local headers_m = require("src.record.headers")
+
 local M = {}
 M.__index = M
 
@@ -75,8 +77,10 @@ M.ISOLATION_READ_UNCOMMITTED = 0
 M.ISOLATION_READ_COMMITTED   = 1
 
 M.FETCH_FLAG_BATCHED = 0x01
+M.FETCH_FLAG_HEADERS = 0x02
 
 M.BATCH_FLAG_IDEMPOTENT = 0x01
+M.BATCH_FLAG_HEADERS    = 0x02
 
 M.OFFSETS_FLAG_HWM_EXACT = 0x01
 M.OFFSETS_FLAG_LSO_KNOWN = 0x02
@@ -189,9 +193,22 @@ function M.encode_auth_scram_final(correl_id, client_final)
     return encode_frame(M.OP_AUTH_SCRAM_FINAL, correl_id, encode_string(client_final))
 end
 
-function M.encode_produce(correl_id, topic, key, value, codec)
+local function trailing_headers(headers)
+    if headers and #headers > 0 then return headers_m.encode(headers) end
+    return ""
+end
+
+local function decode_trailing_headers(payload, pos)
+    if not pos or pos > #payload then return nil, nil end
+    local list, err = headers_m.decode(payload, pos)
+    if not list then return nil, err end
+    return list, nil
+end
+
+function M.encode_produce(correl_id, topic, key, value, codec, headers)
     local payload = string.pack(">B", codec or 0)
         .. encode_string(topic) .. encode_string(key) .. encode_string(value)
+        .. trailing_headers(headers)
     return encode_frame(M.OP_PRODUCE, correl_id, payload)
 end
 
@@ -204,11 +221,18 @@ function M.encode_produce_batch(correl_id, topic, records, opts)
     assert(type(records) == "table", "records must be a list")
     opts = opts or {}
     local idempotent = opts.pid ~= nil
+    local with_headers = false
+    for i = 1, #records do
+        if records[i].headers and #records[i].headers > 0 then
+            with_headers = true
+            break
+        end
+    end
 
+    local flags = (idempotent and M.BATCH_FLAG_IDEMPOTENT or 0)
+        | (with_headers and M.BATCH_FLAG_HEADERS or 0)
     local parts = {
-        string.pack(">BB",
-            idempotent and M.BATCH_FLAG_IDEMPOTENT or 0,
-            opts.codec or 0),
+        string.pack(">BB", flags, opts.codec or 0),
         encode_string(topic),
     }
     if idempotent then
@@ -220,6 +244,9 @@ function M.encode_produce_batch(correl_id, topic, records, opts)
         local r = records[i]
         parts[#parts + 1] = encode_string(r.key or "")
         parts[#parts + 1] = encode_string(r.value or "")
+        if with_headers then
+            parts[#parts + 1] = headers_m.encode(r.headers or headers_m.EMPTY)
+        end
     end
     return encode_frame(M.OP_PRODUCE_BATCH, correl_id, table.concat(parts))
 end
@@ -234,7 +261,7 @@ function M.encode_produce_batch_ack(correl_id, acks, err_code, err_message)
     return encode_frame(M.OP_PRODUCE_BATCH_ACK, correl_id, table.concat(parts))
 end
 
-function M.encode_record_batch(correl_id, records)
+function M.encode_record_batch(correl_id, records, with_headers)
     local parts = { string.pack(">I4", #records) }
     for i = 1, #records do
         local r = records[i]
@@ -243,6 +270,9 @@ function M.encode_record_batch(correl_id, records)
             r.partition, r.offset, r.timestamp or 0)
         parts[#parts + 1] = encode_string(r.key or "")
         parts[#parts + 1] = encode_string(r.value or "")
+        if with_headers then
+            parts[#parts + 1] = headers_m.encode(r.headers or headers_m.EMPTY)
+        end
     end
     return encode_frame(M.OP_RECORD_BATCH, correl_id, table.concat(parts))
 end
@@ -270,11 +300,13 @@ function M.decode_producer_id(payload)
     return { pid = pid, epoch = epoch }, nil
 end
 
-function M.encode_produce_idempotent(correl_id, pid, seq, topic, key, value, epoch, codec)
+function M.encode_produce_idempotent(correl_id, pid, seq, topic, key, value, epoch, codec,
+                                     headers)
     local payload = string.pack(">I8I4I2B", pid, seq, epoch or 0, codec or 0)
         .. encode_string(topic)
         .. encode_string(key)
         .. encode_string(value)
+        .. trailing_headers(headers)
     return encode_frame(M.OP_PRODUCE_IDEMPOTENT, correl_id, payload)
 end
 
@@ -287,11 +319,12 @@ function M.encode_fetch(correl_id, topic, group_id, max_records, isolation, flag
     return encode_frame(M.OP_FETCH, correl_id, payload)
 end
 
-function M.encode_record(correl_id, topic, partition, offset, timestamp, key, value)
+function M.encode_record(correl_id, topic, partition, offset, timestamp, key, value, headers)
     local payload = encode_string(topic)
         .. string.pack(">I4I8I8", partition, offset, timestamp)
         .. encode_string(key)
         .. encode_string(value)
+        .. trailing_headers(headers)
 
     return encode_frame(M.OP_RECORD, correl_id, payload)
 end
@@ -641,9 +674,33 @@ function M.decode_produce(payload)
     if not topic then return nil, err end
     local key, p2, kerr = decode_string(payload, p)
     if not key then return nil, kerr end
-    local value, _, verr = decode_string(payload, p2)
+    local value, p3, verr = decode_string(payload, p2)
     if not value then return nil, verr end
-    return { codec = codec, topic = topic, key = key, value = value }, nil
+    local headers, herr = decode_trailing_headers(payload, p3)
+    if herr then return nil, herr end
+    return { codec = codec, topic = topic, key = key, value = value, headers = headers }, nil
+end
+
+function M.decode_record(payload)
+    local topic, p, err = decode_string(payload, 1, MAX_TOPIC_NAME)
+    if not topic then return nil, err end
+    if #payload - p + 1 < 20 then return nil, "short record" end
+    local partition, offset, timestamp, p2 = string.unpack(">I4I8I8", payload, p)
+    local key, p3, kerr = decode_string(payload, p2)
+    if not key then return nil, kerr end
+    local value, p4, verr = decode_string(payload, p3)
+    if not value then return nil, verr end
+    local headers, herr = decode_trailing_headers(payload, p4)
+    if herr then return nil, herr end
+    return {
+        topic     = topic,
+        partition = partition,
+        offset    = offset,
+        timestamp = timestamp,
+        key       = key,
+        value     = value,
+        headers   = headers or {},
+    }, nil
 end
 
 function M.decode_subscribe(payload)
@@ -681,6 +738,7 @@ function M.decode_fetch(payload)
         isolation   = isolation,
         flags       = flags,
         batched     = (flags & M.FETCH_FLAG_BATCHED) ~= 0,
+        headers     = (flags & M.FETCH_FLAG_HEADERS) ~= 0,
     }, nil
 end
 
@@ -983,6 +1041,7 @@ function M.decode_produce_batch(payload)
     if not topic then return nil, terr end
 
     local idempotent = (flags & M.BATCH_FLAG_IDEMPOTENT) ~= 0
+    local with_headers = (flags & M.BATCH_FLAG_HEADERS) ~= 0
     local pid, base_seq, epoch
     if idempotent then
         if #payload - p2 + 1 < 14 then return nil, "short produce_batch producer header" end
@@ -1005,7 +1064,14 @@ function M.decode_produce_batch(payload)
         if not key then return nil, kerr end
         local value, np2, verr = decode_string(payload, np)
         if not value then return nil, verr end
-        records[i] = { key = key, value = value }
+        local headers
+        if with_headers then
+            local hp
+            headers, hp = headers_m.decode(payload, np2)
+            if not headers then return nil, hp end
+            np2 = hp
+        end
+        records[i] = { key = key, value = value, headers = headers }
         pos = np2
     end
 
@@ -1043,7 +1109,7 @@ function M.decode_produce_batch_ack(payload)
     return { acks = acks, code = code, message = message }, nil
 end
 
-function M.decode_record_batch(payload)
+function M.decode_record_batch(payload, with_headers)
     if #payload < 4 then return nil, "short record_batch" end
     local count, pos = string.unpack(">I4", payload, 1)
     if count > MAX_BATCH_RECORDS then
@@ -1059,6 +1125,13 @@ function M.decode_record_batch(payload)
         if not key then return nil, kerr end
         local value, p4, verr = decode_string(payload, p3)
         if not value then return nil, verr end
+        local headers
+        if with_headers then
+            local hp
+            headers, hp = headers_m.decode(payload, p4)
+            if not headers then return nil, hp end
+            p4 = hp
+        end
         records[i] = {
             topic     = topic,
             partition = partition,
@@ -1066,6 +1139,7 @@ function M.decode_record_batch(payload)
             timestamp = timestamp,
             key       = key,
             value     = value,
+            headers   = headers,
         }
         pos = p4
     end
@@ -1199,8 +1273,10 @@ function M.decode_produce_idempotent(payload)
     if not topic then return nil, terr end
     local key, p3, kerr = decode_string(payload, p2)
     if not key then return nil, kerr end
-    local value, _, verr = decode_string(payload, p3)
+    local value, p4, verr = decode_string(payload, p3)
     if not value then return nil, verr end
+    local headers, herr = decode_trailing_headers(payload, p4)
+    if herr then return nil, herr end
     return {
         pid       = pid,
         seq       = seq,
@@ -1209,6 +1285,7 @@ function M.decode_produce_idempotent(payload)
         topic     = topic,
         key       = key,
         value     = value,
+        headers   = headers,
     }, nil
 end
 

@@ -85,6 +85,10 @@ that predates batching stops decoding at isolation and answers with the legacy
 one-`RECORD`-frame-per-record stream, so setting the bit is safe against any
 broker version — and the client handles both shapes.
 
+`FETCH_FLAG_HEADERS` (0x02) adds a header block after every `RECORD_BATCH`
+entry, and `BATCH_FLAG_HEADERS` (0x02) does the same for `PRODUCE_BATCH`. See
+[headers.md](headers.md).
+
 ## Limits
 
 | Bound | Value | Why |

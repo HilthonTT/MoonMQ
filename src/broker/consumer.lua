@@ -6,7 +6,7 @@ local log    = require("src.log.logger").get("consumer")
 local ConsumerRecord = {}
 ConsumerRecord.__index = ConsumerRecord
 
-function ConsumerRecord.new(topic, partition, offset, key, value, timestamp)
+function ConsumerRecord.new(topic, partition, offset, key, value, timestamp, headers)
     return setmetatable({
         topic     = topic,
         partition = partition,
@@ -14,6 +14,7 @@ function ConsumerRecord.new(topic, partition, offset, key, value, timestamp)
         key       = key,
         value     = value,
         timestamp = timestamp,
+        headers   = headers or {},
     }, ConsumerRecord)
 end
 
@@ -207,7 +208,8 @@ function Consumer:poll(opts)
                         offset,
                         msg.key,
                         value,
-                        msg.timestamp
+                        msg.timestamp,
+                        msg.headers
                     )
                     taken  = taken + 1
                     offset = next_offset

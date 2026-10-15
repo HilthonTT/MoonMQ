@@ -18,6 +18,10 @@ local res   = assert(c:join_group("billing", { "orders" }))    -- {member_id, as
 local ends  = assert(c:list_offsets("orders"))                 -- per partition {earliest, latest, …}
 ```
 
+`produce` takes optional headers as a 4th argument, and `produce_batch` records
+take a `headers` field. Fetched records carry `headers`. See
+[headers.md](headers.md).
+
 For a replicated cluster pass `hosts = { … }` instead of `host`/`port`; the
 client follows `leader=` hints across the list. For TLS and SCRAM options see
 [security.md](security.md#clients).
