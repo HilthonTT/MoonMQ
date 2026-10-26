@@ -183,4 +183,21 @@ function TopicManager:delete_topic(name)
     return true, nil
 end
 
+function TopicManager:close()
+    if self.closed then return true, nil end
+    self.closed = true
+    local first_err
+    for name, topic in pairs(self.topics) do
+        for _, p in ipairs(topic.partitions) do
+            local ok, err = pcall(p.close, p)
+            if not ok and not first_err then
+                first_err = string.format("closing %s/%s: %s",
+                    name, tostring(p.id), tostring(err))
+            end
+        end
+    end
+    if first_err then return nil, first_err end
+    return true, nil
+end
+
 return TopicManager

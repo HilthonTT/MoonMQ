@@ -324,6 +324,11 @@ function Broker:detach_committers()
     end
 end
 
+function Broker:close()
+    self:detach_committers()
+    return self.topic_manager:close()
+end
+
 function Broker:tick_cleaners()
     local ran = 0
     for name, topic in pairs(self.topic_manager.topics) do

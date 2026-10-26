@@ -833,6 +833,11 @@ function Server:start()
     log:info("reactor stopped, closing sockets")
     self.reactor:shutdown()
 
+    local cok, cerr = self.broker:close()
+    if not cok then
+        log:error("closing partitions: %s", tostring(cerr))
+    end
+
     return true
 end
 
