@@ -29,7 +29,7 @@ deps:
 	$(LUAROCKS) install lpeg
 	$(LUAROCKS) install argparse
 	$(LUAROCKS) install compat53
-	bash scripts/setup-deps.sh
+	LUAROCKS="$(LUAROCKS)" bash scripts/setup-deps.sh
 
 test:
 	busted

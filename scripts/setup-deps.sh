@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LUAROCKS="${LUAROCKS:-luarocks}"
+LUAROCKS="${LUAROCKS:-luarocks-5.4}"
 
 case "$(uname -s)" in
   Linux*|Darwin*)
-    "$LUAROCKS" install luaposix
+    $LUAROCKS install luaposix
     ;;
   *)
     echo "setup-deps.sh: skipping luaposix on non-POSIX platform ($(uname -s))"
