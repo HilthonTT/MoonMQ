@@ -35,6 +35,10 @@ src/cluster/               the EXECUTION layer (actually moving them)
                            fenced by a claimed controller epoch
   controller_fence.lua     durable highest-controller-epoch tracking; what
                            stops two balance loops from duelling
+  local_loads.lua          per-partition traffic and size samples for the
+                           partitions this broker owns
+  raft/                    opt-in controller consensus: node, RPC, durable
+                           store, service and the Raft-backed fence
 ```
 
 ## What a MOVE does
@@ -131,8 +135,11 @@ Under `Server` in `appsettings.json`:
   "Port": 9095,                     // omit → client-only node (no endpoint)
   "Token": "shared-secret",         // X-Cluster-Token auth; SET THIS if the
                                     // port is reachable beyond loopback
+  "PeerTimeout": 5,                 // seconds per inter-broker HTTP request
+  "BatchBytes": 262144,             // migration copy batch size (256 KiB)
   "Peers": [
-    { "Id": "b2", "Address": "10.0.0.2:9095" }
+    { "Id": "b2", "Address": "10.0.0.2:9095",
+      "Token": "..." }              // optional per-peer override of Token
   ],
   "Raft": { "Enabled": true }   // majority-elected controller + replicated
                                 // ownership table; see below
@@ -141,7 +148,10 @@ Under `Server` in `appsettings.json`:
   "Enabled": true,                  // needs Cluster; run on ONE broker
   "IntervalSeconds": 60,
   "DryRun": true,                   // start here: log plans, move nothing
-  "MaxActionsPerDetect": 50
+  "MaxActionsPerDetect": 50,
+  "Window": 60,                     // load samples kept per partition
+  "MinValid": 1,                    // samples needed before a partition counts
+  "Percentile": 0.9                 // load figure taken from the window
 }
 ```
 
@@ -209,6 +219,7 @@ replay.
 | --- | --- | --- |
 | `Enabled` | — | Omit the block entirely to keep epoch fencing |
 | `ElectionTimeoutMs` | 2500 | Lower bound; the upper bound is randomised from it |
+| `ElectionTimeoutMaxMs` | 1.6 × `ElectionTimeoutMs` | Upper bound of the randomised election timeout |
 | `HeartbeatMs` | 500 | Leader → follower AppendEntries interval |
 | `RpcTimeoutMs` | 1000 | Per-RPC deadline |
 | `CommitTimeoutSeconds` | 10 | How long a proposal waits for a majority |
@@ -226,6 +237,7 @@ treat it as broker data, not as a cache.
 | `moonmq_autobalancer_broker_load{broker,resource}` | per-broker load in the post-plan snapshot |
 | `moonmq_autobalancer_load_mean/stddev{goal}` | distribution stats per goal |
 | `moonmq_autobalancer_last_plan_size` | actions in the most recent plan |
+| `moonmq_autobalancer_actions_total{type}` | MOVE/SWAP actions planned by the detector |
 | `moonmq_reassign_partitions_total{dest}` | completed migrations |
 | `moonmq_reassign_bytes_total{dest}` | bytes migrated |
 | `moonmq_reassign_duration_seconds{topic}` | migration latency histogram |
@@ -237,7 +249,8 @@ treat it as broker data, not as a cache.
 ## Boundaries (read before enabling)
 
 * **Consumer groups span the cluster (2026-07-19), with caveats.** Each group
-  hashes to ONE coordinator broker (deterministic over the sorted member ids);
+  hashes to ONE coordinator broker (`fnv1a(group_id)` over the sorted broker
+  ids, `src/server/group_coordinator.lua`);
   JOIN/HEARTBEAT/LEAVE arriving elsewhere are forwarded to it over
   `/cluster/group/*`. Assignment is ownership-aware: a member only receives
   partitions owned by the broker its connection lives on (fetches are local —

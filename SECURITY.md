@@ -32,15 +32,21 @@ have found a way around the documented boundary.
 - **The broker starts open when no usable credential is configured.** It logs
   a warning and accepts any `AUTH`. Set `Auth.PasswordHash` before exposing a
   port. See [docs/configuration.md](docs/configuration.md).
-- **The metrics/stats HTTP endpoints are unauthenticated.** They bind
-  `127.0.0.1:9090` by default. Keep them on loopback or firewall the port.
-- **There is no transport encryption.** Client↔broker and inter-broker traffic
-  are plaintext TCP/HTTP. TLS is scoped but unshipped —
-  see [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md).
-  Run MoonMQ on a trusted network or tunnel it.
+- **The metrics/stats HTTP endpoints are unauthenticated unless
+  `Server.MetricsAuth` is set** (a bearer token, also readable from
+  `MOONMQ_METRICS_TOKEN`, or HTTP Basic against `Auth.Users`). They bind
+  `127.0.0.1:9090` by default; `/health` is always open. See
+  [docs/security.md](docs/security.md).
+- **Every listener is plaintext until its `Tls` block is set.** Client
+  (`Server.Tls`), metrics (`Server.MetricsTls`), cluster (`Cluster.Tls`) and
+  replication (`Replication.Tls`) traffic is plaintext TCP/HTTP by default.
+  Configure TLS (optionally mTLS) per [docs/security.md](docs/security.md), or
+  run MoonMQ on a trusted network.
 - **Inter-broker endpoints trust the peer list.** Cluster membership is static
-  config with no peer authentication; anything that can reach a broker's
-  cluster port is treated as a peer.
+  config. Peers are authenticated only by the shared `Token`
+  (`X-Cluster-Token`) and, when configured, mTLS on `Cluster.Tls` /
+  `Replication.Tls`; with neither set, anything that can reach a broker's
+  cluster or replication port is treated as a peer.
 
 ## Scope
 

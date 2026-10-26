@@ -49,7 +49,8 @@ For more than one tenant, use `Auth.Users`:
 ```
 
 `MaxFailures` / `FailureWindow` / `BanDuration` are per **IP**, not per account,
-and are shared by both mechanisms — an attacker rotating usernames still trips
+and are shared by every mechanism (plain, SCRAM and EXTERNAL) — an attacker
+rotating usernames still trips
 one counter.
 
 **Configuration errors are fatal.** An unparseable credential, an unknown
@@ -230,7 +231,7 @@ client opens.
 | --- | --- |
 | `RequestsPerSec` | every gated request |
 | `ProduceRecordsPerSec` | records appended |
-| `ProduceBytesPerSec` | key + value bytes appended |
+| `ProduceBytesPerSec` | key + value + header bytes appended |
 | `FetchRecordsPerSec` | records delivered, pull or push |
 | `FetchBytesPerSec` | key + value bytes delivered |
 
@@ -287,7 +288,7 @@ They have genuinely different exposure, so each configures its own:
 | `Server.Tls` | client protocol | Records, keys, topic and group names — everything a client sends or receives |
 | `Server.MetricsTls` | `/metrics`, `/stats` | Topic names and sizes; and Basic credentials, if `MetricsAuth.Basic` is on |
 | `Server.Cluster.Tls` | `/cluster/*` | The `X-Cluster-Token`, and every record migrated between brokers |
-| `Server.Replication.Tls` | `/replicate` | Every record, again — this is the whole log in flight |
+| `Server.Replication.Tls` | `/replicate`, and in failover mode `/replication/*` (fetch, Raft, status) | Every record, again — this is the whole log in flight |
 
 ```json
 "Server": {

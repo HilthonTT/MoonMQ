@@ -33,9 +33,10 @@ append-only logs with CRC-checked on-disk records.
 ## Quick start
 
 ```bash
-sudo apt install lua5.4 lua-socket libssl-dev zlib1g-dev   # Debian/Ubuntu
+sudo apt install lua5.4 liblua5.4-dev luarocks libssl-dev zlib1g-dev   # Debian/Ubuntu
 make deps          # Lua dependencies, see docs/installation.md
 make run           # or: lua5.4 main.lua  (--repl for the MQL console)
+make gateway       # optional HTTP gateway in front of the broker (Gateway in appsettings.json)
 ```
 
 ```lua

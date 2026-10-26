@@ -11,6 +11,9 @@ single- or double-quoted (`''` escapes a quote) and `-- ...` is a comment. The
 language runs through a real lexer → parser → executor pipeline
 (`src/repl/sql/`), so errors carry actual positions.
 
+Aliases: `CONNECT TO …`; `ON` or `TO` in place of `SUBSCRIBE` in `CREATE GROUP` /
+`JOIN GROUP`; `LIST GROUP;` (or `GROUPS`) for `SHOW GROUP;`.
+
 `HELP;` prints the same reference in-session; `HELP <command>;` prints one
 entry.
 

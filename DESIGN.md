@@ -61,14 +61,16 @@ src/
                    client, partition reassigner, produce router, balance loop
   cluster/raft/    controller consensus: persistent log store, node state
                    machine, reactor-native RPC, replication service
+  replication/     automatic failover: the replication Raft group, follower
+                   fetcher, leader-epoch cache, inter-replica wire codec
   autobalancer/    pure decision engine: cluster model, windowed load samples,
                    distribution goals, anomaly detector
   storage/         topic/partition management + default "segmented" backend
                    (segments, time index, group-commit fsync, retention, recovery)
   commitlog/       alternative jocko-style backend: dense offset index,
                    byte-budget retention, key compaction
-  record/          on-disk record codec (v2: CRC-framed key/value + attrs byte)
-                   plus gzip/snappy compression
+  record/          on-disk record codec (v2: CRC-framed key/value + attrs byte),
+                   record headers, the DLQ envelope, gzip/snappy compression
   io/              filesystem + durability primitives (fsync, ftruncate, rename)
                    and TLS parameters/wrapping shared by every listener + client
   metrics/ log/    Prometheus registry · leveled logger
@@ -111,7 +113,10 @@ Two interchangeable backends behind one duck-typed partition interface
 * **segmented** (`storage/segmentation.lua`, default): byte-offset log.
   Segment files roll at a size threshold; a sparse timeindex maps timestamps
   to file positions; retention deletes whole aged-out segments; recovery
-  CRC-verifies the unclean tail and truncates torn records.
+  CRC-verifies the unclean tail and truncates torn records. A graceful stop
+  (SIGINT/SIGTERM) closes every partition, which checkpoints the log end and
+  leaves a `.clean-shutdown` marker, so the next start only verifies the
+  active segment instead of every segment past the checkpoint.
 * **commitlog** (`src/commitlog/`, jocko-style): message-offset log with a
   dense offset index per segment, byte-budget retention, and key compaction
   (latest record per key survives; offsets renumber — see the caveat in
@@ -287,7 +292,7 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | Client → server | Purpose |
 | --- | --- |
 | `HELLO` · `AUTH` | Protocol-version handshake · password authentication |
-| `AUTH_SCRAM` · `AUTH_SCRAM_FINAL` | SCRAM-SHA-256 client-first · client-final (answered by `AUTH_CHALLENGE`, then `AUTH_OK` carrying the server signature) |
+| `AUTH_SCRAM` · `AUTH_SCRAM_FINAL` | SCRAM-SHA-256 client-first · client-final (answered by `AUTH_CHALLENGE`, then `AUTH_OK` carrying the server signature). `AUTH_SCRAM` with mechanism `EXTERNAL` is certificate login |
 | `PRODUCE` · `PRODUCE_BATCH` | Append one record · append N in one frame |
 | `FETCH` · `SUBSCRIBE` | Pull a batch · stream on arrival |
 | `COMMIT` · `NACK` | Commit a group offset · reject a record (→ DLQ) |
@@ -295,7 +300,7 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | `DELETE_TOPIC` · `DESCRIBE_TOPIC` · `ALTER_TOPIC_CONFIG` | Remove a topic · read its config · change it |
 | `CREATE_PARTITIONS` | Grow a topic to a larger partition count (never shrinks) |
 | `LIST_GROUPS` · `DESCRIBE_GROUP` · `DELETE_GROUP` | Consumer-group admin |
-| `INIT_PRODUCER_ID` · `PRODUCE_IDEMPOTENT` | Request a u64 PID · append `(PID, seq, …)` |
+| `INIT_PRODUCER_ID` · `PRODUCE_IDEMPOTENT` | Request a PID + epoch (durable when a `producer_name` is given) · append `(PID, seq, epoch, …)` |
 | `BEGIN_TXN` · `END_TXN` · `TXN_OFFSET_COMMIT` | Transaction lifecycle |
 | `JOIN_GROUP` · `GROUP_HEARTBEAT` · `LEAVE_GROUP` | Consumer-group membership |
 | `IDENTIFY_CLIENT` · `GOODBYE` | Client metadata · clean disconnect |
@@ -305,14 +310,15 @@ Opcodes split into client requests (`0x01`–`0x7F`) and server replies
 | --- | --- |
 | `WELCOME` · `AUTH_OK` · `IDENTIFY_ACK` | Handshake / auth acceptance |
 | `PRODUCE_ACK` · `PRODUCE_BATCH_ACK` | Partition + offset · one pair per batched record |
-| `PRODUCER_ID` · `GROUP_ASSIGNMENT` | Assigned u64 PID · member id + partitions |
+| `PRODUCER_ID` · `GROUP_ASSIGNMENT` | Assigned u64 PID + u16 epoch · member id + partitions |
 | `RECORD` · `RECORD_BATCH` | A delivered record · N of them in one frame |
 | `TOPIC_LIST` · `OFFSETS` · `OK` · `NACK_ACK` | Query results / acks |
 | `TOPIC_DESCRIPTION` · `GROUP_LIST` · `GROUP_DESCRIPTION` | Admin query results |
 | `ERROR` | Numeric error code + message |
 
-A connection must `HELLO` then `AUTH` before anything else; only handshake
-opcodes are accepted pre-auth.
+A connection must `HELLO` then authenticate (`AUTH`, or `AUTH_SCRAM` for
+SCRAM and EXTERNAL) before anything else; only handshake opcodes are accepted
+pre-auth.
 
 `src/server/server.lua` owns the listener, capacity accounting, and ban
 enforcement, then delegates to `src/server/connection.lua`. Each `Connection`
@@ -356,6 +362,16 @@ port. `/health` is open either way.
 | `moonmq_quota_throttled_total` | counter | `scope`, `dimension` |
 | `moonmq_auth_success_total` · `moonmq_auth_failures_total` | counter | `mechanism` |
 | `moonmq_tls_handshakes_total` · `moonmq_tls_handshake_failures_total` | counter | — |
+| `moonmq_build_info` | gauge (always 1) | `version`, `commit` |
+| `moonmq_connection_duration_seconds` | histogram | — |
+| `moonmq_pending_bytes` | gauge | `conn` (one series per open connection, removed on close) |
+| `moonmq_connections_refused_fd_total` | counter | — |
+| `moonmq_metrics_http_requests_total` | counter | — |
+| `moonmq_producers_expired_total` | counter | — |
+
+Cluster, autobalancer, replication and TLS-reload metrics are listed in
+[docs/cluster.md](docs/cluster.md), [docs/replication.md](docs/replication.md)
+and [docs/security.md](docs/security.md).
 
 `moonmq_partition_log_bytes` is per-partition — a few thousand series at the
 default `MaxTopics=1024`, which is fine for Prometheus. Lift `MaxTopics`
@@ -372,7 +388,7 @@ such as a connection id.
 
 | If you want to understand… | Start at |
 | --- | --- |
-| the event loop | `src/server/reactor.lua` (~270 lines, self-contained) |
+| the event loop | `src/server/reactor.lua` (~420 lines, self-contained) |
 | a request's lifecycle | `src/server/connection.lua`, then `handlers.lua` |
 | who may do what | `src/server/acl.lua`, then the gates in `handlers.lua` |
 | TLS | `src/io/tls.lua`, then `Reactor:park` / `tls_handshake` |

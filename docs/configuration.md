@@ -6,9 +6,15 @@
 
 | Section | Keys |
 | --- | --- |
-| `Server` | `Host`, `Port` (9092), `DataDir`, `MaxConnections` (960), `MaxConnectionsPerIP`, `FdReserve` (64), `MaxFrameSize`, `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `Tls`, `MetricsHost`, `MetricsPort` (`null` disables), `MetricsTls`, `MetricsAuth`, `Acks`, `Replication`, `Cluster`, `Autobalance` |
+| `Server` | `Host`, `Port` (9092), `DataDir`, `StorageBackend` (`segmented` default, or `commitlog`), `MaxConnections` (960), `MaxConnectionsPerIP`, `FdReserve` (64), `MaxFrameSize`, `MaxPendingBytes` (16 MiB queued per connection), `SendDeadline` (30s), `MaxTopics` (1024), `MaxListTopics`, `IdleDeadline` (60s), `PreAuthReadDeadline` (5s), `HandshakeDeadline` (5s), `HeartbeatInterval` (30s), `HeartbeatMissThreshold` (3), `ProducerExpirySeconds` (86400), `ProducerExpiryCheckIntervalSeconds` (300), `Tls`, `MetricsHost` (127.0.0.1), `MetricsPort` (9090), `MetricsTls`, `MetricsAuth`, `Acks`, `Replication`, `Cluster`, `Autobalance` |
+| `Server.GroupCommit` | `LingerMs` (2), `MaxWaiters` (64) — how long an fsync waits to batch acks, and how many it batches at most |
+| `Server.Dlq` | `Suffix` (`.dlq`), `MaxDeliveries` (3) — see [dlq.md](dlq.md) |
 | `Auth` | `Username` + either `PasswordHash` (`pbkdf2-sha256$…` or `scram-sha-256$…`) or plaintext `Password`; `MaxFailures`, `FailureWindow`, `BanDuration` for per-IP lockout. `Users` (multi-tenant list with `Acls` + `Quota`) and `Quotas` (`Default`/`Topics`/`BurstSeconds`) — see [security.md](security.md) |
 | `Logging` | `Level` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `File` (empty = stderr only), `LogToStderr` (default true, tees both) |
+| `Gateway` | `Host` (0.0.0.0), `Port` (8080), `MoonMQHost` (127.0.0.1), `MoonMQPort` (`Server.Port`), `MoonMQPassword` (logs in as `Auth.Username`), `MoonMQTimeout` (30s), `PoolMax` (8) — the HTTP gateway started by `make gateway` (`bin/gateway.lua`) |
+
+The metrics listener always starts; `MetricsPort` has no "off" value, so keep
+`MetricsHost` on loopback or set `MetricsAuth` (see [security.md](security.md)).
 
 ## Connection limits
 

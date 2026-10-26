@@ -1,8 +1,9 @@
 # Installation
 
 ```bash
-sudo apt install lua5.4 lua-socket libssl-dev zlib1g-dev   # Debian/Ubuntu
-make deps          # busted, dkjson, luasocket, luaposix, lua-zlib, luaossl, luasec
+sudo apt install lua5.4 liblua5.4-dev luarocks libssl-dev zlib1g-dev   # Debian/Ubuntu
+make deps          # busted, dkjson, luasocket, luaposix, lua-zlib, luaossl, luasec,
+                   # luacheck + the console line-editing rocks (sirocco, hump, lpeg, argparse, compat53)
 ```
 
 ## Requirements

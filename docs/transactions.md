@@ -54,28 +54,38 @@ This document records:
 
 ---
 
-## 1. Today: idempotent producer (session-scoped)
+## 1. Today: idempotent and transactional producers
+
+A client asks for a producer id with `INIT_PRODUCER_ID`. Without a
+`producer_name` (`Client.new{ idempotent = true }`) the id is **ephemeral**:
+it lives for one connection, and the guarantees and non-guarantees below
+apply. With a `producer_name` it is **durable**: PID, epoch and sequence memos
+survive reconnects and restarts (`__producer_state`), a new session fences the
+old one, and the producer may run transactions (see the client example at the
+end of this section).
 
 ### Guarantees
 
 Within the lifetime of a single TCP connection that called
-`INIT_PRODUCER_ID`, the broker guarantees:
+`INIT_PRODUCER_ID` (and, for a named producer, across connections), the
+broker guarantees:
 
 - A `PRODUCE_IDEMPOTENT` retry with the same `(PID, topic, seq)` returns
   the original `(partition, offset)` instead of appending a duplicate.
 - An out-of-order `seq` (gap or regression) is rejected with
   `ERR_OUT_OF_ORDER_SEQUENCE` so the client can detect lost messages.
 
-### Non-guarantees
+### Non-guarantees (unnamed producers)
 
-- **No durability across the broker process.** PIDs and sequence memos
-  live in broker memory. A restart wipes them; clients must call
+- **No durability across the broker process.** Ephemeral PIDs and sequence
+  memos live in broker memory. A restart wipes them; clients must call
   `INIT_PRODUCER_ID` again on reconnect.
-- **No cross-connection idempotence.** Two connections with the same
-  client identity get two distinct PIDs; the broker can't dedup
-  retries that move across connections.
-- **No transaction boundary.** Multiple `PRODUCE_IDEMPOTENT` calls do
-  NOT form an atomic group; a crash mid-batch leaves a partial write.
+- **No cross-connection idempotence.** Two unnamed connections get two
+  distinct PIDs; the broker can't dedup retries that move across
+  connections. Give the producer a `producer_name` for that.
+- **No transaction boundary.** Without `BEGIN_TXN`/`END_TXN`, multiple
+  `PRODUCE_IDEMPOTENT` calls do NOT form an atomic group; a crash mid-batch
+  leaves a partial write. Transactions require a named producer.
 
 ### Wire format
 
@@ -83,17 +93,25 @@ Opcodes (additive on PROTOCOL_VERSION 1):
 
 | Op                          | Direction | Payload                                                |
 |----------------------------|-----------|--------------------------------------------------------|
-| `OP_INIT_PRODUCER_ID` 0x0E | C → S     | empty                                                  |
-| `OP_PRODUCER_ID` 0x88      | S → C     | `u64 pid`                                              |
-| `OP_PRODUCE_IDEMPOTENT` 0x0F | C → S   | `u64 pid \| u32 seq \| str topic \| str key \| str value` |
+| `OP_INIT_PRODUCER_ID` 0x0E | C → S     | `str producer_name` (empty, or no payload, = ephemeral) |
+| `OP_PRODUCER_ID` 0x88      | S → C     | `u64 pid \| u16 epoch`                                 |
+| `OP_PRODUCE_IDEMPOTENT` 0x0F | C → S   | `u64 pid \| u32 seq \| u16 epoch \| u8 codec \| str topic \| str key \| str value [\| headers]` |
+| `OP_BEGIN_TXN` 0x13        | C → S     | empty                                                  |
+| `OP_END_TXN` 0x14          | C → S     | `u8 commit` (1 = commit, 0 = abort)                    |
+| `OP_TXN_OFFSET_COMMIT` 0x15 | C → S    | `str group \| u32 n \| n × (str topic \| u32 partition \| u64 offset)` |
 
 Acks reuse `OP_PRODUCE_ACK` (0x82) with the original `(partition, offset)`.
+The optional trailing headers block is described in [headers.md](headers.md).
 Errors use `OP_ERROR` with codes:
 
 | Code | Name                       | Meaning                                                |
 |-----:|----------------------------|--------------------------------------------------------|
 | 10   | `ERR_NO_PRODUCER_ID`       | `PRODUCE_IDEMPOTENT` sent before `INIT_PRODUCER_ID`.   |
 | 11   | `ERR_OUT_OF_ORDER_SEQUENCE` | seq not equal to last_seq or last_seq + 1.            |
+| 50   | `ERR_PRODUCER_FENCED`      | A newer session of the same `producer_name` exists.    |
+| 51   | `ERR_INVALID_TXN_STATE`    | Transaction call out of order (e.g. `END_TXN` with none open). |
+| 52   | `ERR_TRANSACTION_TIMED_OUT` | The transaction was aborted for running too long.     |
+| 53   | `ERR_OFFSETS_OUT_OF_RANGE_FOR_TXN` | A transactional offset commit was out of range. |
 
 ### Why per-(PID, topic) and not per-(PID, partition)?
 
@@ -107,8 +125,8 @@ Real Kafka tracks sequences per `(PID, topic, partition)`. We track per
 - It costs: idempotent producers can't batch across partitions in
   parallel (we don't anyway).
 
-The full Kafka layout is the natural upgrade path when consumer groups
-+ offset commits land (see §3).
+Consumer groups and offset commits have since landed (see §3); moving to the
+full Kafka per-partition layout remains possible but has not been needed.
 
 ### Client API
 
@@ -131,6 +149,22 @@ local ack = c:produce("orders", "key-1", "value-1")
 -- For testing: send a specific seq (e.g. simulate a retry).
 local replay = c:produce_at_seq("orders", "key-1", "value-1", 0)
 -- replay.partition == ack.partition, replay.offset == ack.offset
+```
+
+A named producer runs transactions — here a consume-transform-produce step
+that commits its output and its input offset together:
+
+```lua
+local p = assert(Client.new{ host = "127.0.0.1", port = 9092,
+                             username = "admin", password = "admin",
+                             producer_name = "billing-writer" })
+
+assert(p:begin_transaction())
+assert(p:produce("invoices", "order-42", "…"))
+assert(p:send_offsets_to_transaction("billing", {
+    { topic = "orders", partition = 2, offset = 43 },
+}))
+assert(p:commit_transaction())          -- or p:abort_transaction()
 ```
 
 ---
@@ -186,8 +220,10 @@ Everything below has since landed (including `read_committed` + LSO as of
 
 1. **Transaction coordinator.** A new broker subsystem that owns
    `__transaction_state`. Producers route `INIT_PRODUCER_ID` to the
-   coordinator (today: the server assigns inline). The coordinator
-   tracks `(transactional_id → (PID, epoch, state))` durably.
+   coordinator, which tracks `(transactional_id → (PID, epoch, state))`
+   durably. *As shipped:* the server assigns PIDs inline from
+   `__producer_state`, and `src/broker/txn_coordinator.lua` owns the
+   transaction state.
 
 2. **Producer epochs.** PIDs become 2-field: `(pid: u64, epoch: u16)`.
    On reconnect with a known `transactional_id`, the coordinator bumps
@@ -210,6 +246,12 @@ Everything below has since landed (including `read_committed` + LSO as of
    and only takes effect when the COMMIT control record lands.
 
 ### Opcodes (proposed)
+
+*As shipped:* `INIT_TRANSACTIONAL_ID` became `INIT_PRODUCER_ID` with a
+`producer_name`; `ADD_PARTITIONS_TO_TXN` became implicit enrolment on the
+first transactional produce to a partition; `WRITE_TXN_MARKERS` became the
+inter-broker `/cluster/txn/enroll` and `/cluster/txn/resolve` endpoints.
+`BEGIN_TXN`, `END_TXN` and `TXN_OFFSET_COMMIT` shipped as proposed.
 
 | Op                              | Notes                                |
 |---------------------------------|--------------------------------------|

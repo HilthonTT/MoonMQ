@@ -12,8 +12,8 @@ Found a security issue? Don't open an issue — follow
 Linux (or WSL on Windows) with Lua 5.4:
 
 ```bash
-sudo apt install lua5.4 liblua5.4-dev luarocks wget
-make deps          # busted, luasocket, dkjson, lua-zlib, luacheck, …
+sudo apt install lua5.4 liblua5.4-dev luarocks wget libssl-dev zlib1g-dev
+make deps          # busted, luasocket, dkjson, lua-zlib, luaossl, luasec, luacheck, …
 ```
 
 Windows note: the test/lint toolchain assumes POSIX (luaposix for real
@@ -69,6 +69,9 @@ The codebase is deliberately consistent; match what's around you.
 
 * Specs live in `spec/*_spec.lua` (busted). Use the temp-dir + `rmdir`
   pattern from `topic_manager_spec.lua`; never write into the repo.
+* `spec/helper.lua` (loaded through `.busted`) closes every `TopicManager` a
+  test opened once the test ends, so partition file handles don't leak across
+  specs. It does not remove temp dirs — that is still the spec's job.
 * Bug fixes come with a regression test that fails before the fix
   (`spec/review_fixes_spec.lua` and `spec/bugfix_regression_spec.lua` show
   the shape).
@@ -84,16 +87,24 @@ The codebase is deliberately consistent; match what's around you.
   break vs. read-compat), and update `docs/`.
 * New config keys: map them from `appsettings.json` in
   `src/server/options.lua`, add a case to `spec/options_spec.lua`, document
-  them in the README's Configuration table, and give them safe defaults
+  them in [docs/configuration.md](docs/configuration.md) (or the feature's
+  own doc), and give them safe defaults
   (features off, loopback binds). Builders there return `nil, err` instead
   of exiting; `main.lua` owns the one exit path.
 
 ## Docs map
 
-* [README](README.md) — running, configuring, feature overview
+* [README](README.md) — feature overview and quick start
 * [DESIGN.md](DESIGN.md) — layering, module map, data flow, wire protocol
-* [docs/cluster.md](docs/cluster.md) — clustering, reassignment, autobalancer
+* [docs/installation.md](docs/installation.md) — dependencies, fallbacks, luaposix build, Windows
+* [docs/configuration.md](docs/configuration.md) — every `appsettings.json` section
+* [docs/client.md](docs/client.md) — the Lua client API
+* [docs/headers.md](docs/headers.md) — record headers and their encoding
+* [docs/security.md](docs/security.md) — TLS, users, ACLs, SCRAM, quotas, metrics auth
+* [docs/replication.md](docs/replication.md) — replication, failover, in-sync replicas
+* [docs/cluster.md](docs/cluster.md) — clustering, reassignment, autobalancer, Raft controller
 * [docs/transactions.md](docs/transactions.md) — transaction semantics
 * [docs/batching.md](docs/batching.md) — batch wire formats and guarantees
 * [docs/dlq.md](docs/dlq.md) — dead-letter queue and NACK semantics
 * [docs/mql.md](docs/mql.md) — the interactive console's grammar
+* [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md) — design notes behind TLS and controller consensus

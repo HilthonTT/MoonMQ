@@ -12,7 +12,9 @@ MoonMQ has two replication modes, chosen by `Server.Replication.Failover`:
 | Consumers read up to | log end | high watermark |
 
 The rest of this page is about failover mode. Static mode is unchanged and is
-what an existing `Replication` block keeps getting.
+what an existing `Replication` block keeps getting. Its one extra knob is
+`Replication.LagMax` (default 0): how many records behind the leader's log end
+a follower may be and still count towards the static high watermark.
 
 ## Topology
 
