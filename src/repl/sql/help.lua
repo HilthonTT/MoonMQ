@@ -7,7 +7,7 @@ return {
 
     connect = {
         usage = "CONNECT ['host'] [HOST 'host'] [PORT n] [USER 'u'] [PASSWORD 'p'];",
-        blurb = "Open a connection to a broker. Defaults: host 127.0.0.1, port 9092, no auth.",
+        blurb = "Open a connection to a broker. Defaults: host 127.0.0.1, port 9092, user admin, password admin.",
     },
     disconnect = {
         usage = "DISCONNECT;",
