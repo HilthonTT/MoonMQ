@@ -1,4 +1,4 @@
-# Dependabot keeps the two dependency surfaces GitHub can actually see up to
+# Dependabot keeps the dependency surfaces GitHub can actually see up to
 # date. MoonMQ's Lua deps are installed by `make deps` / CI via luarocks, and
 # Dependabot has no LuaRocks ecosystem — those are bumped by hand in the
 # Makefile and .github/workflows/ci.yml.
@@ -33,6 +33,22 @@ updates:
       - python
     groups:
       python-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Documentation site (website/package.json).
+  - package-ecosystem: npm
+    directory: "/website"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - website
+    groups:
+      website-minor-patch:
         update-types:
           - minor
           - patch

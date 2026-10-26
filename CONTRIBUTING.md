@@ -108,3 +108,4 @@ The codebase is deliberately consistent; match what's around you.
 * [docs/dlq.md](docs/dlq.md) — dead-letter queue and NACK semantics
 * [docs/mql.md](docs/mql.md) — the interactive console's grammar
 * [docs/roadmap-security-consensus.md](docs/roadmap-security-consensus.md) — design notes behind TLS and controller consensus
+* [website/](website/README.md) — the documentation site; it renders the files above, so edit them rather than the site

@@ -64,7 +64,9 @@ make test          # busted only
 
 ## Documentation
 
-Start with [DESIGN.md](DESIGN.md), then [CONTRIBUTING.md](CONTRIBUTING.md).
+The same docs are published at **[hilthontt.github.io/MoonMQ](https://hilthontt.github.io/MoonMQ/)**
+(built from `website/`). Start with [DESIGN.md](DESIGN.md), then
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 | Doc | Covers |
 | --- | --- |
