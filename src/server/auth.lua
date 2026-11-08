@@ -196,6 +196,7 @@ function M.authenticator(opts)
 
     return setmetatable({
         store          = store,
+        generation     = 1,
         max_failures   = opts.max_failures   or 5,
         failure_window = opts.failure_window or 60,
         ban_duration   = (opts.ban_duration   or 15) * 60,
@@ -267,6 +268,17 @@ function M.static_authenticator(opts)
     a.username      = opts.username
     a.password_hash = password_hash
     return a
+end
+
+function Auth:replace_store(store)
+    assert(type(store) == "table" and store:count() > 0,
+        "replace_store: a non-empty store is required")
+    local worst_iterations = report_kdf_cost(store)
+    self.store      = store
+    self.generation = self.generation + 1
+    self.cred_cache = {}
+    self.decoy.iterations = math.max(worst_iterations, 1)
+    return self.generation
 end
 
 function Auth:set_yield_fn(fn)
@@ -412,12 +424,16 @@ function Auth:verify(user, pass, ip)
     local has_password = record ~= nil and record.parsed ~= nil
     local parsed = has_password and record.parsed or self.decoy
 
+    local generation = self.generation
     self.inflight = self.inflight + 1
     local ok, pass_ok = pcall(M.verify_password, parsed, pass or "",
         { yield_fn = self.yield_fn })
     self.inflight = self.inflight - 1
     if not ok then
         return false, "auth aborted"
+    end
+    if generation ~= self.generation then
+        return false, "users were reloaded during login, retry"
     end
 
     if has_password and pass_ok then

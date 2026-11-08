@@ -120,6 +120,13 @@ function M.new(opts)
     }, Manager)
 end
 
+function Manager:replace_specs(other)
+    self.default       = other and other.default
+    self.users         = other and other.users  or {}
+    self.topics        = other and other.topics or {}
+    self.burst_seconds = other and other.burst_seconds or self.burst_seconds
+end
+
 function Manager:is_empty()
     return self.default == nil
         and next(self.users) == nil

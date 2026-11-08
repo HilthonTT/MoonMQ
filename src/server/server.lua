@@ -201,6 +201,10 @@ function Server.new(opts)
         "TLS listener configurations revalidated and swapped in on SIGHUP.")
     metrics.describe("moonmq_tls_reload_failures_total", "counter",
         "SIGHUP reloads refused because the new certificate or key was unusable.")
+    metrics.describe("moonmq_auth_reloads_total", "counter",
+        "User, ACL and quota configurations swapped in on SIGHUP.")
+    metrics.describe("moonmq_auth_reload_failures_total", "counter",
+        "SIGHUP user reloads refused; the running users, ACLs and quotas were kept.")
     metrics.describe("moonmq_tls_handshake_failures_total", "counter",
         "TLS handshakes that failed: an untrusted or missing client "
         .. "certificate, a plaintext client on a TLS port, or a stalled peer.")
@@ -389,6 +393,7 @@ function Server.new(opts)
         metrics_port = opts.metrics_port,
 
         authenticator        = opts.authenticator,
+        auth_loader          = opts.auth_loader,
         rate_limiter_factory = opts.rate_limiter_factory,
         quotas               = opts.quotas,
         metrics_auth         = opts.metrics_auth,
@@ -627,8 +632,9 @@ function Server:_install_signal_handlers()
     if signal.SIGHUP then
         signal.signal(signal.SIGHUP, function()
             self.tls_reload_requested = true
+            self.auth_reload_requested = true
         end)
-        log:info("SIGHUP reloads TLS certificates without a restart")
+        log:info("SIGHUP reloads TLS certificates and users without a restart")
     end
 end
 
@@ -646,6 +652,66 @@ function Server:reload_tls()
     return reloaded, rotated, errors
 end
 
+function Server:_refuse_auth_reload(reason)
+    metrics.inc("moonmq_auth_reload_failures_total", 1)
+    log:error("user reload refused, keeping the running users: %s", reason)
+    return nil, reason
+end
+
+function Server:reload_auth()
+    if not self.auth_loader then
+        return nil, "no config loader"
+    end
+    local store, quotas, err = self.auth_loader()
+    if err then return self:_refuse_auth_reload(err) end
+
+    if not self.authenticator then
+        if store then
+            return self:_refuse_auth_reload(
+                "the broker started OPEN; enabling authentication needs a restart")
+        end
+        return true, 0, 0
+    end
+    if not store then
+        return self:_refuse_auth_reload(
+            "the new config has no users, which would make the broker OPEN; "
+            .. "that needs a restart")
+    end
+
+    self.authenticator:replace_store(store)
+    if self.quotas and quotas then
+        self.quotas:replace_specs(quotas)
+    elseif self.quotas then
+        self.quotas:replace_specs(nil)
+    else
+        self.quotas = quotas
+    end
+
+    local updated, dropped = {}, {}
+    for _, conn in pairs(self.connections_by_id) do
+        if conn.principal then
+            local principal = self.authenticator:principal(conn.principal.username)
+            if principal then
+                conn.principal = principal
+                updated[#updated + 1] = conn
+            else
+                dropped[#dropped + 1] = conn
+            end
+        end
+    end
+    for _, conn in ipairs(dropped) do
+        log:info("conn=%s user %q was removed, closing", conn.id_short,
+            conn.username or "?")
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
+            "user removed")
+    end
+
+    metrics.inc("moonmq_auth_reloads_total", 1)
+    log:info("users reloaded: %d user(s): %s; %d connection(s) updated, %d closed",
+        store:count(), store:describe(), #updated, #dropped)
+    return true, #updated, #dropped
+end
+
 function Server:_run_tls_reload_watch()
     while self.running do
         self.reactor:sleep(TLS_RELOAD_POLL_S)
@@ -653,6 +719,11 @@ function Server:_run_tls_reload_watch()
             self.tls_reload_requested = false
             local ok, err = pcall(self.reload_tls, self)
             if not ok then log:error("TLS reload failed: %s", tostring(err)) end
+        end
+        if self.auth_reload_requested then
+            self.auth_reload_requested = false
+            local ok, err = pcall(self.reload_auth, self)
+            if not ok then self:_refuse_auth_reload(tostring(err)) end
         end
     end
 end

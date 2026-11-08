@@ -327,6 +327,7 @@ function M.auth_scram(server, conn, correl, payload)
     conn.scram = {
         username     = first.username,
         principal    = principal,
+        generation   = server.authenticator.generation,
         credential   = credential,
         nonce        = combined_nonce,
         client_first = first.bare,
@@ -387,6 +388,11 @@ function M.auth_scram_final(server, conn, correl, payload)
     if not scram_m.verify_proof(state.credential.stored_key, auth_message, final.proof)
        or not state.principal then
         reject("invalid credentials")
+        return
+    end
+    if state.generation ~= server.authenticator.generation then
+        conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
+            "users were reloaded during login, retry")
         return
     end
 

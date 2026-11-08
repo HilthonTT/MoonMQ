@@ -122,6 +122,29 @@ function M.auth(cfg)
     return authenticator, q, nil
 end
 
+-- What a SIGHUP swaps in: the user store and quota manager built from a
+-- freshly loaded config, or an error that leaves the running ones alone.
+-- An absent store (no users at all) is returned as nil, not an error; the
+-- server decides whether that transition is allowed.
+function M.reload_auth(cfg)
+    local ac = cfg.Auth or {}
+    local store, serr = users_m.load(ac)
+    if serr then return nil, nil, "Auth config: " .. serr end
+    if not store then return nil, nil, nil end
+    local q, qerr = quotas(ac.Quotas or {}, store)
+    if qerr then return nil, nil, qerr end
+    return store, q, nil
+end
+
+function M.auth_loader(load_config)
+    load_config = load_config or Config.load
+    return function()
+        local cfg, cerr = load_config()
+        if not cfg then return nil, nil, "config: " .. tostring(cerr) end
+        return M.reload_auth(cfg)
+    end
+end
+
 function M.metrics_auth(cfg, getenv)
     getenv = getenv or os.getenv
     local mc = Config.get(cfg, "Server.MetricsAuth", nil)
@@ -241,6 +264,7 @@ function M.from_config(cfg, getenv)
     if mterr then return nil, mterr end
 
     return {
+        auth_loader            = M.auth_loader(),
         acks                   = s.Acks,
         replication            = replication,
         cluster                = cluster,

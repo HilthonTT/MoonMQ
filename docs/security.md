@@ -78,6 +78,39 @@ Both are salted PBKDF2-SHA256 at the same iteration count, and both accept both
 mechanisms, so migrating is a config edit with no client change. Existing
 `pbkdf2-sha256` hashes keep working untouched.
 
+### Changing users without a restart
+
+`SIGHUP` re-reads `appsettings.json` (plus the environment overlay) and swaps
+in the whole `Auth` block: users, credentials, ACLs, superuser flags,
+certificate names and quotas.
+
+```bash
+kill -HUP $(pidof lua5.4)     # or: systemctl reload moonmq
+```
+
+* The new block is built and validated in full before anything changes. A
+  typo, a duplicate user or a bad hash is **refused** and logged, and the
+  running users stay in place.
+* Connections that are already logged in pick up the new ACLs, quotas and
+  superuser flag on their next request. A connection whose user was removed
+  is closed.
+* A changed password applies to new logins. Sessions that logged in with the
+  old one stay connected; remove and re-add the user, or restart the client,
+  to end them.
+* A login that is in progress while the swap happens is refused with
+  "users were reloaded during login, retry", rather than finishing against
+  credentials that no longer exist. This does not count towards the IP lockout.
+* Two transitions still need a restart: going from OPEN (no users) to
+  authenticated, and removing every user (which would make the broker OPEN).
+  Both are refused on reload.
+* A quota whose rate changed starts a new, full bucket. Unchanged quotas
+  keep their current fill, so a reload does not hand throttled clients a
+  free burst.
+
+Each broker reloads its own config. In a cluster or replication group, send
+the signal to every broker. Watch `moonmq_auth_reloads_total` and
+`moonmq_auth_reload_failures_total`.
+
 ---
 
 ## 2. ACLs
@@ -559,6 +592,8 @@ wrong reasons.
 | `moonmq_metrics_http_unauthorized_total` | — |
 | `moonmq_tls_handshakes_total` | — |
 | `moonmq_tls_handshake_failures_total` | — |
+| `moonmq_auth_reloads_total` | — |
+| `moonmq_auth_reload_failures_total` | — |
 
 Every denial is also logged with the connection id, the username, the
 operation, and the resource, which between them name the ACL rule that is
@@ -583,5 +618,6 @@ missing.
 10. Once every client speaks SCRAM over TLS, set
     `Server.Tls.ChannelBinding: "required"` — it turns "the password is safe"
     into "this session is the one the broker terminated".
-11. Reload certificates with `SIGHUP` rather than a restart, and alert on
-    `moonmq_tls_reload_failures_total`.
+11. Reload certificates and users with `SIGHUP` rather than a restart, and
+    alert on `moonmq_tls_reload_failures_total` and
+    `moonmq_auth_reload_failures_total`.
