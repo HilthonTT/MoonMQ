@@ -216,3 +216,82 @@ describe("DlqManager", function()
         assert.are.equal(1, broker.dlq:attempts_for("g1", "orders", 1, o2))
     end)
 end)
+
+describe("DlqManager attempt persistence", function()
+    before_each(function() rmdir(BASE_DIR) end)
+    after_each(function() rmdir(BASE_DIR) end)
+
+    local function reopen(broker, dlq_opts)
+        broker:close()
+        return assert(brk_m.Broker.new(BASE_DIR, { dlq = dlq_opts }))
+    end
+
+    it("keeps attempt counters across a broker restart", function()
+        local broker = new_broker_with_topic("orders", 1)
+        local off = append(broker, "orders", 1, "k1", "v1")
+        assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom"))
+        assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom"))
+
+        broker = reopen(broker)
+        assert.are.equal(2, broker.dlq:attempts_for("g1", "orders", 1, off))
+        local r3 = assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom"))
+        assert.is_true(r3.dead_lettered)
+        assert.are.equal(3, r3.attempts)
+        broker:close()
+    end)
+
+    it("does not resurrect a counter cleared by dead-lettering", function()
+        local broker = new_broker_with_topic("orders", 1, { max_deliveries = 2 })
+        local off = append(broker, "orders", 1, "k1", "v1")
+        assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom"))
+        assert.is_true(assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom")).dead_lettered)
+
+        broker = reopen(broker, { max_deliveries = 2 })
+        assert.are.equal(0, broker.dlq:attempts_for("g1", "orders", 1, off))
+        assert.are.equal(0, broker.dlq.tracked)
+        broker:close()
+    end)
+
+    it("does not resurrect counters for a deleted topic or group", function()
+        local broker = new_broker_with_topic("orders", 1)
+        assert(broker:create_topic("audit", 1))
+        local off = append(broker, "orders", 1, "k1", "v1")
+        local aoff = append(broker, "audit", 1, "k1", "v1")
+        assert(broker.dlq:record_failure("g1", "orders", 1, off, "boom"))
+        assert(broker.dlq:record_failure("g2", "orders", 1, off, "boom"))
+        assert(broker.dlq:record_failure("g1", "audit", 1, aoff, "boom"))
+
+        assert.are.equal(1, broker.dlq:forget_topic("audit"))
+        assert.are.equal(1, broker.dlq:forget_group("g2"))
+
+        broker = reopen(broker)
+        assert.are.equal(1, broker.dlq:attempts_for("g1", "orders", 1, off))
+        assert.are.equal(0, broker.dlq:attempts_for("g2", "orders", 1, off))
+        assert.are.equal(0, broker.dlq:attempts_for("g1", "audit", 1, aoff))
+        assert.are.equal(1, broker.dlq.tracked)
+        broker:close()
+    end)
+
+    it("tombstones evicted counters so a restart respects max_tracked", function()
+        local broker = new_broker_with_topic("orders", 1, { max_tracked = 2 })
+        local offs = {}
+        for i = 1, 3 do offs[i] = append(broker, "orders", 1, "k" .. i, "v") end
+        for i = 1, 3 do
+            assert(broker.dlq:record_failure("g1", "orders", 1, offs[i], "boom"))
+        end
+        assert.are.equal(2, broker.dlq.tracked)
+
+        broker = reopen(broker, { max_tracked = 2 })
+        assert.are.equal(2, broker.dlq.tracked)
+        broker:close()
+    end)
+
+    it("hides the attempts topic from list_topics", function()
+        local broker = assert(brk_m.Broker.new(BASE_DIR))
+        assert.is_table(broker.topic_manager.topics["__dlq_attempts"])
+        for _, name in ipairs(broker:list_topics()) do
+            assert.are_not.equal("__dlq_attempts", name)
+        end
+        broker:close()
+    end)
+end)

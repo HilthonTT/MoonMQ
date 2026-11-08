@@ -9,6 +9,11 @@ local DEFAULT_SUFFIX         = ".dlq"
 local DEFAULT_MAX_DELIVERIES = 3
 local DEFAULT_MAX_TRACKED    = 4096
 
+local ATTEMPTS_TOPIC            = "__dlq_attempts"
+local ATTEMPTS_BACKEND          = "commitlog"
+local ATTEMPTS_MAX_SEGMENT_SIZE = 4 * 1024 * 1024
+local ATTEMPTS_VALUE_FMT        = ">I4I8"
+
 local DlqManager = {}
 DlqManager.__index = DlqManager
 
@@ -19,7 +24,7 @@ function DlqManager.new(broker, opts)
     assert(type(max_deliveries) == "number" and max_deliveries >= 1,
         "max_deliveries must be >= 1")
 
-    return setmetatable({
+    local self = setmetatable({
         broker         = broker,
         suffix         = opts.suffix or DEFAULT_SUFFIX,
         max_deliveries = max_deliveries,
@@ -27,7 +32,101 @@ function DlqManager.new(broker, opts)
         now_ms         = opts.now_ms or time_m.now_ms,
         attempts       = {},
         tracked        = 0,
+        store          = nil,
     }, DlqManager)
+
+    if opts.persist ~= false and broker.topic_manager then
+        self:_open_store()
+    end
+    return self
+end
+
+function DlqManager.topic_name()
+    return ATTEMPTS_TOPIC
+end
+
+function DlqManager:_open_store()
+    local tm = self.broker.topic_manager
+    local topic = tm.topics[ATTEMPTS_TOPIC]
+    if not topic then
+        local created, err = tm:create_topic(ATTEMPTS_TOPIC, 1, {
+            backend          = ATTEMPTS_BACKEND,
+            cleanup_policy   = "compact",
+            max_segment_size = ATTEMPTS_MAX_SEGMENT_SIZE,
+        })
+        if not created then
+            log:warn("cannot create %s, NACK attempt counters stay in memory: %s",
+                ATTEMPTS_TOPIC, tostring(err))
+            return
+        end
+        topic = created
+    end
+    self.store = topic.partitions[1]
+    self:_recover()
+end
+
+function DlqManager:_recover()
+    local serr = self.store:scan(function(_offset, msg)
+        local key = msg.key
+        if not key or #key == 0 then return end
+        local existing = self.attempts[key]
+        if #msg.value == 0 then
+            if existing then
+                self.attempts[key] = nil
+                self.tracked = self.tracked - 1
+            end
+            return
+        end
+        local ok, count, ts = pcall(string.unpack, ATTEMPTS_VALUE_FMT, msg.value)
+        if not ok then
+            log:warn("%s: skipping undecodable attempt record", ATTEMPTS_TOPIC)
+            return
+        end
+        if not existing then
+            existing = {}
+            self.attempts[key] = existing
+            self.tracked = self.tracked + 1
+        end
+        existing.count, existing.ts = count, ts
+    end)
+    if serr then
+        log:warn("%s: replay stopped early: %s", ATTEMPTS_TOPIC, serr)
+    end
+
+    while self.tracked > self.max_tracked do
+        local key = self:_oldest()
+        if not key then break end
+        self.attempts[key] = nil
+        self.tracked = self.tracked - 1
+    end
+
+    if self.tracked > 0 then
+        log:info("recovered %d NACK attempt counter(s) from %s", self.tracked, ATTEMPTS_TOPIC)
+    end
+end
+
+function DlqManager:_persist(key, entry)
+    if not self.store then return true end
+    local value = entry and string.pack(ATTEMPTS_VALUE_FMT, entry.count, entry.ts) or ""
+    local _, werr = self.store:write_message(msg_m.Message.new(key, value, self.now_ms()))
+    if werr then
+        return nil, string.format("%s write failed: %s", ATTEMPTS_TOPIC, tostring(werr))
+    end
+    if self.store.request_sync then
+        local ok, serr = self.store:request_sync()
+        if not ok then
+            return nil, string.format("%s sync failed: %s", ATTEMPTS_TOPIC, tostring(serr))
+        end
+    end
+    return true
+end
+
+function DlqManager:_forget(key)
+    if not self.attempts[key] then return end
+    self.attempts[key] = nil
+    self.tracked = self.tracked - 1
+    local ok, err = self:_persist(key, nil)
+    if not ok then log:warn("%s", err) end
 end
 
 function DlqManager:topic_for(topic_name)
@@ -61,7 +160,8 @@ function DlqManager:record_failure(group, topic_name, partition_id, offset, reas
 
     local key = attempt_key(group, topic_name, partition_id, offset)
     local entry = self.attempts[key]
-    if not entry then
+    local fresh = entry == nil
+    if fresh then
         self:_evict_if_full()
         entry = { count = 0 }
         self.attempts[key] = entry
@@ -71,6 +171,15 @@ function DlqManager:record_failure(group, topic_name, partition_id, offset, reas
     entry.ts = self.now_ms()
 
     if entry.count < self.max_deliveries then
+        local ok, perr = self:_persist(key, entry)
+        if not ok then
+            entry.count = entry.count - 1
+            if fresh then
+                self.attempts[key] = nil
+                self.tracked = self.tracked - 1
+            end
+            return nil, perr
+        end
         return {
             dead_lettered = false,
             attempts      = entry.count,
@@ -82,8 +191,7 @@ function DlqManager:record_failure(group, topic_name, partition_id, offset, reas
         group, topic, topic_name, partition_id, offset, msg, entry.count, reason)
     if not dlq_topic then return nil, derr end
 
-    self.attempts[key] = nil
-    self.tracked = self.tracked - 1
+    self:_forget(key)
 
     log:info("dead-lettered %s/partition-%d offset %d for group '%s' after %d attempt(s) -> %s",
         topic_name, partition_id, offset, group, entry.count, dlq_topic)
@@ -172,26 +280,45 @@ function DlqManager:forget_topic(topic_name)
     end
 
     for _, k in ipairs(doomed) do
-        self.attempts[k] = nil
-        self.tracked = self.tracked - 1
+        self:_forget(k)
     end
     return #doomed
 end
 
-function DlqManager:_evict_if_full()
-    if self.tracked < self.max_tracked then return end
+function DlqManager:forget_group(group)
+    assert(type(group) == "string", "group must be a string")
+
+    local doomed = {}
+    for k in pairs(self.attempts) do
+        local ok, g = pcall(string.unpack, ">s2", k)
+        if ok and g == group then doomed[#doomed + 1] = k end
+    end
+
+    for _, k in ipairs(doomed) do
+        self:_forget(k)
+    end
+    return #doomed
+end
+
+function DlqManager:_oldest()
     local oldest_key, oldest_ts
     for k, e in pairs(self.attempts) do
         if oldest_ts == nil or e.ts < oldest_ts then
             oldest_key, oldest_ts = k, e.ts
         end
     end
+    return oldest_key
+end
+
+function DlqManager:_evict_if_full()
+    if self.tracked < self.max_tracked then return end
+    local oldest_key = self:_oldest()
     if oldest_key then
-        self.attempts[oldest_key] = nil
-        self.tracked = self.tracked - 1
+        self:_forget(oldest_key)
     end
 end
 
 return {
-    DlqManager = DlqManager,
+    DlqManager     = DlqManager,
+    ATTEMPTS_TOPIC = ATTEMPTS_TOPIC,
 }

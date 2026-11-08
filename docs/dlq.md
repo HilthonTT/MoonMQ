@@ -71,9 +71,15 @@ end
 
 ## Semantics and limits
 
-* **Attempt counters are in-memory.** A broker restart (or eviction from the
-  bounded counter map) forgets them; the record is then redelivered up to
-  `MaxDeliveries` more times before dead-lettering. At-least-once, never lost.
+* **Attempt counters are durable.** Every NACK below `MaxDeliveries` writes
+  the new count to the compacted internal topic `__dlq_attempts` (fsynced
+  before the `NACK_ACK`), and the broker replays it on start. Dead-lettering,
+  deleting the source topic, deleting the group and eviction write tombstones,
+  so a cleared counter stays cleared. The topic is replicated like the other
+  internal topics, so counters also survive a failover.
+* **The counter map is bounded** (4096 entries). When it is full the oldest
+  counter is evicted; that record then gets up to `MaxDeliveries` more
+  deliveries before dead-lettering. At-least-once, never lost.
 * A NACK is validated like a COMMIT: it must come from a live group member on
   the broker that serves the partition, and the offset must point at a
   readable, non-control record.

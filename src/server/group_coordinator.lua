@@ -245,6 +245,11 @@ function GroupCoordinator:delete(group_id)
         n = deleted
     end
 
+    local dlq = self.broker.dlq
+    if dlq and dlq.forget_group then
+        dlq:forget_group(group_id)
+    end
+
     if group then
         group:close()
         self.groups[group_id] = nil
