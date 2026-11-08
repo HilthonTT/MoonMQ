@@ -12,6 +12,7 @@ local KEYWORDS = {
     join = true, leave = true, heartbeat = true, ["on"] = true,
     host = true, port = true, user = true, password = true,
     help = true, exit = true, quit = true,
+    drop = true, describe = true, alter = true, set = true,
 }
 
 Lexer.KEYWORDS = KEYWORDS
@@ -90,6 +91,11 @@ function Lexer.tokenize(src)
             local sc = col
             advance()
             push("comma", ",", ",", i - 1, sc)
+
+        elseif c == "=" then
+            local sc = col
+            advance()
+            push("eq", "=", "=", i - 1, sc)
 
         elseif c == "*" then
             local sc = col

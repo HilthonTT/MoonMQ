@@ -104,6 +104,159 @@ function Session:list_topics()
     }
 end
 
+function Session:drop_topic(node)
+    local c, err = self:require_client()
+    if not c then return fail(err) end
+    local ok, derr = c:delete_topic(node.name)
+    if not ok then return fail(derr) end
+    return ok_msg(string.format("topic '%s' dropped", node.name))
+end
+
+function Session:drop_group(node)
+    local c, err = self:require_client()
+    if not c then return fail(err) end
+    local ok, derr = c:delete_group(node.name)
+    if not ok then return fail(derr) end
+    return ok_msg(string.format("group '%s' dropped", node.name))
+end
+
+function Session:alter_config(node)
+    local c, err = self:require_client()
+    if not c then return fail(err) end
+    local ok, aerr = c:alter_topic_config(node.name, node.config)
+    if not ok then return fail(aerr) end
+    local keys = {}
+    for k, v in pairs(node.config) do keys[#keys + 1] = k .. "=" .. tostring(v) end
+    table.sort(keys)
+    return ok_msg(string.format("topic '%s' altered (%s)", node.name, table.concat(keys, ", ")))
+end
+
+function Session:alter_partitions(node)
+    local c, err = self:require_client()
+    if not c then return fail(err) end
+    local ok, aerr = c:create_partitions(node.name, node.partitions)
+    if not ok then return fail(aerr) end
+    return ok_msg(string.format("topic '%s' now has %d partition%s",
+        node.name, node.partitions, node.partitions == 1 and "" or "s"))
+end
+
+function Session:describe_topic(node)
+    local c, err = self:require_client()
+    if not c then return fail(err) end
+    local desc, derr = c:describe_topic(node.name)
+    if not desc then return fail(derr) end
+    local offsets, oerr = c:list_offsets(node.name)
+    if not offsets then return fail(oerr) end
+
+    local config_rows = {}
+    for k, v in pairs(desc.config or {}) do config_rows[#config_rows + 1] = { k, v } end
+    table.sort(config_rows, function(a, b) return a[1] < b[1] end)
+
+    local part_rows = {}
+    for _, o in ipairs(offsets) do
+        part_rows[#part_rows + 1] = {
+            o.partition, o.earliest, o.latest, o.high_watermark,
+            o.lso_known and o.lso or "", o.leader and "yes" or "no",
+        }
+    end
+    table.sort(part_rows, function(a, b) return a[1] < b[1] end)
+
+    return {
+        ok = true, kind = "multi",
+        results = {
+            {
+                ok = true, kind = "rows",
+                columns = { "partition", "earliest", "latest", "high_watermark", "lso", "local" },
+                rows = part_rows,
+                note = string.format("topic '%s', %d partition%s", desc.name,
+                    desc.num_partitions, desc.num_partitions == 1 and "" or "s"),
+            },
+            {
+                ok = true, kind = "rows",
+                columns = { "config", "value" },
+                rows = config_rows,
+                note = #config_rows == 0 and "broker defaults" or nil,
+            },
+        },
+    }
+end
+
+function Session:list_groups()
+    local c, err = self:require_client()
+    if not c then return fail(err) end
+    local groups, lerr = c:list_groups()
+    if not groups then return fail(lerr) end
+    local rows = {}
+    for _, g in ipairs(groups) do
+        rows[#rows + 1] = { g.group_id, g.state, g.member_count }
+    end
+    table.sort(rows, function(a, b) return a[1] < b[1] end)
+    return {
+        ok = true, kind = "rows",
+        columns = { "group", "state", "members" },
+        rows = rows,
+        note = string.format("%d group%s", #rows, #rows == 1 and "" or "s"),
+    }
+end
+
+function Session:describe_group(node)
+    local c, err = self:require_client()
+    if not c then return fail(err) end
+    local desc, derr = c:describe_group(node.name)
+    if not desc then return fail(derr) end
+
+    local member_rows = {}
+    for _, m in ipairs(desc.members or {}) do
+        local topics = {}
+        for topic in pairs(m.assignment or {}) do topics[#topics + 1] = topic end
+        table.sort(topics)
+        if #topics == 0 then
+            member_rows[#member_rows + 1] = { m.member_id, "", "" }
+        end
+        for _, topic in ipairs(topics) do
+            member_rows[#member_rows + 1] = { m.member_id, topic, table.concat(m.assignment[topic], ",") }
+        end
+    end
+
+    local hwm = {}
+    local offset_rows = {}
+    for _, o in ipairs(desc.offsets or {}) do
+        if hwm[o.topic] == nil then
+            hwm[o.topic] = {}
+            local list = c:list_offsets(o.topic)
+            for _, e in ipairs(list or {}) do hwm[o.topic][e.partition] = e.high_watermark end
+        end
+        local end_offset = hwm[o.topic][o.partition]
+        offset_rows[#offset_rows + 1] = {
+            o.topic, o.partition, o.offset,
+            end_offset or "", end_offset and math.max(0, end_offset - o.offset) or "",
+        }
+    end
+    table.sort(offset_rows, function(a, b)
+        if a[1] ~= b[1] then return a[1] < b[1] end
+        return a[2] < b[2]
+    end)
+
+    return {
+        ok = true, kind = "multi",
+        results = {
+            {
+                ok = true, kind = "rows",
+                columns = { "member", "topic", "partitions" },
+                rows = member_rows,
+                note = string.format("group '%s' is %s, %d member%s", desc.group_id, desc.state,
+                    #(desc.members or {}), #(desc.members or {}) == 1 and "" or "s"),
+            },
+            {
+                ok = true, kind = "rows",
+                columns = { "topic", "partition", "committed", "high_watermark", "lag" },
+                rows = offset_rows,
+                note = #offset_rows == 0 and "no committed offsets" or nil,
+            },
+        },
+    }
+end
+
 function Session:produce(node)
     local c, err = self:require_client()
     if not c then return fail(err) end
@@ -217,6 +370,13 @@ local HANDLERS = {
     disconnect   = function(s) return s:disconnect() end,
     create_topic = Session.create_topic,
     list_topics  = function(s) return s:list_topics() end,
+    drop_topic       = Session.drop_topic,
+    drop_group       = Session.drop_group,
+    alter_config     = Session.alter_config,
+    alter_partitions = Session.alter_partitions,
+    describe_topic   = Session.describe_topic,
+    describe_group   = Session.describe_group,
+    list_groups      = function(s) return s:list_groups() end,
     produce      = Session.produce,
     fetch        = Session.fetch,
     subscribe    = Session.subscribe,
@@ -232,6 +392,9 @@ local HANDLERS = {
 local RETRYABLE = {
     create_topic = true,
     list_topics  = true,
+    list_groups    = true,
+    describe_topic = true,
+    describe_group = true,
     produce      = true,
     fetch        = true,
     commit       = true,

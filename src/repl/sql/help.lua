@@ -1,6 +1,7 @@
 return {
     _order = {
         "connect", "disconnect", "create", "list",
+        "describe", "alter", "drop",
         "produce", "fetch", "subscribe", "commit",
         "join", "leave", "heartbeat", "help", "exit",
     },
@@ -20,8 +21,24 @@ return {
     },
     list = {
         usage = "LIST TOPICS;   (alias: SHOW TOPICS)\n" ..
-                "  SHOW GROUP;    -- current group membership & assignment",
-        blurb = "List broker topics, or show this session's group membership.",
+                "  LIST GROUPS;   (alias: SHOW GROUPS) -- every group on the broker\n" ..
+                "  SHOW GROUP;    -- this session's membership & assignment",
+        blurb = "List topics or groups, or show this session's group membership.",
+    },
+    describe = {
+        usage = "DESCRIBE TOPIC <name>;\n" ..
+                "  DESCRIBE GROUP <name>;",
+        blurb = "Show a topic's partitions, offsets and config, or a group's members, committed offsets and lag.",
+    },
+    alter = {
+        usage = "ALTER TOPIC <name> SET <key> = <value>[, <key> = <value> ...];\n" ..
+                "  ALTER TOPIC <name> PARTITIONS <total>;",
+        blurb = "Change topic config (retention, max_segment_size, cleanup_policy, ...) or grow to a new partition total.",
+    },
+    drop = {
+        usage = "DROP TOPIC <name>;\n" ..
+                "  DROP GROUP <name>;",
+        blurb = "Delete a topic and its data, or delete an empty group and its committed offsets.",
     },
     produce = {
         usage = "PRODUCE INTO <topic> [KEY '<key>'] VALUE '<payload>';",

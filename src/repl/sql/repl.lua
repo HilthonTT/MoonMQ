@@ -66,6 +66,10 @@ local function print_result(res, out)
             out(render.table(res.columns, res.rows) .. "\n")
             if res.note then out(paint("dim", "(" .. res.note .. ")") .. "\n") end
         end
+    elseif res.kind == "multi" then
+        for _, sub in ipairs(res.results) do
+            print_result(sub, out)
+        end
     elseif res.kind == "help" then
         print_help(res.topic, out)
     end

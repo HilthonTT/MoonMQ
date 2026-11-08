@@ -146,10 +146,83 @@ function Parser:parse_list()
     self:next()
     if self:accept_kw("topics") or self:accept_kw("topic") then
         return { type = "list_topics" }
-    elseif self:accept_kw("group") or self:accept_kw("groups") then
+    elseif self:accept_kw("groups") then
+        return { type = "list_groups" }
+    elseif self:accept_kw("group") then
         return { type = "show_group" }
     end
-    return self:fail("expected TOPICS or GROUP")
+    return self:fail("expected TOPICS, GROUPS or GROUP")
+end
+
+function Parser:parse_drop()
+    self:next()
+    if self:accept_kw("topic") then
+        local name, e = self:expect_name("a topic name")
+        if not name then return nil, e end
+        return { type = "drop_topic", name = name }
+    elseif self:accept_kw("group") then
+        local name, e = self:expect_name("a group name")
+        if not name then return nil, e end
+        return { type = "drop_group", name = name }
+    end
+    return self:fail("expected TOPIC or GROUP after DROP")
+end
+
+function Parser:parse_describe()
+    self:next()
+    if self:accept_kw("topic") then
+        local name, e = self:expect_name("a topic name")
+        if not name then return nil, e end
+        return { type = "describe_topic", name = name }
+    elseif self:accept_kw("group") then
+        local name, e = self:expect_name("a group name")
+        if not name then return nil, e end
+        return { type = "describe_group", name = name }
+    end
+    return self:fail("expected TOPIC or GROUP after DESCRIBE")
+end
+
+function Parser:config_value()
+    local tok = self:peek()
+    if tok and (tok.kind == "string" or tok.kind == "ident" or tok.kind == "number") then
+        self:next()
+        return tok.kind == "number" and tok.text or tok.value
+    end
+    return self:fail("expected a config value")
+end
+
+function Parser:parse_alter()
+    self:next()
+    if not self:accept_kw("topic") then
+        return self:fail("expected TOPIC after ALTER")
+    end
+    local name, e = self:expect_name("a topic name")
+    if not name then return nil, e end
+
+    if self:accept_kw("partitions") then
+        local n, ne = self:expect_number("a partition count")
+        if not n then return nil, ne end
+        return { type = "alter_partitions", name = name, partitions = n }
+    end
+
+    if not self:accept_kw("set") then
+        return self:fail("expected SET <key> = <value> or PARTITIONS <n>")
+    end
+    local config, count = {}, 0
+    repeat
+        local key, ke = self:expect_name("a config key")
+        if not key then return nil, ke end
+        local eq = self:peek()
+        if not (eq and eq.kind == "eq") then
+            return self:fail("expected '=' after " .. key)
+        end
+        self:next()
+        local value, ve = self:config_value()
+        if not value then return nil, ve end
+        config[key] = value
+        count = count + 1
+    until not (self:peek() and self:peek().kind == "comma" and self:next())
+    return { type = "alter_config", name = name, config = config, count = count }
 end
 
 function Parser:parse_produce()
@@ -274,6 +347,12 @@ function Parser:parse_statement()
         return self:parse_create()
     elseif kw == "list" or kw == "show" then
         return self:parse_list()
+    elseif kw == "drop" then
+        return self:parse_drop()
+    elseif kw == "describe" then
+        return self:parse_describe()
+    elseif kw == "alter" then
+        return self:parse_alter()
     elseif kw == "produce" then
         return self:parse_produce()
     elseif kw == "fetch" then
