@@ -4,6 +4,7 @@ local ltn12  = require("ltn12")
 local json   = require("dkjson")
 local msg_m  = require("src.record.message")
 local tls_m  = require("src.io.tls")
+local httpk  = require("src.server.http_kit")
 local log    = require("src.log.logger").get("replicate")
 
 local DEFAULT_QUEUE_SIZE = 1000
@@ -20,6 +21,7 @@ function ReplicaClient.new(address, timeout, opts)
         address = address,
         timeout = timeout or DEFAULT_TIMEOUT_IN_SECONDS,
         tls     = opts.tls,
+        token   = opts.token,
     }, ReplicaClient)
 end
 
@@ -27,19 +29,23 @@ function ReplicaClient:send(topic_name, partition_id, sender_replica_id, payload
     local timeout = self.timeout
     local response_body = {}
 
+    local headers = {
+        ["Content-Type"]   = "application/octet-stream",
+        ["Content-Length"] = tostring(#payload),
+        ["X-Replica-ID"]   = tostring(sender_replica_id),
+        ["X-Topic"]        = topic_name,
+        ["X-Partition"]    = tostring(partition_id),
+    }
+    if self.token then headers["X-Cluster-Token"] = self.token end
+
     local _, code, _hdrs, status = http.request{
         url     = string.format("%s://%s/replicate",
                                 self.tls and "https" or "http", self.address),
-        method  = "POST",
-        headers = {
-            ["Content-Type"]   = "application/octet-stream",
-            ["Content-Length"] = tostring(#payload),
-            ["X-Replica-ID"]   = tostring(sender_replica_id),
-            ["X-Topic"]        = topic_name,
-            ["X-Partition"]    = tostring(partition_id),
-        },
-        source = ltn12.source.string(payload),
-        sink   = ltn12.sink.table(response_body),
+        method   = "POST",
+        headers  = headers,
+        redirect = false,
+        source   = ltn12.source.string(payload),
+        sink     = httpk.capped_sink(response_body),
         create = self.tls
             and tls_m.http_create(self.tls.params, timeout, self.tls.server_name)
             or function()
@@ -110,7 +116,8 @@ function ReplicatedPartition.new(partition, replica_id, is_leader, replica_addre
 
     for id, address in pairs(replica_addresses) do
         if id ~= replica_id then
-            local client  = ReplicaClient.new(address, self.timeout)
+            local client  = ReplicaClient.new(address, self.timeout,
+                { tls = opts.tls, token = opts.token })
             self.replicas[#self.replicas + 1] = PartitionReplica.new(id, client)
         end
     end

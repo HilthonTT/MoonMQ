@@ -19,7 +19,7 @@ function Fence:claim(claimant)
 end
 
 function Fence:observe(epoch, claimant)
-    if type(epoch) ~= "number" or epoch < 1 or epoch % 1 ~= 0 then
+    if math.type(epoch) ~= "integer" or epoch < 1 or epoch >= (1 << 53) then
         return nil, "bad controller epoch"
     end
     local term, leader = self.node:term(), self.node.leader_id

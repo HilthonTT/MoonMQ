@@ -14,6 +14,12 @@ Node.KIND_OWNER      = "owner"
 local DEFAULT_ELECTION_MIN    = 2.5
 local DEFAULT_ELECTION_MAX    = 4.0
 local DEFAULT_MAX_LOG_ENTRIES = 512
+local MAX_INDEX               = (1 << 53) - 1
+
+local function valid_index(v)
+    return math.type(v) == "integer" and v >= 0 and v <= MAX_INDEX
+end
+Node.valid_index = valid_index
 
 function Node.new(opts)
     assert(type(opts) == "table", "opts must be a table")
@@ -309,10 +315,10 @@ function Node:snapshot_args()
 end
 
 function Node:handle_vote(args)
-    if type(args) ~= "table" or type(args.term) ~= "number"
+    if type(args) ~= "table" or not valid_index(args.term)
        or type(args.candidate_id) ~= "string"
-       or type(args.last_log_index) ~= "number"
-       or type(args.last_log_term) ~= "number" then
+       or not valid_index(args.last_log_index)
+       or not valid_index(args.last_log_term) then
         return nil, "vote: need {term, candidate_id, last_log_index, last_log_term}"
     end
 
@@ -345,14 +351,25 @@ function Node:handle_vote(args)
 end
 
 function Node:handle_append(args)
-    if type(args) ~= "table" or type(args.term) ~= "number"
+    if type(args) ~= "table" or not valid_index(args.term)
        or type(args.leader_id) ~= "string"
-       or type(args.prev_log_index) ~= "number"
-       or type(args.prev_log_term) ~= "number"
-       or type(args.leader_commit) ~= "number"
+       or not valid_index(args.prev_log_index)
+       or not valid_index(args.prev_log_term)
+       or not valid_index(args.leader_commit)
        or type(args.entries) ~= "table" then
         return nil, "append: need {term, leader_id, prev_log_index, prev_log_term, "
             .. "leader_commit, entries}"
+    end
+    if #args.entries > MAX_INDEX - args.prev_log_index then
+        return nil, "append: log index out of range"
+    end
+    for i, raw in ipairs(args.entries) do
+        if type(raw) ~= "table" or not valid_index(raw.term)
+           or raw.term > args.term
+           or type(raw.kind) ~= "string"
+           or (raw.index ~= nil and raw.index ~= args.prev_log_index + i) then
+            return nil, "append: malformed log entry"
+        end
     end
 
     if args.term < self.state.current_term then
@@ -374,6 +391,9 @@ function Node:handle_append(args)
                  match_index = self:last_index() }
     end
     if self:term_at(args.prev_log_index) ~= args.prev_log_term then
+        if args.prev_log_index <= self.commit_index then
+            return nil, "append: conflicting term at or below the commit index"
+        end
         self:truncate_from(args.prev_log_index)
         local ok, err = self:persist()
         if not ok then return nil, err end
@@ -383,10 +403,6 @@ function Node:handle_append(args)
 
     local dirty = false
     for i, raw in ipairs(args.entries) do
-        if type(raw) ~= "table" or type(raw.term) ~= "number"
-           or type(raw.kind) ~= "string" then
-            return nil, "append: malformed log entry"
-        end
         local index = args.prev_log_index + i
         local entry = {
             term  = raw.term,
@@ -399,6 +415,9 @@ function Node:handle_append(args)
             self.state.entries[index - self.state.base_index] = entry
             dirty = true
         elseif existing ~= entry.term then
+            if index <= self.commit_index then
+                return nil, "append: conflicting term at or below the commit index"
+            end
             self:truncate_from(index)
             self.state.entries[index - self.state.base_index] = entry
             dirty = true
@@ -420,10 +439,11 @@ function Node:handle_append(args)
 end
 
 function Node:handle_snapshot(args)
-    if type(args) ~= "table" or type(args.term) ~= "number"
+    if type(args) ~= "table" or not valid_index(args.term)
        or type(args.leader_id) ~= "string"
-       or type(args.last_index) ~= "number"
-       or type(args.last_term) ~= "number"
+       or not valid_index(args.last_index)
+       or not valid_index(args.last_term)
+       or args.last_term > args.term
        or type(args.state) ~= "table" then
         return nil, "snapshot: need {term, leader_id, last_index, last_term, state}"
     end

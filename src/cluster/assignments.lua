@@ -1,10 +1,25 @@
 local json    = require("dkjson")
 local fs_m    = require("src.io.fs")
+local util_m  = require("src.core.util")
 
-local FILE_NAME = "cluster-assignments.json"
+local FILE_NAME      = "cluster-assignments.json"
+local MAX_PARTITIONS = 1024
 
 local Assignments = {}
 Assignments.__index = Assignments
+Assignments.MAX_PARTITIONS = MAX_PARTITIONS
+
+function Assignments.validate(topic, partition, owner)
+    local ok, terr = util_m.validate_topic_name(topic)
+    if not ok then return nil, terr end
+    if math.type(partition) ~= "integer" or partition < 1 or partition > MAX_PARTITIONS then
+        return nil, string.format("partition must be an integer in [1, %d]", MAX_PARTITIONS)
+    end
+    if type(owner) ~= "string" or #owner == 0 then
+        return nil, "owner must be a non-empty string"
+    end
+    return true
+end
 
 local function key(topic, partition)
     return topic .. "\0" .. tostring(partition)
@@ -37,8 +52,7 @@ function Assignments:_load()
         return string.format("%s: %s", self.path, tostring(perr or "not a JSON object"))
     end
     for _, e in ipairs(parsed.entries or {}) do
-        if type(e.topic) == "string" and type(e.partition) == "number"
-            and type(e.owner) == "string" then
+        if type(e) == "table" and Assignments.validate(e.topic, e.partition, e.owner) then
             self.map[key(e.topic, e.partition)] = e.owner
         end
     end
@@ -71,9 +85,8 @@ function Assignments:owned_by_self(topic, partition)
 end
 
 function Assignments:set_owner(topic, partition, owner)
-    assert(type(topic) == "string", "topic must be a string")
-    assert(type(partition) == "number", "partition must be a number")
-    assert(type(owner) == "string", "owner must be a string")
+    local valid, verr = Assignments.validate(topic, partition, owner)
+    if not valid then return nil, verr end
 
     local k = key(topic, partition)
     local prev = self.map[k]
@@ -93,8 +106,7 @@ function Assignments:replace(entries)
 
     local map = {}
     for _, e in ipairs(entries) do
-        if type(e.topic) == "string" and type(e.partition) == "number"
-            and type(e.owner) == "string" then
+        if type(e) == "table" and Assignments.validate(e.topic, e.partition, e.owner) then
             map[key(e.topic, e.partition)] = e.owner
         end
     end

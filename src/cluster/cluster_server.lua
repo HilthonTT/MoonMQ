@@ -4,7 +4,9 @@ local msg_m  = require("src.record.message")
 local httpk  = require("src.server.http_kit")
 local tls_m  = require("src.io.tls")
 local util_m = require("src.core.util")
+local ct     = require("src.core.ct")
 local ControllerFence = require("src.cluster.controller_fence")
+local Assignments = require("src.cluster.assignments")
 local local_loads = require("src.cluster.local_loads")
 local log    = require("src.log.logger").get("cluster_server")
 
@@ -14,10 +16,24 @@ M.__index = M
 local READ_DEADLINE  = 10
 local WRITE_DEADLINE = 5
 local MAX_BODY       = 8 * 1024 * 1024
-local MAX_PARTITIONS = 1024
+local MAX_PARTITIONS = Assignments.MAX_PARTITIONS
+local MAX_OFFSET     = (1 << 53) - 1
+
+local function is_int(v, lo, hi)
+    return math.type(v) == "integer" and v >= lo and v <= hi
+end
+
+local function valid_partition(v)
+    return is_int(v, 1, MAX_PARTITIONS)
+end
+
+local function nonempty(v)
+    return type(v) == "string" and #v > 0
+end
 
 function M.new(opts)
     local broker = assert(opts.broker, "broker required")
+    assert(opts.token == nil or nonempty(opts.token), "token must be a non-empty string")
     local fence = opts.fence
     if not fence then
         local f, ferr = ControllerFence.new(broker.topic_manager.baseDir)
@@ -40,13 +56,8 @@ function M.new(opts)
 end
 
 local function token_ok(expect, got)
-    if not expect then return true end
-    if type(got) ~= "string" then return false end
-    local diff = #expect ~ #got
-    for i = 1, math.max(#expect, #got) do
-        diff = diff | ((expect:byte(i) or 0) ~ (got:byte(i) or 0))
-    end
-    return diff == 0
+    if expect == nil then return true end
+    return ct.equal(expect, got or "")
 end
 
 
@@ -68,7 +79,7 @@ function M:_ensure(body)
     if not req then return 400, derr end
     local valid, verr = util_m.validate_topic_name(req.topic)
     if not valid then return 400, "ensure: " .. tostring(verr) end
-    if req.partitions < 1 or req.partitions > MAX_PARTITIONS then
+    if not valid_partition(req.partitions) then
         return 400, "ensure: partitions out of range"
     end
 
@@ -92,6 +103,9 @@ function M:_ensure(body)
 end
 
 function M:_append(topic_name, partition_id, payload, forwarded)
+    if not util_m.validate_topic_name(topic_name) or not valid_partition(partition_id) then
+        return 400, "append: bad topic or partition"
+    end
     local topic, terr = self.broker:get_topic(topic_name)
     if not topic then return 404, "append: " .. tostring(terr) end
     local part = topic.partitions[partition_id]
@@ -132,7 +146,7 @@ end
 function M:_leo(query)
     local q = httpk.parse_query(query)
     local partition_id = tonumber(q.partition)
-    if type(q.topic) ~= "string" or not partition_id then
+    if not util_m.validate_topic_name(q.topic) or not valid_partition(partition_id) then
         return 400, "leo: need topic & partition"
     end
     local topic, terr = self.broker:get_topic(q.topic)
@@ -147,9 +161,8 @@ function M:_owner(body)
         "topic", "string", "partition", "number", "owner", "string",
     })
     if not req then return 400, derr end
-    if req.partition < 1 or req.partition % 1 ~= 0 then
-        return 400, "owner: partition must be a positive integer"
-    end
+    local valid, verr = Assignments.validate(req.topic, req.partition, req.owner)
+    if not valid then return 400, "owner: " .. tostring(verr) end
     local ok, err = self.assignments:set_owner(req.topic, req.partition, req.owner)
     if not ok then return 500, "owner: " .. tostring(err) end
     log:info("ownership: %s/partition-%d -> %s", req.topic, req.partition, req.owner)
@@ -159,14 +172,15 @@ end
 function M:_claim(body)
     local req, derr = decode_body(body, "claim", { "epoch", "number", "broker_id", "string" })
     if not req then return 400, derr end
+    if not nonempty(req.broker_id) then return 400, "claim: broker_id must be non-empty" end
     local ok, err = self.fence:observe(req.epoch, req.broker_id)
     local highest = self.fence:highest()
     if ok then
         log:info("controller claim accepted: epoch %d by %s", req.epoch, req.broker_id)
         return 200, { accepted = true, highest = highest }
     end
-    log:warn("controller claim rejected: epoch %d by %s (%s)",
-        req.epoch, req.broker_id, tostring(err))
+    log:warn("controller claim rejected: epoch %s by %s (%s)",
+        tostring(req.epoch), req.broker_id, tostring(err))
     return 200, { accepted = false, highest = highest, reason = err }
 end
 
@@ -182,6 +196,14 @@ function M:_offsets(body)
         "topic", "string", "partition", "number", "offsets", "table",
     })
     if not req then return 400, derr end
+    if not util_m.validate_topic_name(req.topic) or not valid_partition(req.partition) then
+        return 400, "offsets: bad topic or partition"
+    end
+    for group, offset in pairs(req.offsets) do
+        if not nonempty(group) or not is_int(offset, 0, MAX_OFFSET) then
+            return 400, "offsets: need {group: non-negative integer offset}"
+        end
+    end
     local applied, failed = 0, 0
     for group, offset in pairs(req.offsets) do
         if type(group) == "string" and type(offset) == "number" then
@@ -212,6 +234,10 @@ function M:_txn_enroll(body)
         "txn", "string", "topic", "string", "partition", "number", "first_offset", "number",
     })
     if not req then return 400, derr end
+    if not nonempty(req.txn) or not util_m.validate_topic_name(req.topic)
+       or not valid_partition(req.partition) or not is_int(req.first_offset, 0, MAX_OFFSET) then
+        return 400, "txn/enroll: bad txn, topic, partition or first_offset"
+    end
     local txns = self.broker.transactions
     if not txns then return 500, "txn/enroll: no transaction coordinator" end
     txns:remote_enroll(req.txn, req.topic, req.partition, req.first_offset)
@@ -223,6 +249,19 @@ function M:_txn_resolve(body)
         "txn", "string", "topic", "string", "partition", "number",
     })
     if not req then return 400, derr end
+    if not nonempty(req.txn) or not util_m.validate_topic_name(req.topic)
+       or not valid_partition(req.partition) then
+        return 400, "txn/resolve: bad txn, topic or partition"
+    end
+    for _, field in ipairs({ "pid", "epoch", "first", "upto" }) do
+        local v = req[field]
+        if v ~= nil and not is_int(v, -MAX_OFFSET, MAX_OFFSET) then
+            return 400, "txn/resolve: " .. field .. " must be an integer"
+        end
+    end
+    if (req.first ~= nil and req.first < 0) or (req.upto ~= nil and req.upto < 0) then
+        return 400, "txn/resolve: first/upto must be non-negative"
+    end
     local txns = self.broker.transactions
     if not txns then return 500, "txn/resolve: no transaction coordinator" end
     local ok, err = txns:remote_resolve(req.txn, req.topic, req.partition, {
@@ -314,6 +353,16 @@ end
 
 
 function M:_handle(sock)
+    local ok, err = xpcall(self._dispatch, debug.traceback, self, sock)
+    if not ok then
+        log:error("cluster request handler failed: %s", tostring(err))
+        pcall(httpk.respond, self.reactor, sock, 500, "text/plain",
+            "internal error\n", WRITE_DEADLINE)
+        pcall(function() sock:close() end)
+    end
+end
+
+function M:_dispatch(sock)
     local deadline = socket.gettime() + READ_DEADLINE
     local headers, leftover = httpk.read_headers(self.reactor, sock, deadline)
     if not headers then pcall(function() sock:close() end); return end

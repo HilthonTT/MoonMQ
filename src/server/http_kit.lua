@@ -70,6 +70,22 @@ function M.respond(reactor, sock, status, ctype, body, opts)
     reactor:send_all(sock, response, socket.gettime() + (opts.deadline or 5))
 end
 
+M.MAX_RESPONSE = 8 * 1024 * 1024
+
+function M.capped_sink(parts, max_bytes)
+    max_bytes = max_bytes or M.MAX_RESPONSE
+    local total = 0
+    return function(chunk)
+        if chunk == nil then return 1 end
+        total = total + #chunk
+        if total > max_bytes then
+            return nil, string.format("response exceeds %d bytes", max_bytes)
+        end
+        parts[#parts + 1] = chunk
+        return 1
+    end
+end
+
 function M.header(headers, name)
     local pat = "[\r\n]" .. name:gsub("%a", function(c)
         return "[" .. c:lower() .. c:upper() .. "]"

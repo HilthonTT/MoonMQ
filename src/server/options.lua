@@ -159,8 +159,19 @@ function M.metrics_auth(cfg, getenv)
     return { token = token, basic = basic }
 end
 
+local function check_token(value, key)
+    if value == nil then return nil end
+    if type(value) ~= "string" or value == "" then
+        return string.format("%s must be a non-empty string when set", key)
+    end
+    return nil
+end
+
 function M.replication(rep)
     rep = rep or {}
+
+    local rterr = check_token(rep.Token, "Replication.Token")
+    if rterr then return nil, rterr end
 
     local peers = {}
     for _, p in ipairs(rep.Peers or {}) do
@@ -202,8 +213,18 @@ function M.cluster(cl)
     cl = section(cl)
     if not cl or not cl.BrokerId then return nil, nil end
 
+    local cterr = check_token(cl.Token, "Cluster.Token")
+    if cterr then return nil, cterr end
+
     local peers = {}
-    for _, p in ipairs(cl.Peers or {}) do
+    for i, p in ipairs(cl.Peers or {}) do
+        local key = string.format("Cluster.Peers[%d].Token", i)
+        local perr = check_token(p.Token, key)
+        if perr then return nil, perr end
+        if p.Token ~= nil and cl.Token == nil then
+            return nil, key .. " requires Cluster.Token: without it the inbound "
+                .. "cluster listener accepts unauthenticated requests"
+        end
         peers[#peers + 1] = { id = p.Id, address = p.Address, token = p.Token }
     end
 

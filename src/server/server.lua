@@ -45,7 +45,7 @@ local function build_replicator(reactor, rc)
         followers[#followers + 1] = {
             id     = peer.id,
             client = replica_m.ReplicaClient.new(peer.address, rc.ack_timeout,
-                { tls = rc.tls }),
+                { tls = rc.tls, token = rc.token }),
         }
     end
     if #followers == 0 then return nil end
@@ -276,8 +276,8 @@ function Server.new(opts)
                 apply = function(entry)
                     if entry.kind ~= RaftNode.KIND_OWNER then return true end
                     local d = entry.data
-                    if type(d.topic) ~= "string" or type(d.partition) ~= "number"
-                       or type(d.owner) ~= "string" then
+                    if type(d) ~= "table"
+                       or not Assignments.validate(d.topic, d.partition, d.owner) then
                         return true
                     end
                     return assignments:set_owner(d.topic, d.partition, d.owner)
@@ -886,6 +886,7 @@ function Server:start()
                 host    = rc.replicate_host or "127.0.0.1",
                 port    = rc.replicate_port,
                 tls     = rc.server_tls,
+                token   = rc.token,
             })
             rs:start()
         end

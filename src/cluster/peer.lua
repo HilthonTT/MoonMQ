@@ -3,8 +3,10 @@ local http   = require("socket.http")
 local ltn12  = require("ltn12")
 local json   = require("dkjson")
 local tls_m  = require("src.io.tls")
+local httpk  = require("src.server.http_kit")
 
 local DEFAULT_TIMEOUT = 5
+local MAX_RESPONSE    = 8 * 1024 * 1024
 
 local Peer = {}
 Peer.__index = Peer
@@ -46,12 +48,13 @@ function Peer:_request(method, path, headers, body)
     end
 
     local _, code, _, status = http.request{
-        url     = string.format("%s://%s%s",
-                                self.tls and "https" or "http", self.address, path),
-        method  = method,
-        headers = headers,
-        source  = body and ltn12.source.string(body) or nil,
-        sink    = ltn12.sink.table(response_body),
+        url      = string.format("%s://%s%s",
+                                 self.tls and "https" or "http", self.address, path),
+        method   = method,
+        headers  = headers,
+        redirect = false,
+        source   = body and ltn12.source.string(body) or nil,
+        sink     = httpk.capped_sink(response_body, MAX_RESPONSE),
         create  = self.tls
             and tls_m.http_create(self.tls.params, timeout, self.tls.server_name)
             or function()

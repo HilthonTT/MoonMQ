@@ -50,7 +50,9 @@ function Service:_call(peer_id, path, payload)
 end
 
 function Service:_observe_term(reply)
-    if type(reply.term) == "number" and reply.term > self.node:term() then
+    if type(reply) ~= "table" then return true end
+    if reply.term ~= nil and not Node.valid_index(reply.term) then return true end
+    if reply.term ~= nil and reply.term > self.node:term() then
         self.node:become_follower(reply.term)
         local ok, err = self.node:persist()
         if not ok then log:error("%s", tostring(err)) end
@@ -134,14 +136,18 @@ function Service:_replicate(peer_id)
 
         self.last_ack[peer_id] = socket.gettime()
         if reply.success == true then
-            local match = tonumber(reply.match_index) or (next_index + #args.entries - 1)
+            local match = next_index + #args.entries - 1
+            if Node.valid_index(reply.match_index) and reply.match_index <= match then
+                match = reply.match_index
+            end
             node.match_index[peer_id] = math.max(node.match_index[peer_id] or 0, match)
             node.next_index[peer_id]  = node.match_index[peer_id] + 1
             node:advance_commit()
         elseif reply.need_snapshot == true then
             self:_send_snapshot(peer_id)
         else
-            local hint = tonumber(reply.match_index)
+            local hint = reply.match_index
+            if not Node.valid_index(hint) or hint >= next_index then hint = nil end
             local back = hint and (hint + 1) or (next_index - 1)
             node.next_index[peer_id] = math.max(node.state.base_index + 1, back)
         end

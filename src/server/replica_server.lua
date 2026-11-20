@@ -14,6 +14,8 @@ local WRITE_DEADLINE = 5
 local MAX_BODY       = 8 * 1024 * 1024
 
 function M.new(opts)
+    assert(opts.token == nil or (type(opts.token) == "string" and #opts.token > 0),
+        "token must be a non-empty string")
     return setmetatable({
         reactor = assert(opts.reactor, "reactor required"),
         broker  = assert(opts.broker, "broker required"),
@@ -64,8 +66,7 @@ function M:_handle_group(sock, headers, leftover, deadline, method, path)
         reply(status, "application/json", json.encode(value))
     end
 
-    if self.token and not ct.equal(self.token,
-            httpk.header(headers, "X%-Cluster%-Token") or "") then
+    if not self:_authorized(headers) then
         return reply(401, "text/plain", "bad or missing X-Cluster-Token\n")
     end
     if method == "GET" and path == "/replication/status" then
@@ -100,7 +101,21 @@ function M:_handle_group(sock, headers, leftover, deadline, method, path)
     return reply(404, "text/plain", "unknown replication endpoint\n")
 end
 
+function M:_authorized(headers)
+    if self.token == nil then return true end
+    return ct.equal(self.token, httpk.header(headers, "X%-Cluster%-Token") or "")
+end
+
 function M:_handle(sock)
+    local ok, err = xpcall(self._dispatch, debug.traceback, self, sock)
+    if not ok then
+        log:error("replica request handler failed: %s", tostring(err))
+        pcall(respond, self.reactor, sock, 500, "text/plain", "internal error\n")
+        pcall(function() sock:close() end)
+    end
+end
+
+function M:_dispatch(sock)
     local deadline = socket.gettime() + READ_DEADLINE
     local headers, leftover = httpk.read_headers(self.reactor, sock, deadline)
     if not headers then pcall(function() sock:close() end); return end
@@ -114,6 +129,13 @@ function M:_handle(sock)
         pcall(function()
             respond(self.reactor, sock, 404, "text/plain",
                 "failover replication serves /replication/* only\n")
+            sock:close()
+        end)
+        return
+    end
+    if not self:_authorized(headers) then
+        pcall(function()
+            respond(self.reactor, sock, 401, "text/plain", "bad or missing X-Cluster-Token\n")
             sock:close()
         end)
         return
