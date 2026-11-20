@@ -281,3 +281,103 @@ describe("REPL table rendering", function()
         assert.are.equal("a b  c", render.one_line("a\nb\r\nc"))
     end)
 end)
+
+describe("gateway", function()
+    local Gateway = dofile("bin/gateway.lua")
+
+    local function req(header)
+        return { method = "GET", path = "/topics",
+                 headers = { authorization = header } }
+    end
+
+    it("refuses to start without a token", function()
+        local gw, err = Gateway.new({ pool_opts = {} })
+        assert.is_nil(gw)
+        assert.is_truthy(err:find("token"))
+        assert.is_nil((Gateway.new({ token = "", pool_opts = {} })))
+    end)
+
+    it("defaults to loopback and a connection cap", function()
+        local gw = assert(Gateway.new({ token = "t", pool_opts = {} }))
+        assert.are.equal("127.0.0.1", gw.host)
+        assert.are.equal(64, gw.max_connections)
+    end)
+
+    it("checks the bearer token", function()
+        assert.is_true(Gateway.authorized(req("Bearer s3cret"), "s3cret"))
+        assert.is_true(Gateway.authorized(req("bearer s3cret"), "s3cret"))
+        assert.is_false(Gateway.authorized(req("Bearer wrong"), "s3cret"))
+        assert.is_false(Gateway.authorized(req("Basic s3cret"), "s3cret"))
+        assert.is_false(Gateway.authorized(req(nil), "s3cret"))
+        assert.is_false(Gateway.authorized(req("Bearer "), "s3cret"))
+        assert.is_false(Gateway.authorized(req("Bearer x"), ""))
+    end)
+
+    it("answers 401 on every route without a valid token", function()
+        local gw = assert(Gateway.new({ token = "s3cret", pool_opts = {} }))
+        for _, path in ipairs({ "/", "/healthz", "/topics", "/topics/t/records" }) do
+            local status = gw:_dispatch({ method = "GET", path = path, headers = {} })
+            assert.are.equal(401, status, path)
+        end
+        local status = gw:_dispatch({ method = "GET", path = "/healthz",
+            headers = { authorization = "Bearer s3cret" } })
+        assert.are.equal(200, status)
+    end)
+
+    it("closes connections over the cap without handling them", function()
+        local gw = assert(Gateway.new({ token = "t", max_connections = 1, pool_opts = {} }))
+        gw.connections = 1
+        local closed = false
+        gw._handle = function() error("must not be handled") end
+        gw:_accept({ close = function() closed = true end }, "peer")
+        assert.is_true(closed)
+        assert.are.equal(1, gw.connections)
+    end)
+
+    it("reads the token from config before the environment", function()
+        local env = { MOONMQ_GATEWAY_TOKEN = "from-env" }
+        local getenv = function(k) return env[k] end
+        local warnings = {}
+        local warn = function(m) warnings[#warnings + 1] = m end
+
+        local o = Gateway.options_from_config({ Gateway = {} }, getenv, warn)
+        assert.are.equal("from-env", o.token)
+        o = Gateway.options_from_config({ Gateway = { Token = "from-cfg" } }, getenv, warn)
+        assert.are.equal("from-cfg", o.token)
+        o = Gateway.options_from_config({ Gateway = {} }, function() return nil end, warn)
+        assert.is_nil(o.token)
+        assert.are.equal("127.0.0.1", o.host)
+        assert.are.equal(64, o.max_connections)
+    end)
+
+    it("prefers MoonMQUsername and warns when falling back to the superuser", function()
+        local warnings = {}
+        local warn = function(m) warnings[#warnings + 1] = m end
+        local o = Gateway.options_from_config({ Auth = { Username = "admin" },
+            Gateway = { MoonMQUsername = "gw" } }, function() end, warn)
+        assert.are.equal("gw", o.pool_opts.username)
+        assert.are.equal(0, #warnings)
+
+        o = Gateway.options_from_config({ Auth = { Username = "admin" }, Gateway = {} },
+            function() end, warn)
+        assert.are.equal("admin", o.pool_opts.username)
+        assert.are.equal(1, #warnings)
+        assert.is_truthy(warnings[1]:find("SUPERUSER"))
+    end)
+
+    it("assembles a body that arrives in many chunks", function()
+        local head = "POST /topics HTTP/1.1\r\nContent-Length: 10\r\n\r\nab"
+        local chunks = { head, "cd", "ef", "ghij" }
+        local i = 0
+        local sock = {
+            settimeout = function() end,
+            receive = function()
+                i = i + 1
+                if chunks[i] then return chunks[i] end
+                return nil, "closed"
+            end,
+        }
+        local r = assert(Gateway.read_http_request({}, sock))
+        assert.are.equal("abcdefghij", r.body)
+    end)
+end)

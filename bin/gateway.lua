@@ -3,6 +3,7 @@ local json = require("dkjson")
 local Reactor = require("src.server.reactor")
 local Client = require("src.client")
 local Config = require("src.server.config")
+local ct = require("src.core.ct")
 
 local Pool = {}
 Pool.__index = Pool
@@ -76,7 +77,7 @@ local MAX_BODY = 16 * 1024 * 1024
 
 local STATUS = {
     [200] = "OK", [201] = "Created", [204] = "No Content",
-    [400] = "Bad Request", [404] = "Not Found",
+    [400] = "Bad Request", [401] = "Unauthorized", [404] = "Not Found",
     [405] = "Method Not Allowed", [413] = "Payload Too Large",
     [500] = "Internal Server Error", [502] = "Bad Gateway",
     [503] = "Service Unavailable",
@@ -108,7 +109,7 @@ local function read_http_request(reactor, sock)
 
     local sep = buf:find("\r\n\r\n", 1, true)
     local head = buf:sub(1, sep - 1)
-    local body = buf:sub(sep + 4)
+    local initial = buf:sub(sep + 4)
 
     local first_line, rest = head:match("^([^\r\n]+)\r\n(.*)$")
     if not first_line then return nil, "bad request line" end
@@ -124,14 +125,16 @@ local function read_http_request(reactor, sock)
 
     local cl = tonumber(headers["content-length"] or "0") or 0
     if cl > MAX_BODY then return nil, "body too large" end
-    while #body < cl do
-        local chunk, err, partial = sock:receive(cl - #body)
-        if chunk then
-            body = body .. chunk
-        elseif partial and #partial > 0 then
-            body = body .. partial
+    local parts = { initial }
+    local have = #initial
+    while have < cl do
+        local chunk, err, partial = sock:receive(cl - have)
+        local piece = chunk or partial
+        if piece and #piece > 0 then
+            parts[#parts + 1] = piece
+            have = have + #piece
         end
-        if #body >= cl then break end
+        if have >= cl then break end
         if err == "timeout" then
             if socket.gettime() > deadline then return nil, "body read deadline" end
             reactor:wait_readable(sock)
@@ -141,6 +144,8 @@ local function read_http_request(reactor, sock)
             return nil, err
         end
     end
+
+    local body = table.concat(parts)
 
     return { method = method, path = path, headers = headers, body = body }
 end
@@ -285,13 +290,45 @@ end
 local Gateway = {}
 Gateway.__index = Gateway
 
+Gateway.DEFAULT_HOST = "127.0.0.1"
+Gateway.DEFAULT_PORT = 8080
+Gateway.DEFAULT_MAX_CONNECTIONS = 64
+
+function Gateway.authorized(req, token)
+    if type(token) ~= "string" or token == "" then return false end
+    local header = req and req.headers and req.headers["authorization"]
+    if type(header) ~= "string" then return false end
+    local presented = header:match("^[Bb][Ee][Aa][Rr][Ee][Rr]%s+(.-)%s*$")
+    if not presented or presented == "" then return false end
+    return ct.equal(presented, token)
+end
+
 function Gateway.new(opts)
+    if type(opts.token) ~= "string" or opts.token == "" then
+        return nil, "no gateway token configured: set Gateway.Token or "
+            .. "MOONMQ_GATEWAY_TOKEN; every request must carry "
+            .. "'Authorization: Bearer <token>'"
+    end
+    local max_connections = opts.max_connections or Gateway.DEFAULT_MAX_CONNECTIONS
+    if type(max_connections) ~= "number" or max_connections < 1 then
+        return nil, "Gateway.MaxConnections must be a positive number"
+    end
     return setmetatable({
         reactor = Reactor.new(),
-        host    = opts.host or "0.0.0.0",
-        port    = opts.port or 8080,
+        host    = opts.host or Gateway.DEFAULT_HOST,
+        port    = opts.port or Gateway.DEFAULT_PORT,
+        token   = opts.token,
+        max_connections = math.floor(max_connections),
+        connections = 0,
         pool_opts = opts.pool_opts,
     }, Gateway)
+end
+
+function Gateway:_dispatch(req)
+    if not Gateway.authorized(req, self.token) then
+        return err_response(401, "missing or invalid bearer token")
+    end
+    return route(req, self.pool)
 end
 
 function Gateway:_handle(sock, peer)
@@ -301,7 +338,7 @@ function Gateway:_handle(sock, peer)
         return
     end
 
-    local ok, status, ctype, body = pcall(route, req, self.pool)
+    local ok, status, ctype, body = pcall(self._dispatch, self, req)
     if not ok then
         status, ctype, body = 500, "application/json",
             json.encode({ error = "handler crashed: " .. tostring(status) }) .. "\n"
@@ -313,21 +350,76 @@ function Gateway:_handle(sock, peer)
     end)
 end
 
+function Gateway:_accept(sock, peer)
+    if self.connections >= self.max_connections then
+        pcall(function() sock:close() end)
+        return
+    end
+    self.connections = self.connections + 1
+    local ok, err = pcall(self._handle, self, sock, peer)
+    self.connections = self.connections - 1
+    if not ok then
+        pcall(function() sock:close() end)
+        io.stderr:write("[gateway] connection error: " .. tostring(err) .. "\n")
+    end
+end
+
 function Gateway:start()
     self.pool_opts.reactor = self.reactor
     self.pool = Pool.new(self.pool_opts)
 
     local _, lerr = self.reactor:listen(self.host, self.port,
-        function(sock, peer, _ip) self:_handle(sock, peer) end)
+        function(sock, peer, _ip) self:_accept(sock, peer) end)
     if lerr then return nil, lerr end
 
     io.stderr:write(string.format(
-        "[gateway] listening on %s:%d → moonmq %s:%d (pool max=%d)\n",
+        "[gateway] listening on %s:%d → moonmq %s:%d (pool max=%d, max connections=%d)\n",
         self.host, self.port,
-        self.pool_opts.host, self.pool_opts.port, self.pool_opts.max or 8))
+        self.pool_opts.host, self.pool_opts.port, self.pool_opts.max or 8,
+        self.max_connections))
 
     self.reactor:run()
     return true
+end
+
+function Gateway.options_from_config(cfg, getenv, warn)
+    getenv = getenv or os.getenv
+    warn = warn or function(msg) io.stderr:write("[gateway] " .. msg .. "\n") end
+    cfg = cfg or {}
+    local gcfg = cfg.Gateway or {}
+    local scfg = cfg.Server  or {}
+    local acfg = cfg.Auth    or {}
+
+    local token = getenv("MOONMQ_GATEWAY_TOKEN")
+    if type(gcfg.Token) == "string" and gcfg.Token ~= "" then token = gcfg.Token end
+    if token == "" then token = nil end
+
+    local username = gcfg.MoonMQUsername
+    if type(username) ~= "string" or username == "" then
+        username = acfg.Username
+        if username then
+            warn(string.format("Gateway.MoonMQUsername is not set; logging in as "
+                .. "Auth.Username %q, which is a SUPERUSER. Configure a "
+                .. "least-privilege user for the gateway.", tostring(username)))
+        end
+    end
+
+    return {
+        host = gcfg.Host or Gateway.DEFAULT_HOST,
+        port = gcfg.Port or Gateway.DEFAULT_PORT,
+        token = token,
+        max_connections = gcfg.MaxConnections or Gateway.DEFAULT_MAX_CONNECTIONS,
+        pool_opts = {
+            max            = gcfg.PoolMax or 8,
+            host           = gcfg.MoonMQHost or "127.0.0.1",
+            port           = gcfg.MoonMQPort or scfg.Port or 9092,
+            username       = username,
+            password       = gcfg.MoonMQPassword,
+            client_name    = "moonmq-gateway",
+            client_version = "0.1.0",
+            timeout        = gcfg.MoonMQTimeout or 30,
+        },
+    }
 end
 
 local function script_is_main()
@@ -336,24 +428,12 @@ end
 
 if script_is_main() then
     local cfg = Config.load() or {}
-    local gcfg = cfg.Gateway or {}
-    local scfg = cfg.Server  or {}
-    local acfg = cfg.Auth    or {}
 
-    local gw = Gateway.new({
-        host = gcfg.Host or "0.0.0.0",
-        port = gcfg.Port or 8080,
-        pool_opts = {
-            max            = gcfg.PoolMax or 8,
-            host           = gcfg.MoonMQHost or "127.0.0.1",
-            port           = gcfg.MoonMQPort or scfg.Port or 9092,
-            username       = acfg.Username,
-            password       = gcfg.MoonMQPassword,
-            client_name    = "moonmq-gateway",
-            client_version = "0.1.0",
-            timeout        = gcfg.MoonMQTimeout or 30,
-        },
-    })
+    local gw, gerr = Gateway.new(Gateway.options_from_config(cfg))
+    if not gw then
+        io.stderr:write("[gateway] refusing to start: " .. tostring(gerr) .. "\n")
+        os.exit(1)
+    end
 
     local ok, err = gw:start()
     if not ok then
@@ -361,5 +441,8 @@ if script_is_main() then
         os.exit(1)
     end
 end
+
+Gateway.read_http_request = read_http_request
+Gateway.route = route
 
 return Gateway
