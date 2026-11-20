@@ -75,6 +75,7 @@ local function connect(opts, host, port)
         cbind_type = cbind_type,
         reactor = opts.reactor,
         timeout = opts.timeout or DEFAULT_TIMEOUT,
+        min_iterations = opts.min_iterations,
         host = host,
         port = port,
         closed = false,
@@ -345,7 +346,8 @@ function Client:_auth_scram(username, password)
     local challenge, cerr = proto.decode_auth_challenge(payload)
     if not challenge then return "scram challenge: " .. tostring(cerr) end
 
-    local server_first, serr = scram.parse_server_first(challenge.message, client_nonce)
+    local server_first, serr = scram.parse_server_first(challenge.message, client_nonce,
+        { min_iterations = self.min_iterations })
     if not server_first then return "scram: " .. serr end
 
     local salted = pbkdf2.pbkdf2_hmac_sha256(password, server_first.salt,

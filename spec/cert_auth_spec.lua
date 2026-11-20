@@ -231,7 +231,8 @@ describe("client and broker halves against each other", function()
             transition_to = function(self, state) self.state = state end,
         }
         transport = fake_transport(server, conn)
-        local client = setmetatable({ sock = transport, closed = false, timeout = 1 }, Client)
+        local client = setmetatable({ sock = transport, closed = false, timeout = 1,
+                                      min_iterations = ITER }, Client)
         return client, conn, server
     end
 

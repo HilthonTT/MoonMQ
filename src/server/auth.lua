@@ -163,6 +163,22 @@ end
 local Auth = {}
 Auth.__index = Auth
 
+local function iteration_counts(store)
+    local seen, counts = {}, {}
+    for _, name in ipairs(store:names_sorted()) do
+        local record = store:get(name)
+        local parsed = record and record.parsed
+        local iterations = parsed and parsed.iterations
+        if iterations and iterations >= 1 and not seen[iterations] then
+            seen[iterations] = true
+            counts[#counts + 1] = iterations
+        end
+    end
+    table.sort(counts)
+    if #counts == 0 then counts[1] = 1 end
+    return counts
+end
+
 local function report_kdf_cost(store)
     local worst, worst_user = 0, nil
     for _, name in ipairs(store:names_sorted()) do
@@ -199,7 +215,7 @@ function M.authenticator(opts)
         generation     = 1,
         max_failures   = opts.max_failures   or 5,
         failure_window = opts.failure_window or 60,
-        ban_duration   = (opts.ban_duration   or 15) * 60,
+        ban_duration   = opts.ban_duration   or 900,
         max_failure_entries = opts.max_failure_entries or 10000,
         failures       = {},
         failures_n     = 0,
@@ -211,6 +227,7 @@ function M.authenticator(opts)
         cred_key       = rng.bytes(32),
         cred_cache     = {},
         decoy_key      = rng.bytes(32),
+        decoy_counts   = iteration_counts(store),
         decoy          = {
             kind       = M.FORMAT_PBKDF2,
             iterations = math.max(worst_iterations, 1),
@@ -278,7 +295,26 @@ function Auth:replace_store(store)
     self.generation = self.generation + 1
     self.cred_cache = {}
     self.decoy.iterations = math.max(worst_iterations, 1)
+    self.decoy_counts = iteration_counts(store)
     return self.generation
+end
+
+function Auth:_decoy_iterations(username)
+    local counts = self.decoy_counts
+    if #counts == 1 then return counts[1] end
+    local digest = sha2.hex_to_bin(
+        sha2.hmac(sha2.sha256, self.decoy_key, "iter\0" .. (username or "")))
+    local index = string.unpack(">I4", digest) % #counts + 1
+    return counts[index]
+end
+
+function Auth:_decoy_for(username)
+    return {
+        kind       = self.decoy.kind,
+        iterations = self:_decoy_iterations(username),
+        salt       = self.decoy.salt,
+        hash       = self.decoy.hash,
+    }
 end
 
 function Auth:set_yield_fn(fn)
@@ -422,7 +458,7 @@ function Auth:verify(user, pass, ip)
     -- A certificate-only user has no password: run the decoy so the refusal
     -- costs what a wrong password does, then refuse whatever matched.
     local has_password = record ~= nil and record.parsed ~= nil
-    local parsed = has_password and record.parsed or self.decoy
+    local parsed = has_password and record.parsed or self:_decoy_for(user)
 
     local generation = self.generation
     self.inflight = self.inflight + 1
@@ -493,7 +529,7 @@ function Auth:scram_credential(username)
     local key_hex  = sha2.hmac(sha2.sha256, self.decoy_key, "key\0" .. (username or ""))
     return {
         salt       = sha2.hex_to_bin(salt_hex):sub(1, DEFAULT_SALT_BYTES),
-        iterations = self.decoy.iterations,
+        iterations = self:_decoy_iterations(username),
         stored_key = sha2.hex_to_bin(key_hex),
         server_key = sha2.hex_to_bin(key_hex),
     }, nil

@@ -176,7 +176,8 @@ describe("SCRAM exchange", function()
         local combined = first.nonce .. scram.nonce(rng.bytes)
         local server_first = scram.server_first(combined, parsed.salt, parsed.iterations)
 
-        local sf = assert(scram.parse_server_first(server_first, client_nonce))
+        local sf = assert(scram.parse_server_first(server_first, client_nonce,
+            { min_iterations = ITER }))
         local salted = pbkdf2.pbkdf2_hmac_sha256(password, sf.salt, sf.iterations, 32)
         local client_final, expected =
             scram.client_final(salted, bare, server_first, sf.nonce)
@@ -241,7 +242,8 @@ describe("SCRAM exchange", function()
 
         local server_first_1 = scram.server_first(
             first.nonce .. scram.nonce(rng.bytes), parsed.salt, parsed.iterations)
-        local sf1 = assert(scram.parse_server_first(server_first_1, client_nonce))
+        local sf1 = assert(scram.parse_server_first(server_first_1, client_nonce,
+            { min_iterations = ITER }))
         local salted = pbkdf2.pbkdf2_hmac_sha256("s3cret", sf1.salt, sf1.iterations, 32)
         local captured = scram.client_final(salted, bare, server_first_1, sf1.nonce)
         local final = assert(scram.parse_client_final(captured))
@@ -395,7 +397,8 @@ describe("SCRAM over the wire, through the handlers", function()
         local op, payload = last(conn)
         assert.are.equal(proto.OP_AUTH_CHALLENGE, op)
         local challenge = assert(proto.decode_auth_challenge(payload))
-        local sf = assert(scram.parse_server_first(challenge.message, client_nonce))
+        local sf = assert(scram.parse_server_first(challenge.message, client_nonce,
+            { min_iterations = ITER }))
 
         local salted = pbkdf2.pbkdf2_hmac_sha256(password, sf.salt, sf.iterations, 32)
         local client_final, expected =
@@ -552,7 +555,8 @@ describe("client and broker halves against each other", function()
         }
         transport = fake_transport(server, conn)
 
-        local client = setmetatable({ sock = transport, closed = false, timeout = 1 },
+        local client = setmetatable({ sock = transport, closed = false, timeout = 1,
+                                      min_iterations = ITER },
             Client)
         local err = client:_auth_scram(username, password)
         return err, conn

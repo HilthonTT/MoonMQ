@@ -77,6 +77,10 @@ local function save(topic_dir, opts)
                 return false, string.format(
                     "opts.%s must be a number, got %s", key, type(val))
             end
+            if val ~= val or val == math.huge or val == -math.huge then
+                return false, string.format(
+                    "opts.%s must be finite, got %s", key, tostring(val))
+            end
             lines[#lines + 1] = string.format("%s=%.f", key, val)
         end
     end
@@ -87,6 +91,10 @@ local function save(topic_dir, opts)
             if type(val) ~= "string" then
                 return false, string.format(
                     "opts.%s must be a string, got %s", key, type(val))
+            end
+            if val:find("%c") then
+                return false, string.format(
+                    "opts.%s must not contain control characters", key)
             end
             lines[#lines + 1] = string.format("%s=%s", key, val)
         end

@@ -244,6 +244,16 @@ local ALTERABLE = {
     cleanup_policy   = "string",
 }
 
+local MAX_SAFE_INTEGER = 2 ^ 53
+
+local ALTERABLE_MAX = {
+    max_segment_size = 0xFFFFFFFF - (64 * 1024 * 1024),
+}
+
+local ALTERABLE_VALUES = {
+    cleanup_policy = { delete = true, compact = true },
+}
+
 local LIVE_PARTITION_FIELDS = {
     max_segment_size = true,
     retention        = true,
@@ -274,13 +284,33 @@ function Broker:alter_topic_config(name, changes)
                 return nil, string.format(
                     "config key '%s' needs a number, got %q", key, tostring(raw))
             end
+            if n ~= n or n == math.huge or n == -math.huge then
+                return nil, string.format(
+                    "config key '%s' must be finite, got %s", key, tostring(raw))
+            end
             if n <= 0 then
                 return nil, string.format(
                     "config key '%s' must be positive, got %s", key, tostring(n))
             end
+            local limit = ALTERABLE_MAX[key] or MAX_SAFE_INTEGER
+            if n > limit then
+                return nil, string.format(
+                    "config key '%s' must be at most %d, got %s",
+                    key, limit, tostring(raw))
+            end
             parsed[key] = math.floor(n)
         else
-            parsed[key] = tostring(raw)
+            local s = tostring(raw)
+            if s:find("%c") then
+                return nil, string.format(
+                    "config key '%s' must not contain control characters", key)
+            end
+            local allowed = ALTERABLE_VALUES[key]
+            if allowed and not allowed[s] then
+                return nil, string.format(
+                    "config key '%s' has invalid value %q", key, s)
+            end
+            parsed[key] = s
         end
     end
 

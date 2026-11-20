@@ -84,7 +84,7 @@ describe("audit regressions", function()
                 describe     = function() return "u" end,
             }
             return auth.authenticator({
-                store = store, max_failures = 3, failure_window = 10, ban_duration = 15,
+                store = store, max_failures = 3, failure_window = 10, ban_duration = 900,
             })
         end
 

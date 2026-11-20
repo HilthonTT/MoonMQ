@@ -18,13 +18,22 @@ end
 
 M.paint = paint
 
-local function display_width(s)
+local function one_line(s)
     local line = tostring(s):gsub("[\r\n]", " ")
-    return utf8.len(line) or #line
+    line = line:gsub("%c", function(c)
+        return string.format("\\x%02x", c:byte())
+    end)
+    line = line:gsub("\xC2([\x80-\x9F])", function(c)
+        return string.format("\\u%04x", c:byte())
+    end)
+    return line
 end
 
-local function one_line(s)
-    return (tostring(s):gsub("[\r\n]", " "))
+M.one_line = one_line
+
+local function display_width(s)
+    local line = one_line(s)
+    return utf8.len(line) or #line
 end
 
 function M.table(columns, rows)

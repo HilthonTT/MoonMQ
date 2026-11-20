@@ -1,10 +1,14 @@
 local sha2   = require("src.vendor.sha2")
 local b64    = require("src.core.base64")
 local ct     = require("src.core.ct")
+local pbkdf2 = require("src.core.pbkdf2")
 
 local M = {}
 
 M.MECHANISM = "SCRAM-SHA-256"
+
+M.MIN_CLIENT_ITERATIONS = 4096
+M.MAX_CLIENT_ITERATIONS = pbkdf2.MAX_PBKDF2_ITERATIONS
 
 M.GS2_HEADER  = "n,,"
 M.GS2_CBIND   = "biws"
@@ -216,7 +220,10 @@ function M.client_first(username, nonce, cbind_type)
     return gs2 .. bare, bare, gs2
 end
 
-function M.parse_server_first(message, client_nonce)
+function M.parse_server_first(message, client_nonce, opts)
+    opts = opts or {}
+    local min_iterations = opts.min_iterations or M.MIN_CLIENT_ITERATIONS
+    local max_iterations = M.MAX_CLIENT_ITERATIONS
     if type(message) ~= "string" or #message == 0 then
         return nil, "empty server-first message"
     end
@@ -233,11 +240,21 @@ function M.parse_server_first(message, client_nonce)
 
     local salt, serr = b64.decode(fields.s)
     if not salt then return nil, serr end
+    if #salt == 0 then return nil, "empty salt" end
 
     local iterations = tonumber(fields.i)
     if not iterations or iterations < 1 or iterations ~= math.floor(iterations) then
         return nil, "invalid iteration count"
     end
+    if iterations < min_iterations then
+        return nil, string.format(
+            "iteration count %d below the minimum %d", iterations, min_iterations)
+    end
+    if iterations > max_iterations then
+        return nil, string.format(
+            "iteration count %d above the maximum %d", iterations, max_iterations)
+    end
+    iterations = math.tointeger(iterations) or iterations
 
     return { nonce = fields.r, salt = salt, iterations = iterations }, nil
 end

@@ -45,47 +45,56 @@ do
     end
 end
 
-local fallback_warned = false
-local function urandom_fallback(n)
-    if not fallback_warned then
-        log:warn("no OS CSPRNG available, falling back to math.random. " ..
-            "This is NOT cryptographically secure. " ..
-            "Use Lua on Linux/macOS, or LuaJIT on Windows with bcrypt.dll.")
-        fallback_warned = true
-
-        local socket_ok, socket = pcall(require, "socket")
-        local seed_a = os.time()
-        local seed_b = socket_ok
-            and math.floor(socket.gettime() * 1e9)
-            or  math.floor(os.clock() * 1e6)
-
-        if not pcall(math.randomseed, seed_a, seed_b) then
-            pcall(math.randomseed, seed_a)
+local openssl_rand
+do
+    local ok, rand = pcall(require, "openssl.rand")
+    if ok and type(rand) == "table" and type(rand.bytes) == "function" then
+        openssl_rand = function(n)
+            local ready_ok, ready = pcall(function()
+                return rand.ready == nil or rand.ready()
+            end)
+            if ready_ok and not ready then
+                return nil, "openssl.rand not seeded"
+            end
+            local got, bytes = pcall(rand.bytes, n)
+            if not got then return nil, tostring(bytes) end
+            if type(bytes) ~= "string" or #bytes ~= n then
+                return nil, "short read from openssl.rand"
+            end
+            return bytes
         end
     end
+end
 
-    local bytes = {}
-    for i = 1, n do
-        bytes[i] = string.char(math.random(0, 255))
+M._sources = {}
+if os_utils.IS_WINDOWS then
+    if urandom_windows then
+        M._sources[#M._sources + 1] = { name = "BCryptGenRandom", fn = urandom_windows }
     end
-    return table.concat(bytes)
+else
+    M._sources[#M._sources + 1] = { name = "/dev/urandom", fn = urandom_unix }
+end
+if openssl_rand then
+    M._sources[#M._sources + 1] = { name = "openssl.rand", fn = openssl_rand }
 end
 
 function M.bytes(n)
     assert(type(n) == "number" and n > 0, "n must be a positive integer")
 
-    local picked
-    if os_utils.IS_WINDOWS then
-        picked = urandom_windows
-    else
-        picked = urandom_unix
-    end
-    if picked then
-        local b, err = picked(n)
+    local errors = {}
+    for i = 1, #M._sources do
+        local source = M._sources[i]
+        local b, err = source.fn(n)
         if b then return b end
-        log:warn("OS CSPRNG failed (%s); falling back", err)
+        errors[#errors + 1] = string.format("%s: %s", source.name, tostring(err))
+        log:warn("CSPRNG source %s failed (%s)", source.name, tostring(err))
     end
-    return urandom_fallback(n)
+    if #errors == 0 then
+        errors[1] = "no source available"
+    end
+    error("no cryptographically secure random source available ("
+        .. table.concat(errors, "; ")
+        .. "); install luaossl or run where /dev/urandom is readable", 2)
 end
 
 return M
