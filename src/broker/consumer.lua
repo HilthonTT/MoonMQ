@@ -60,6 +60,11 @@ function Consumer:subscribe(topic_name)
     return true, nil
 end
 
+function Consumer:unsubscribe(topic_name)
+    self.topics[topic_name]  = nil
+    self.offsets[topic_name] = nil
+end
+
 -- Starts tracking any partition of the topic this consumer has no position
 -- for yet: all of them on subscribe, and the new ones after the topic grows.
 function Consumer:_track_partitions(topic_name, topic)

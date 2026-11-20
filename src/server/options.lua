@@ -11,6 +11,26 @@ local log     = require("src.log.logger").get("main")
 local M = {}
 
 M.DEFAULT_DATA_DIR = "./data_server"
+M.DEFAULT_MAX_FETCH_RECORDS    = 1000
+M.DEFAULT_TRANSACTION_TIMEOUT_S = 900
+
+local function positive_integer(value, default, key)
+    if value == nil then return default, nil end
+    local n = type(value) == "number" and math.tointeger(value) or nil
+    if not n or n < 1 then
+        return nil, string.format("%s must be a positive integer, got %s", key, tostring(value))
+    end
+    return n, nil
+end
+
+local function non_negative_seconds(value, default, key)
+    if value == nil then return default, nil end
+    if type(value) ~= "number" or value ~= value or value < 0 then
+        return nil, string.format("%s must be a number of seconds >= 0, got %s",
+            key, tostring(value))
+    end
+    return value, nil
+end
 
 local function seconds(ms)
     return ms and ms / 1000 or nil
@@ -284,6 +304,13 @@ function M.from_config(cfg, getenv)
     local metrics_tls, _, mterr = M.tls(s.MetricsTls, "Server.MetricsTls", "server")
     if mterr then return nil, mterr end
 
+    local max_fetch_records, ferr = positive_integer(s.MaxFetchRecords,
+        M.DEFAULT_MAX_FETCH_RECORDS, "Server.MaxFetchRecords")
+    if ferr then return nil, ferr end
+    local txn_timeout, xerr = non_negative_seconds(s.TransactionTimeout,
+        M.DEFAULT_TRANSACTION_TIMEOUT_S, "Server.TransactionTimeout")
+    if xerr then return nil, xerr end
+
     return {
         auth_loader            = M.auth_loader(),
         acks                   = s.Acks,
@@ -308,6 +335,8 @@ function M.from_config(cfg, getenv)
         heartbeat_miss_threshold = s.HeartbeatMissThreshold,
         max_topics             = s.MaxTopics,
         max_list_topics        = s.MaxListTopics,
+        max_fetch_records      = max_fetch_records,
+        transaction_timeout_s  = txn_timeout,
         producer_expiry_s              = s.ProducerExpirySeconds,
         producer_expiry_check_interval = s.ProducerExpiryCheckIntervalSeconds,
         metrics_host           = s.MetricsHost or "127.0.0.1",

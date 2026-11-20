@@ -2,6 +2,7 @@ local proto      = require("src.wire.protocol")
 local Connection = require("src.server.connection")
 local uuid       = require("src.core.uuid")
 local consumer_m = require("src.broker.consumer")
+local broker_m   = require("src.broker")
 local msg_m      = require("src.record.message")
 local compression = require("src.record.compression")
 local headers_m  = require("src.record.headers")
@@ -11,6 +12,7 @@ local quota_m    = require("src.server.quota")
 local scram_m    = require("src.server.scram")
 local tls_m      = require("src.io.tls")
 local rng        = require("src.core.rng")
+local util_m     = require("src.core.util")
 local log        = require("src.log.logger").get("server")
 local push_log   = require("src.log.logger").get("push")
 
@@ -28,6 +30,35 @@ local function write_err_code(err)
         and proto.ERR_TOPIC_MISSING or proto.ERR_INTERNAL
 end
 
+local STORAGE_ERROR_MARKERS = {
+    "failed to write message",
+    "failed to sync partition",
+    "failed to persist",
+    "failed to create partition",
+    "failed to remove",
+    "failed to append",
+}
+
+local function internal_error(conn, what, err)
+    log:error("conn=%s %s: %s", conn.id_short, what, tostring(err))
+    return what .. " failed: internal broker error (details in the broker log)"
+end
+
+local function client_write_error(conn, what, err)
+    err = tostring(err)
+    for _, marker in ipairs(STORAGE_ERROR_MARKERS) do
+        if err:find(marker, 1, true) then
+            return internal_error(conn, what, err)
+        end
+    end
+    return err
+end
+
+local function fail_write(conn, correl, what, err)
+    return fail(conn, correl, write_err_code(err), "%s",
+        client_write_error(conn, what, err))
+end
+
 local function decode(conn, correl, decoder, payload)
     local value, err = decoder(payload)
     if value then return value end
@@ -42,7 +73,13 @@ local function decode_or_close(conn, decoder, payload)
     return nil
 end
 
+local function internal_topic(resource, name)
+    return resource == acl_m.RES_TOPIC and type(name) == "string"
+        and broker_m.Broker.is_internal(name)
+end
+
 local function permitted(conn, resource, name, operation)
+    if internal_topic(resource, name) then return false end
     local principal = conn.principal
     if not principal then return true end
     return principal.acl:authorized(resource, name, operation)
@@ -50,6 +87,15 @@ end
 M.permitted = permitted
 
 local function authorize(conn, correl, resource, name, operation)
+    if internal_topic(resource, name) then
+        metrics.inc("moonmq_authz_denied_total", 1,
+            { resource = resource, operation = operation })
+        log:warn("conn=%s user=%s DENIED %s on internal topic %q", conn.id_short,
+            conn.username or "?", operation, name)
+        fail(conn, correl, proto.ERR_TOPIC_FORBIDDEN,
+            "topic %q is internal and not accessible to clients", name)
+        return false
+    end
     if permitted(conn, resource, name, operation) then return true end
 
     metrics.inc("moonmq_authz_denied_total", 1,
@@ -423,7 +469,7 @@ function M.produce(server, conn, correl, payload)
     end
     local part_id, offset, werr = server.producer:produce(p.topic, msg)
     if werr then
-        return fail(conn, correl, write_err_code(werr), werr)
+        return fail_write(conn, correl, "produce", werr)
     end
 
     metrics.inc("moonmq_produce_records_total", 1, { topic = p.topic })
@@ -471,14 +517,15 @@ function M.produce_batch(server, conn, correl, payload)
         end
         local acks, perr = server.producer:produce_batch(b.topic, msgs)
         if perr and #acks == 0 then
-            return fail(conn, correl, write_err_code(perr), perr)
+            return fail_write(conn, correl, "produce", perr)
         end
         if #acks > 0 then
             metrics.inc("moonmq_produce_records_total", #acks, { topic = b.topic })
             metrics.inc("moonmq_produce_batches_total", 1, { topic = b.topic })
         end
         conn:send(proto.encode_produce_batch_ack(correl, acks,
-            perr and proto.ERR_INTERNAL or 0, perr))
+            perr and proto.ERR_INTERNAL or 0,
+            perr and client_write_error(conn, "produce", perr)))
         return
     end
 
@@ -550,9 +597,10 @@ function M.produce_batch(server, conn, correl, payload)
 
     if perr and #acks == 0 then
         if enrol_err then
-            return fail(conn, correl, txn_err_code(enrol_code), perr)
+            return fail(conn, correl, txn_err_code(enrol_code), "%s",
+                client_write_error(conn, "produce", perr))
         end
-        return fail(conn, correl, write_err_code(perr), perr)
+        return fail_write(conn, correl, "produce", perr)
     end
 
     local applied  = #acks
@@ -563,7 +611,7 @@ function M.produce_batch(server, conn, correl, payload)
             last_ack.offset, last_ack.partition, conn.epoch, memo)
         if not ok then
             conn:send(proto.encode_produce_batch_ack(correl, acks, proto.ERR_INTERNAL,
-                "produced but failed to persist producer state: " .. tostring(rerr)))
+                internal_error(conn, "persisting producer state", rerr)))
             return
         end
     else
@@ -581,7 +629,8 @@ function M.produce_batch(server, conn, correl, payload)
     metrics.inc("moonmq_produce_batches_total", 1, { topic = b.topic })
 
     conn:send(proto.encode_produce_batch_ack(correl, acks,
-        perr and proto.ERR_INTERNAL or 0, perr))
+        perr and proto.ERR_INTERNAL or 0,
+        perr and client_write_error(conn, "produce", perr)))
 end
 
 function M.init_producer_id(server, conn, correl, payload)
@@ -601,9 +650,13 @@ function M.init_producer_id(server, conn, correl, payload)
         return
     end
 
+    if not authorize(conn, correl, acl_m.RES_TRANSACTIONAL_ID, req.producer_name,
+                     acl_m.OP_WRITE) then return end
+
     local pid, epoch, gerr = ps:get_or_create_producer(req.producer_name)
     if not pid then
-        return fail(conn, correl, proto.ERR_INTERNAL, gerr or "producer id allocation failed")
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "producer id allocation", gerr))
     end
     conn.pid           = pid
     conn.epoch         = epoch
@@ -690,17 +743,18 @@ function M.produce_idempotent(server, conn, correl, payload)
         server.producer:produce(p.topic, msg, produce_opts)
     if werr then
         if enrol_err then
-            return fail(conn, correl, txn_err_code(enrol_code), werr)
+            return fail(conn, correl, txn_err_code(enrol_code), "%s",
+                client_write_error(conn, "produce", werr))
         end
-        return fail(conn, correl, write_err_code(werr), werr)
+        return fail_write(conn, correl, "produce", werr)
     end
 
     if durable then
         local ok, rerr = ps:record_produce(conn.pid, p.topic, p.seq,
             offset, partition_id, conn.epoch)
         if not ok then
-            return fail(conn, correl, proto.ERR_INTERNAL,
-                "produced but failed to persist producer state: " .. tostring(rerr))
+            return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+                internal_error(conn, "persisting producer state", rerr))
         end
     else
         conn.seq_state[p.topic] = {
@@ -734,9 +788,53 @@ local function ensure_consumer(conn, broker, group_id, isolation)
     return conn.consumer
 end
 
+local function prune_revoked(conn)
+    local consumer = conn.consumer
+    if not consumer then return end
+    local revoked
+    for topic in pairs(consumer.offsets) do
+        if not permitted(conn, acl_m.RES_TOPIC, topic, acl_m.OP_READ) then
+            revoked = revoked or {}
+            revoked[#revoked + 1] = topic
+        end
+    end
+    if not revoked then return end
+    for _, topic in ipairs(revoked) do
+        consumer:unsubscribe(topic)
+        conn.subscriptions[topic] = nil
+        log:warn("conn=%s user=%s read on topic %q no longer permitted; unsubscribed",
+            conn.id_short, conn.username or "?", topic)
+    end
+end
+M.prune_revoked = prune_revoked
+
+function M.revoked_read(conn)
+    local topics = {}
+    for topic in pairs(conn.subscriptions or {}) do topics[topic] = true end
+    if conn.consumer then
+        for topic in pairs(conn.consumer.offsets) do topics[topic] = true end
+    end
+    local sorted = {}
+    for topic in pairs(topics) do sorted[#sorted + 1] = topic end
+    table.sort(sorted)
+    for _, topic in ipairs(sorted) do
+        if not permitted(conn, acl_m.RES_TOPIC, topic, acl_m.OP_READ) then
+            return string.format("topic %q", topic)
+        end
+    end
+    local group = (conn.consumer and conn.consumer.group_id) or conn.group_id
+    if group and not permitted(conn, acl_m.RES_GROUP, group, acl_m.OP_READ) then
+        return string.format("group %q", group)
+    end
+    return nil
+end
+
+local DEFAULT_MAX_FETCH_RECORDS = 1000
+
 local function subscriber_loop(server, conn)
     while conn.state ~= Connection.STATE_CLOSED do
         server.coordinator:apply_assignment(conn)
+        prune_revoked(conn)
         local records, err = conn.consumer:poll({ max_records = server.push_batch })
         if err then
             push_log:error("conn=%s poll: %s", conn.id_short, err)
@@ -857,13 +955,17 @@ function M.fetch(server, conn, correl, payload)
     consumer.auto_commit = false
 
     server.coordinator:apply_assignment(conn)
+    prune_revoked(conn)
 
-    local records, perr = consumer:poll({ max_records = f.max_records })
+    local max_records = math.min(f.max_records,
+        server.max_fetch_records or DEFAULT_MAX_FETCH_RECORDS)
+    local records, perr = consumer:poll({ max_records = max_records })
     if perr then
-        return fail(conn, correl, proto.ERR_INTERNAL, perr)
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "fetch", perr))
     end
     if records then
-        local limit = math.min(#records, f.max_records or #records)
+        local limit = math.min(#records, max_records)
 
         for i = #records, limit + 1, -1 do
             local r = records[i]
@@ -964,7 +1066,8 @@ function M.commit(server, conn, correl, payload)
     end
     local ok, cerr = conn.consumer:commit_offset(c.topic, c.partition, c.offset)
     if not ok then
-        return fail(conn, correl, proto.ERR_INTERNAL, cerr or "commit failed")
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "commit", cerr))
     end
     conn:send(proto.encode_ok(correl))
 end
@@ -999,10 +1102,28 @@ function M.nack(server, conn, correl, payload)
     end
 
     local group = conn.consumer.group_id
-    local res, nerr = server.broker.dlq:record_failure(
-        group, n.topic, n.partition, n.offset, n.reason)
+    local res, nerr, ncode = server.broker.dlq:record_failure(
+        group, n.topic, n.partition, n.offset, n.reason, {
+            max_topics = server.max_topics,
+            may_create = function(dlq_name)
+                return permitted(conn, acl_m.RES_TOPIC, dlq_name, acl_m.OP_CREATE)
+                    or permitted(conn, acl_m.RES_CLUSTER, nil, acl_m.OP_CREATE)
+            end,
+        })
     if not res then
-        return fail(conn, correl, proto.ERR_INTERNAL, nerr)
+        if ncode == "auth" then
+            metrics.inc("moonmq_authz_denied_total", 1,
+                { resource = acl_m.RES_TOPIC, operation = acl_m.OP_CREATE })
+            log:warn("conn=%s user=%s DENIED %s", conn.id_short,
+                conn.username or "?", tostring(nerr))
+            return fail(conn, correl, proto.ERR_NOT_AUTHORIZED, "%s", nerr)
+        elseif ncode == "limit" then
+            return fail(conn, correl, proto.ERR_RATE_LIMITED, "%s", nerr)
+        elseif ncode == "forbidden" then
+            return fail(conn, correl, proto.ERR_TOPIC_FORBIDDEN, "%s", nerr)
+        end
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "nack", nerr))
     end
     metrics.inc("moonmq_nack_total", 1, { topic = n.topic })
 
@@ -1019,7 +1140,11 @@ function M.nack(server, conn, correl, payload)
             log:error("conn=%s nack advance %s/partition-%d: %s",
                 conn.id_short, n.topic, n.partition, cerr)
         end
-        metrics.inc("moonmq_dlq_records_total", 1, { topic = n.topic })
+        if res.dropped then
+            metrics.inc("moonmq_dlq_dropped_total", 1, { topic = n.topic })
+        else
+            metrics.inc("moonmq_dlq_records_total", 1, { topic = n.topic })
+        end
         conn:send(proto.encode_nack_ack(correl, true, res.attempts, res.dlq_topic))
         return
     end
@@ -1029,7 +1154,8 @@ function M.nack(server, conn, correl, payload)
     end
     local cok, cerr = conn.consumer:commit_offset(n.topic, n.partition, n.offset)
     if not cok then
-        return fail(conn, correl, proto.ERR_INTERNAL, cerr or "nack rewind failed")
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "nack rewind", cerr))
     end
     conn:send(proto.encode_nack_ack(correl, false, res.attempts, nil))
 end
@@ -1039,6 +1165,10 @@ function M.create_topic(server, conn, correl, payload)
     if not c then return end
     if c.num_partitions < 1 or c.num_partitions > 1024 then
         return fail(conn, correl, proto.ERR_BAD_FRAME, "num_partitions out of range (1..1024)")
+    end
+    if c.name:sub(1, 2) == "__" then
+        return fail(conn, correl, proto.ERR_BAD_FRAME,
+            "topic names starting with '__' are reserved for internal use")
     end
     if not (permitted(conn, acl_m.RES_TOPIC, c.name, acl_m.OP_CREATE)
             or permitted(conn, acl_m.RES_CLUSTER, nil, acl_m.OP_CREATE)) then
@@ -1050,18 +1180,31 @@ function M.create_topic(server, conn, correl, payload)
             "not authorized: create on topic %q", c.name)
     end
     if not charge(server, conn, correl, c.name, quota_m.DIM_REQUESTS, 1) then return end
-    if c.name:sub(1, 2) == "__" then
-        return fail(conn, correl, proto.ERR_BAD_FRAME,
-            "topic names starting with '__' are reserved for internal use")
+    local valid, verr = util_m.validate_topic_name(c.name)
+    if not valid then
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s", verr)
     end
     local current = #server.broker:list_topics()
     if current >= server.max_topics then
         return fail(conn, correl, proto.ERR_RATE_LIMITED,
             "topic limit reached (%d)", server.max_topics)
     end
+    local tm = server.broker.topic_manager
+    if tm then
+        if tm.topics[c.name] then
+            return fail(conn, correl, proto.ERR_INTERNAL, "topic '%s' already exists", c.name)
+        end
+        local clash = tm:case_conflict(c.name)
+        if clash then
+            return fail(conn, correl, proto.ERR_INTERNAL,
+                "topic '%s' conflicts with existing topic '%s' (names differ only in case)",
+                c.name, clash)
+        end
+    end
     local _, terr = server.broker:create_topic(c.name, c.num_partitions)
     if terr then
-        return fail(conn, correl, proto.ERR_INTERNAL, terr)
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "create topic", terr))
     end
     metrics.set("moonmq_topic_count", current + 1)
     conn:send(proto.encode_ok(correl))
@@ -1161,7 +1304,8 @@ function M.delete_topic(server, conn, correl, payload)
 
     local ok, derr = server.broker:delete_topic(c.name)
     if not ok then
-        return fail(conn, correl, proto.ERR_INTERNAL, derr)
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "delete topic", derr))
     end
     if derr then
         log:warn("delete_topic %s: %s", c.name, derr)
@@ -1243,7 +1387,8 @@ function M.create_partitions(server, conn, correl, payload)
 
     local _, aerr = server.broker:add_partitions(c.name, c.total)
     if aerr then
-        return fail(conn, correl, proto.ERR_INTERNAL, aerr)
+        return fail(conn, correl, proto.ERR_INTERNAL, "%s",
+            internal_error(conn, "create partitions", aerr))
     end
     log:info("topic '%s' grown from %d to %d partitions", c.name, current, c.total)
     conn:send(proto.encode_ok(correl))
@@ -1321,6 +1466,14 @@ function M.join_group(server, conn, correl, payload)
     local member_id = j.member_id
     if member_id == "" then
         member_id = conn.member_id or conn.id_short
+    end
+
+    if conn.group_id == j.group_id and conn.member_id and conn.member_id ~= member_id then
+        server.coordinator:leave(conn.group_id, conn.member_id)
+        log:info("conn=%s left group=%s member=%s to rejoin as member=%s",
+            conn.id_short, conn.group_id, conn.member_id, member_id)
+        conn.group_id  = nil
+        conn.member_id = nil
     end
 
     local assignment, jerr, jcode =

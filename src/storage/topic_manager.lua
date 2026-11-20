@@ -37,7 +37,17 @@ function TopicManager.new(baseDir, opts)
     }, TopicManager)
 end
 
-function TopicManager:create_topic(name, numPartitions, opts)
+function TopicManager:case_conflict(name)
+    local folded = name:lower()
+    for existing in pairs(self.topics) do
+        if existing ~= name and existing:lower() == folded then
+            return existing
+        end
+    end
+    return nil
+end
+
+function TopicManager:create_topic(name, numPartitions, opts, recovering)
     assert(type(name) == "string", "name must be a string")
     assert(type(numPartitions) == "number", "numPartitions must be a number")
     if opts ~= nil then
@@ -49,6 +59,13 @@ function TopicManager:create_topic(name, numPartitions, opts)
 
     if self.topics[name] then
         return nil, string.format("topic '%s' already exists", name)
+    end
+
+    local clash = not recovering and self:case_conflict(name)
+    if clash then
+        return nil, string.format(
+            "topic '%s' conflicts with existing topic '%s' (names differ only in case)",
+            name, clash)
     end
 
     local backend_name = (opts and opts.backend) or self.default_backend

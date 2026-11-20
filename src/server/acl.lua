@@ -8,6 +8,7 @@ local VALID_OPS = {
                 delete = true, alter = true, describe = true },
     group   = { read = true, delete = true, describe = true },
     cluster = { describe = true, alter = true, create = true },
+    transactional_id = { write = true, describe = true },
 }
 
 M.VALID_OPS = VALID_OPS
@@ -22,6 +23,7 @@ M.OP_DESCRIBE = "describe"
 M.RES_TOPIC   = "topic"
 M.RES_GROUP   = "group"
 M.RES_CLUSTER = "cluster"
+M.RES_TRANSACTIONAL_ID = "transactional_id"
 
 local function is_list(t)
     return type(t) == "table" and (t[1] ~= nil or next(t) == nil)
@@ -34,12 +36,12 @@ function M.rule(spec)
 
     local resource = spec.Resource or spec.resource
     if type(resource) ~= "string" then
-        return nil, "acl rule: Resource is required (topic|group|cluster)"
+        return nil, "acl rule: Resource is required (topic|group|cluster|transactional_id)"
     end
     resource = resource:lower()
     if not VALID_OPS[resource] then
         return nil, string.format("acl rule: unknown resource %q "
-            .. "(expected topic, group or cluster)", resource)
+            .. "(expected topic, group, cluster or transactional_id)", resource)
     end
 
     local name = spec.Name or spec.name or "*"

@@ -142,7 +142,17 @@ function DlqManager:attempts_for(group, topic, partition, offset)
     return e and e.count or 0
 end
 
-function DlqManager:record_failure(group, topic_name, partition_id, offset, reason)
+function DlqManager:is_dead_letter_topic(topic_name)
+    local suffix = self.suffix
+    return #suffix > 0 and #topic_name > #suffix
+        and topic_name:sub(-#suffix) == suffix
+end
+
+function DlqManager:record_failure(group, topic_name, partition_id, offset, reason, opts)
+    opts = opts or {}
+    if topic_name:sub(1, 2) == "__" then
+        return nil, string.format("cannot nack internal topic '%s'", topic_name), "forbidden"
+    end
     local topic, terr = self.broker:get_topic(topic_name)
     if not topic then return nil, terr end
     local part = topic.partitions[partition_id]
@@ -187,9 +197,22 @@ function DlqManager:record_failure(group, topic_name, partition_id, offset, reas
         }, nil
     end
 
-    local dlq_topic, dlq_partition, dlq_offset, derr = self:_dead_letter(
-        group, topic, topic_name, partition_id, offset, msg, entry.count, reason)
-    if not dlq_topic then return nil, derr end
+    if self:is_dead_letter_topic(topic_name) then
+        self:_forget(key)
+        log:warn("dropped %s/partition-%d offset %d for group '%s' after %d attempt(s): "
+            .. "it is already a dead-letter topic", topic_name, partition_id, offset,
+            group, entry.count)
+        return {
+            dead_lettered = true,
+            dropped       = true,
+            attempts      = entry.count,
+            next_offset   = next_offset,
+        }, nil
+    end
+
+    local dlq_topic, dlq_partition, dlq_offset, derr, dcode = self:_dead_letter(
+        group, topic, topic_name, partition_id, offset, msg, entry.count, reason, opts)
+    if not dlq_topic then return nil, derr, dcode end
 
     self:_forget(key)
 
@@ -207,7 +230,8 @@ function DlqManager:record_failure(group, topic_name, partition_id, offset, reas
 end
 
 function DlqManager:_dead_letter(group, topic, topic_name, partition_id, offset,
-                                 msg, attempts, reason)
+                                 msg, attempts, reason, opts)
+    opts = opts or {}
     local value = msg.value
     local codec = msg:codec()
     if codec ~= 0 then
@@ -229,6 +253,15 @@ function DlqManager:_dead_letter(group, topic, topic_name, partition_id, offset,
 
     local dlq_topic = self.broker.topic_manager.topics[dlq_name]
     if not dlq_topic then
+        if opts.may_create and not opts.may_create(dlq_name) then
+            return nil, nil, nil, string.format(
+                "not authorized: create on topic %q (dead-letter topic)", dlq_name), "auth"
+        end
+        if opts.max_topics and #self.broker:list_topics() >= opts.max_topics then
+            return nil, nil, nil, string.format(
+                "topic limit reached (%d); cannot create dead-letter topic %s",
+                opts.max_topics, dlq_name), "limit"
+        end
         local created, cerr = self.broker:create_topic(dlq_name, #topic.partitions)
         if not created then
             return nil, nil, nil, string.format(

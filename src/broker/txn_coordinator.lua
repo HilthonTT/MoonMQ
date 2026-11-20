@@ -58,6 +58,7 @@ function Coordinator.new(broker, opts)
         remote = {},
         router = nil,
         recovery_pending = false,
+        now_ms = opts.now_ms or time_m.now_ms,
     }, Coordinator)
 
     -- In a cluster, in-flight transactions may have participants owned by
@@ -181,6 +182,7 @@ function Coordinator:begin(txn_id, pid, epoch)
     self.txns[txn_id] = {
         pid = pid, epoch = epoch, state = S.ONGOING,
         participants = {}, pending_offsets = {},
+        started_at = self.now_ms(),
     }
     local ok, err = self:_persist(txn_id)
     if not ok then return nil, err end
@@ -377,6 +379,52 @@ function Coordinator:end_txn(txn_id, pid, epoch, commit)
     return self:_finish(txn_id, commit)
 end
 
+local function in_flight(t)
+    return t.state == S.ONGOING or t.state == S.PREPARE_COMMIT
+        or t.state == S.PREPARE_ABORT
+end
+
+function Coordinator:expire(timeout_s, now_ms)
+    if self.recovery_pending or not timeout_s or timeout_s <= 0 then return {} end
+    now_ms = now_ms or self.now_ms()
+    local limit_ms = timeout_s * 1000
+
+    local due = {}
+    for txn_id, t in pairs(self.txns) do
+        if in_flight(t) and not t.expiring then
+            t.started_at = t.started_at or now_ms
+            if now_ms - t.started_at >= limit_ms then due[#due + 1] = txn_id end
+        end
+    end
+    table.sort(due)
+
+    local expired = {}
+    for _, txn_id in ipairs(due) do
+        local t = self.txns[txn_id]
+        if t and in_flight(t) and not t.expiring then
+            t.expiring = true
+            local commit = t.state == S.PREPARE_COMMIT
+            local ok, err = true, nil
+            if t.state == S.ONGOING then
+                t.state = S.PREPARE_ABORT
+                ok, err = self:_persist(txn_id)
+            end
+            if ok then ok, err = self:_finish(txn_id, commit) end
+            t.expiring = nil
+            if ok then
+                expired[#expired + 1] = txn_id
+                log:warn("txn %s exceeded the %ss transaction timeout; %s",
+                    txn_id, tostring(timeout_s), commit and "commit completed" or "aborted")
+            else
+                t.started_at = now_ms
+                log:error("txn %s timed out but could not be finished: %s",
+                    txn_id, tostring(err))
+            end
+        end
+    end
+    return expired
+end
+
 function Coordinator:current(txn_id) return self.txns[txn_id] end
 
 function Coordinator:has_unresolved(txn_id)
@@ -442,10 +490,12 @@ end
 
 -- Replay __transaction_state into memory (no side effects on other topics).
 function Coordinator:_load_txns()
+    local loaded_at = self.now_ms()
     for _, part in ipairs(self.topic.partitions) do
         local serr = part:scan(function(_offset, m)
             local ok, decoded = pcall(decode_txn, m.value)
             if ok then
+                decoded.started_at = loaded_at
                 self.txns[m.key] = decoded
             else
                 log:warn("%s: skipping undecodable txn record for %q",

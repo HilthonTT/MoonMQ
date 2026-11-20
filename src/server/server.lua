@@ -161,6 +161,10 @@ function Server.new(opts)
         "Processing failures reported by consumers via NACK.")
     metrics.describe("moonmq_dlq_records_total", "counter",
         "Records moved to a dead-letter topic.")
+    metrics.describe("moonmq_dlq_dropped_total", "counter",
+        "Records from a dead-letter topic dropped after exhausting their deliveries.")
+    metrics.describe("moonmq_txn_timeouts_total", "counter",
+        "Transactions aborted for exceeding Server.TransactionTimeout.")
     metrics.describe("moonmq_authz_denied_total", "counter",
         "Requests refused by an ACL, labelled by resource and operation.")
     metrics.describe("moonmq_quota_throttled_total", "counter",
@@ -382,6 +386,8 @@ function Server.new(opts)
         push_batch               = opts.push_batch               or DEFAULT_PUSH_BATCH,
         max_topics               = opts.max_topics               or DEFAULT_MAX_TOPICS,
         max_list_topics          = opts.max_list_topics          or DEFAULT_MAX_LIST_TOPICS,
+        max_fetch_records        = opts.max_fetch_records        or 1000,
+        transaction_timeout_s    = opts.transaction_timeout_s    or 900,
 
         max_connections        = max_connections,
         max_connections_per_ip = opts.max_connections_per_ip or 32,
@@ -580,9 +586,26 @@ function Server:_every(interval, name, fn)
     end
 end
 
+function Server:expire_transactions(now_ms)
+    local txns = self.broker.transactions
+    if not (txns and txns.expire and self:_writable()) then return {} end
+    local expired = txns:expire(self.transaction_timeout_s, now_ms)
+    if #expired == 0 then return expired end
+    local names = {}
+    for _, txn_id in ipairs(expired) do names[txn_id] = true end
+    for _, conn in pairs(self.connections_by_id) do
+        if conn.producer_name and names[conn.producer_name] then
+            conn.in_txn = false
+        end
+    end
+    metrics.inc("moonmq_txn_timeouts_total", #expired)
+    return expired
+end
+
 function Server:_run_group_reaper()
     self:_every(self.group_reaper_interval, "group reaper", function()
         if self:_writable() then self.coordinator:reap() end
+        self:expire_transactions()
     end)
 end
 
@@ -687,13 +710,18 @@ function Server:reload_auth()
         self.quotas = quotas
     end
 
-    local updated, dropped = {}, {}
+    local updated, dropped, revoked = {}, {}, {}
     for _, conn in pairs(self.connections_by_id) do
         if conn.principal then
             local principal = self.authenticator:principal(conn.principal.username)
             if principal then
                 conn.principal = principal
-                updated[#updated + 1] = conn
+                local lost = handlers.revoked_read(conn)
+                if lost then
+                    revoked[#revoked + 1] = { conn = conn, what = lost }
+                else
+                    updated[#updated + 1] = conn
+                end
             else
                 dropped[#dropped + 1] = conn
             end
@@ -704,6 +732,13 @@ function Server:reload_auth()
             conn.username or "?")
         conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_AUTH_FAILED,
             "user removed")
+    end
+    for _, r in ipairs(revoked) do
+        log:info("conn=%s user %q lost read access to %s, closing", r.conn.id_short,
+            r.conn.username or "?", r.what)
+        r.conn:close(Connection.REASON_AUTH_FAILED, proto.ERR_NOT_AUTHORIZED,
+            "read access revoked: " .. r.what)
+        dropped[#dropped + 1] = r.conn
     end
 
     metrics.inc("moonmq_auth_reloads_total", 1)

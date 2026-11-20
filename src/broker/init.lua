@@ -131,7 +131,7 @@ function Broker:load_topics()
                             "failed to load topic %s config: %s", name, oerr)
                     end
 
-                    local _, cErr = self.topic_manager:create_topic(name, max_id, opts)
+                    local _, cErr = self.topic_manager:create_topic(name, max_id, opts, true)
                     if cErr then
                         return string.format("failed to load topic %s: %s", name, cErr)
                     end
