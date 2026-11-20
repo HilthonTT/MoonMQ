@@ -64,6 +64,20 @@ survive reconnects and restarts (`__producer_state`), a new session fences the
 old one, and the producer may run transactions (see the client example at the
 end of this section).
 
+Two limits apply to named producers:
+
+- **Claiming a name needs an ACL.** On an authenticated broker,
+  `INIT_PRODUCER_ID` with a `producer_name` requires
+  `transactional_id:write` on that name (superusers excepted). See
+  [security.md](security.md#2-acls).
+- **Open transactions time out.** A transaction still ongoing after
+  `Server.TransactionTimeout` seconds (default 900, 0 = never) is aborted by
+  the broker. Until then it pins the partition's LSO, so without the timeout one
+  idle producer could stall every `read_committed` consumer. The producer's
+  next `END_TXN` gets "no transaction in progress". Aborts are counted in
+  `moonmq_txn_timeouts_total`. A transaction recovered at startup is timed
+  from the recovery.
+
 ### Guarantees
 
 Within the lifetime of a single TCP connection that called

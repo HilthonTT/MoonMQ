@@ -89,6 +89,7 @@ error, so check the second value rather than wrapping it in `assert`.
 | `hosts` | — | List of `"host:port"`; replaces `host`/`port` and follows `leader=` hints across it |
 | `username`, `password` | — | Credentials; omit for an open broker |
 | `mechanism` | `plain` | `plain`, `scram-sha-256` or `external` (certificate login) — see [security.md](security.md) |
+| `min_iterations` | 4096 | Lowest SCRAM iteration count the client accepts from the broker; lower it only for an account hashed with fewer |
 | `tls` | — | `true` or a table (`cafile`, `certfile`, `keyfile`, `server_name`, `insecure`) |
 | `channel_binding` | on with TLS | `false` disables it; `"tls-server-end-point"` pins the older binding type |
 | `timeout` | 30 | Socket timeout in seconds |

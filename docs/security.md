@@ -48,6 +48,8 @@ For more than one tenant, use `Auth.Users`:
 }
 ```
 
+`FailureWindow` and `BanDuration` are in seconds: the example locks an IP out
+for 15 minutes after 5 failures in a minute.
 `MaxFailures` / `FailureWindow` / `BanDuration` are per **IP**, not per account,
 and are shared by every mechanism (plain, SCRAM and EXTERNAL) — an attacker
 rotating usernames still trips
@@ -67,7 +69,9 @@ forgotten `Acls` block.
 ### Credential formats
 
 Generate with `make hash PASSWORD=... [ITER=...] [SCRAM=1]`, or
-`lua bin/moonmq-hash.lua <password> [iterations] [--scram]`.
+`lua bin/moonmq-hash.lua [--iterations N] [--scram]` with the password on
+stdin. Passing the password as an argument still works but warns, because it
+is visible in `ps` and shell history.
 
 | Format | Works with | If the config leaks |
 | --- | --- | --- |
@@ -116,7 +120,7 @@ the signal to every broker. Watch `moonmq_auth_reloads_total` and
 ## 2. ACLs
 
 ```
-resource   := topic | group | cluster
+resource   := topic | group | cluster | transactional_id
 operation  := read | write | create | delete | alter | describe
 effect     := allow | deny
 name       := "orders" | "orders.*" | "*"
@@ -139,6 +143,16 @@ Which operations each resource accepts:
 | `topic` | `read` `write` `create` `delete` `alter` `describe` |
 | `group` | `read` `delete` `describe` |
 | `cluster` | `describe` `alter` `create` |
+| `transactional_id` | `write` `describe` |
+
+`transactional_id` names a durable producer (`producer_name`). A principal
+needs `transactional_id:write` on the name to claim it with
+`INIT_PRODUCER_ID`. Without that rule, any authenticated user could fence
+another tenant's producer and then commit or abort its open transaction.
+
+```json
+{ "Resource": "transactional_id", "Name": "orders-*", "Operations": ["write"] }
+```
 
 Anything else — `group:write`, say — is a boot error rather than a rule that
 silently never fires.
@@ -156,6 +170,7 @@ silently never fires.
 | `DELETE_TOPIC` | `topic:delete` |
 | `ALTER_TOPIC_CONFIG`, `CREATE_PARTITIONS` | `topic:alter` |
 | `DESCRIBE_TOPIC`, `LIST_OFFSETS` | `topic:describe` |
+| `INIT_PRODUCER_ID` with a `producer_name` | `transactional_id:write` on the name |
 | `DESCRIBE_GROUP` | `group:describe` |
 | `DELETE_GROUP` | `group:delete` |
 | `LIST_TOPICS`, `LIST_GROUPS` | *filtered* to what the principal may `describe` |
@@ -166,22 +181,40 @@ was off limits would be useless to a tenant, and one that included every name
 would leak the shape of everyone else's deployment. Topic and group names are
 rarely uninteresting.
 
+**Internal topics are never reachable from the client protocol.** Any request
+that names a `__*` topic (`__consumer_offsets`, `__transaction_state`,
+`__producer_state`, `__dlq_attempts`) is refused with `ERR_TOPIC_FORBIDDEN`,
+whatever the ACLs say. This applies to superusers and OPEN mode too, so a
+`Name: "*"` rule cannot be used to forge offsets or transaction state.
+
+**Revoked read access takes effect on live sessions.** Topics a principal can
+no longer read are dropped from its subscriptions before every poll. On a
+`SIGHUP` reload, a connection that lost `read` on a subscribed topic or its
+group is closed.
+
 Deliberate gaps, so they are choices rather than oversights:
 
 * **`LEAVE_GROUP` / `GROUP_HEARTBEAT` are not checked.** Membership was
   authorized at `JOIN_GROUP`; re-checking would strand a live member whose ACL
   changed mid-session, and neither request grants access to anything.
-* **`INIT_PRODUCER_ID` is not checked.** It allocates an identity, not access;
-  every produce made under that identity is checked normally.
+* **An ephemeral `INIT_PRODUCER_ID` (no `producer_name`) is not checked.** It
+  allocates a connection-scoped identity, not access; every produce made under
+  it is checked normally. A named one needs `transactional_id:write`.
 * **`BEGIN_TXN` / `END_TXN` are not checked.** A transaction is a wrapper around
   produces and offset commits, each of which is checked on its own frame.
 * **The dead-letter write is not separately checked.** When a `NACK` exhausts
   its delivery budget the broker moves the record to `<topic>.dlq` on the
   consumer's behalf; `topic:read` on the source topic is the permission that
   gates it. A tenant that must not reach its own DLQ needs an explicit deny on
-  that name.
+  that name. *Creating* the dead-letter topic is checked: the first dead-letter
+  needs `topic:create` on `<topic>.dlq` (or `cluster:create`) and counts
+  against `MaxTopics`, unless an operator created the DLQ topic in advance.
 * **Inter-broker endpoints (`/cluster/*`, `/replicate`) are unaffected.** They
-  authenticate with `X-Cluster-Token`, not with a user.
+  authenticate with `X-Cluster-Token`, not with a user. The token is enforced
+  on both the static and the failover `/replicate` listener. An empty token,
+  or per-peer `Cluster.Peers[].Token` values without a top-level
+  `Cluster.Token`, is a boot error, because either would leave the inbound
+  listener open.
 
 ---
 
@@ -230,6 +263,13 @@ iteration count are derived from the username — stable across attempts, so a
 prober cannot spot the difference, and guaranteed to fail at proof
 verification. Password AUTH does the same with a decoy derivation, so response
 time does not answer "does this account exist?" either.
+
+The client also checks the iteration count the broker sends. It refuses
+anything below 4096 (an attacker in the middle could otherwise send `i=1` and
+crack the resulting proof offline) or above 1,000,000 (which would hang the
+client), and it refuses an empty salt. If an account's hash really is under
+4096 iterations, set the client option `min_iterations` to match, or better,
+re-hash it.
 
 On a plaintext connection the client opens with `n,,` (no channel binding);
 over TLS it binds the exchange to the connection — see
@@ -621,3 +661,10 @@ missing.
 11. Reload certificates and users with `SIGHUP` rather than a restart, and
     alert on `moonmq_tls_reload_failures_total` and
     `moonmq_auth_reload_failures_total`.
+12. Set `Cluster.Token` / `Replication.Token` on every broker whose
+    inter-broker port is reachable beyond loopback.
+13. If you run the HTTP gateway, give it its own token and a non-superuser
+    `Gateway.MoonMQUsername` (see
+    [configuration.md](configuration.md#http-gateway)).
+14. Grant `transactional_id:write` only on the producer names each
+    application owns.

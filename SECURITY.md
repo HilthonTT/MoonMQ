@@ -46,7 +46,12 @@ have found a way around the documented boundary.
   config. Peers are authenticated only by the shared `Token`
   (`X-Cluster-Token`) and, when configured, mTLS on `Cluster.Tls` /
   `Replication.Tls`; with neither set, anything that can reach a broker's
-  cluster or replication port is treated as a peer.
+  cluster or replication port is treated as a peer. An empty token is
+  rejected at boot rather than treated as "no token".
+- **The HTTP gateway acts as the broker account it logs in with.** It
+  requires its own bearer token (`Gateway.Token`) and binds loopback by
+  default. Anyone holding that token has the gateway account's permissions,
+  so give it a non-superuser `Gateway.MoonMQUsername`.
 
 ## Scope
 

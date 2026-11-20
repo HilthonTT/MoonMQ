@@ -67,7 +67,23 @@ end
 ```
 
 `MaxDeliveries = 1` dead-letters on the first NACK. Metrics:
-`moonmq_nack_total` and `moonmq_dlq_records_total` (both labelled by topic).
+`moonmq_nack_total`, `moonmq_dlq_records_total` and `moonmq_dlq_dropped_total`
+(all labelled by topic).
+
+## Limits on dead-letter topics
+
+* **Creating a DLQ is authorized.** The lazy creation of `<topic>.dlq` needs
+  `topic:create` on that name (or `cluster:create`) for the consumer's
+  principal, and counts against `Server.MaxTopics`. Otherwise the NACK fails
+  (`ERR_NOT_AUTHORIZED` or `ERR_RATE_LIMITED`), and the record keeps being
+  redelivered. Create the DLQ topic in advance if consumers should not hold
+  create rights.
+* **No nesting.** A record NACKed `MaxDeliveries` times on a topic that is
+  itself a dead-letter topic (its name ends with `Suffix`) is **dropped**
+  rather than moved to `<topic>.dlq.dlq`. The group advances past it, the
+  reply carries `dead_lettered = true` with an empty `dlq_topic`, a warning is
+  logged, and `moonmq_dlq_dropped_total` counts it.
+* Internal `__*` topics cannot be NACKed at all.
 
 ## Semantics and limits
 

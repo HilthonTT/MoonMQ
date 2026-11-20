@@ -77,7 +77,10 @@ mq> ALTER TOPIC orders SET retention = 86400;
 OK topic 'orders' altered (retention=86400)
 ```
 
-`ALTER ... SET` accepts the keys `topic.config` stores: `retention` (seconds),
-`max_segment_size`, `max_log_bytes`, `cleaner_interval`, `cleanup_policy` and
-`backend`. `DROP`, `DESCRIBE`, `ALTER` and `SET` are command words, so a topic
+`ALTER ... SET` accepts `retention` (seconds), `max_segment_size`,
+`max_log_bytes`, `cleaner_interval` and `cleanup_policy`. The storage
+`backend` is fixed when the topic is created. Numbers must be positive and
+finite, and `max_segment_size` is capped at 4 GiB − 64 MiB.
+`cleanup_policy` must be `delete` or `compact`. Values containing control
+characters are refused. `DROP`, `DESCRIBE`, `ALTER` and `SET` are command words, so a topic
 with one of those names has to be quoted.

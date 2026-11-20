@@ -155,6 +155,22 @@ Under `Server` in `appsettings.json`:
 }
 ```
 
+Token rules, checked at boot:
+
+* An empty `Token` (top-level or per-peer) is a configuration error, not "no
+  token".
+* Per-peer `Peers[].Token` values only set what this broker *sends*. Inbound
+  requests are checked against the top-level `Token`, so setting per-peer
+  tokens without a top-level one is refused: the listener would otherwise
+  accept anyone.
+
+Inter-broker HTTP requests never follow redirects (a peer cannot bounce a
+request carrying `X-Cluster-Token` to another host), and responses larger than
+8 MiB are rejected. Cluster endpoints validate every topic name, partition
+(an integer from 1 to 1024), offset, epoch and Raft term/index they receive,
+and answer `400` instead of storing a malformed value. A Raft follower refuses
+an AppendEntries that would truncate already-committed entries.
+
 Start with `DryRun: true` and watch the `balance_loop` log lines and the
 `moonmq_autobalancer_*` metrics until the plans look sane.
 

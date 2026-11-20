@@ -62,7 +62,7 @@ and `ClientAddress`, and lists the other two as peers:
 | --- | --- | --- |
 | `Role` | `leader` | Only `leader`/`both` replicas may win the very first election (before any ISR exists). Set it on exactly one replica. |
 | `ClientAddress`, `Peers[].ClientAddress` | – | What followers put in the `leader=` hint. Without them clients only get "not the leader". |
-| `Token` | none | Shared secret sent as `X-Cluster-Token` on every replication request and required on the listener. |
+| `Token` | none | Shared secret sent as `X-Cluster-Token` on every replication request and required on the listener, in both static and failover mode. Must be non-empty. Upgrade a static leader and its followers together: an older leader does not send the token, and an upgraded follower answers it with `401`. |
 | `Tls` | none | Same block as before; covers the Raft and fetch traffic. |
 | `AckTimeout` | 5 s | How long `acks=all` waits for the ISR. |
 | `Failover.IsrLagSeconds` | 10 | A follower that has not caught up to the leader's log end for this long leaves the ISR. |
