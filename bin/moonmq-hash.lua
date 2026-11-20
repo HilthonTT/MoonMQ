@@ -1,28 +1,53 @@
 local auth = require("src.server.auth")
 
+local USAGE = "usage: lua bin/moonmq-hash.lua [-|<password>] [iterations] [--scram]\n"
+    .. "       with no password argument (or '-') the password is read from stdin\n"
+
 local args = {}
 local scram_format = false
-for i = 1, #arg do
-    if arg[i] == "--scram" then
+local iterations_flag
+local i = 1
+while i <= #arg do
+    local a = arg[i]
+    if a == "--scram" then
         scram_format = true
+    elseif a == "--iterations" then
+        i = i + 1
+        iterations_flag = arg[i] or ""
+    elseif a:match("^%-%-iterations=") then
+        iterations_flag = a:match("^%-%-iterations=(.*)$")
+    elseif a == "-h" or a == "--help" then
+        io.stderr:write(USAGE)
+        os.exit(0)
     else
-        args[#args + 1] = arg[i]
+        args[#args + 1] = a
     end
+    i = i + 1
 end
 
-local password = args[1]
+local password
+if args[1] == nil or args[1] == "-" then
+    password = io.read("l")
+    if password then password = password:gsub("\r$", "") end
+else
+    io.stderr:write("warning: passing the password as an argument exposes it "
+        .. "in the process list and shell history; pipe it on stdin instead\n")
+    password = args[1]
+end
+
 if not password or password == "" then
-    io.stderr:write("usage: lua bin/moonmq-hash.lua <password> [iterations] [--scram]\n")
+    io.stderr:write(USAGE)
     os.exit(1)
 end
 
+local iterations_arg = iterations_flag or args[2]
 local iterations = auth.DEFAULT_PBKDF2_ITERATIONS
-if args[2] and args[2] ~= "" then
-    iterations = tonumber(args[2])
+if iterations_arg and iterations_arg ~= "" then
+    iterations = tonumber(iterations_arg)
     iterations = iterations and math.tointeger(iterations)
     if not iterations or iterations < 1 then
         io.stderr:write(string.format(
-            "iterations must be a positive integer (got: %q)\n", tostring(args[2])))
+            "iterations must be a positive integer (got: %q)\n", tostring(iterations_arg)))
         os.exit(1)
     end
     if iterations > auth.MAX_PBKDF2_ITERATIONS then

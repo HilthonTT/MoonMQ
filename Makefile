@@ -55,6 +55,6 @@ example:
 
 hash:
 	@test -n "$(PASSWORD)" || (echo "usage: make hash PASSWORD=mypass [ITER=10000] [SCRAM=1]" && exit 1)
-	@$(LUA) bin/moonmq-hash.lua "$(PASSWORD)" $(ITER) $(if $(SCRAM),--scram,)
+	@printf '%s\n' "$(PASSWORD)" | $(LUA) bin/moonmq-hash.lua - $(ITER) $(if $(SCRAM),--scram,)
 
 .PHONY: deps test smoke lint check run server gateway example hash
